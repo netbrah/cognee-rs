@@ -6,9 +6,9 @@ mod session_messages;
 
 pub use access_tracking::update_node_access_timestamps;
 pub use completion::{
-    DEFAULT_GRAPH_USER_PROMPT_TEMPLATE, DEFAULT_RAG_SYSTEM_PROMPT,
-    DEFAULT_RAG_USER_PROMPT_TEMPLATE, render_graph_user_prompt, render_user_prompt,
-    resolve_system_prompt,
+    DEFAULT_GRAPH_USER_PROMPT_TEMPLATE, DEFAULT_HYBRID_USER_PROMPT_TEMPLATE,
+    DEFAULT_RAG_SYSTEM_PROMPT, DEFAULT_RAG_USER_PROMPT_TEMPLATE, render_graph_user_prompt,
+    render_user_prompt, resolve_system_prompt,
 };
 pub use feedback_detection::detect_feedback;
 pub(crate) use resolve_edges_to_text::DEFAULT_STOP_WORDS;

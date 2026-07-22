@@ -7,6 +7,7 @@ pub const DEFAULT_RAG_SYSTEM_PROMPT: &str =
 pub const DEFAULT_RAG_USER_PROMPT_TEMPLATE: &str =
     "The question is: `{question}`\nAnd here is the context: `{context}`";
 pub const DEFAULT_GRAPH_USER_PROMPT_TEMPLATE: &str = "The question is: `{question}`\nand here is the context provided with a set of relationships from a knowledge graph separated by \\n---\\n each represented as node1 -- relation -- node2 triplet: `{context}`";
+pub const DEFAULT_HYBRID_USER_PROMPT_TEMPLATE: &str = "The question is: `{question}`\nAnswer using this sectioned context. Keep the answer brief and do not use information outside the context.\n\nContext:\n`{context}`";
 
 pub fn resolve_system_prompt(
     system_prompt: Option<&str>,
@@ -104,6 +105,28 @@ mod tests {
         assert!(result.contains("And here is the context: `context`"));
         // Should NOT contain graph-specific text
         assert!(!result.contains("knowledge graph"));
+    }
+
+    #[test]
+    fn hybrid_user_prompt_template_matches_python() {
+        // Verbatim parity with hybrid_context_for_question.txt (modulo the
+        // Jinja2 `{{ }}` -> Rust `{ }` placeholder syntax used across all
+        // DEFAULT_*_USER_PROMPT_TEMPLATE constants). Backticks are literal.
+        assert_eq!(
+            DEFAULT_HYBRID_USER_PROMPT_TEMPLATE,
+            "The question is: `{question}`\nAnswer using this sectioned context. Keep the answer brief and do not use information outside the context.\n\nContext:\n`{context}`"
+        );
+
+        // render_user_prompt substitutes both placeholders correctly.
+        let rendered = render_user_prompt(
+            Some(DEFAULT_HYBRID_USER_PROMPT_TEMPLATE),
+            "Who knows Bob?",
+            "Alice knows Bob.",
+        );
+        assert!(rendered.contains("The question is: `Who knows Bob?`"));
+        assert!(rendered.contains("Context:\n`Alice knows Bob.`"));
+        assert!(!rendered.contains("{question}"));
+        assert!(!rendered.contains("{context}"));
     }
 
     #[test]

@@ -1567,18 +1567,10 @@ pub async fn add_temporal_data_points(
 /// prefer the nonblank `edge_text` property, fall back to the nonblank
 /// `relationship_name`, else return an empty string (caller drops empties).
 fn edge_retrieval_text(edge_pair: &GraphEdgePair) -> String {
-    let from_edge_text = edge_pair
-        .properties
-        .get("edge_text")
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty());
-
-    if let Some(text) = from_edge_text {
-        return text.to_string();
-    }
-
-    let rel = edge_pair.relationship_name.trim();
-    rel.to_string()
+    EdgeType::retrieval_text(
+        edge_pair.properties.get("edge_text").map(String::as_str),
+        &edge_pair.relationship_name,
+    )
 }
 
 /// Build minimal edge properties for graph storage.
@@ -2932,6 +2924,10 @@ async fn index_data_points(
                 if let Some(made_from) = summary.made_from {
                     point = point.with_metadata("chunk_id", json!(made_from.to_string()));
                 }
+                if let Some(source_chunk_id) = summary.source_chunk_id {
+                    point =
+                        point.with_metadata("source_chunk_id", json!(source_chunk_id.to_string()));
+                }
                 if let Some(uid) = user_id {
                     point = point.with_metadata("user_id", json!(uid.to_string()));
                 }
@@ -4240,6 +4236,66 @@ mod tests {
 
         // 5 from generate_embeddings + 1 entity-type (not precomputed) = 6.
         assert_eq!(engine.embedded_text_count(), 6);
+    }
+
+    // The TextSummary vector payload must carry both `chunk_id` (back-compat)
+    // and the new `source_chunk_id` key with identical string values, so the
+    // hybrid pairing algorithm can join a summary hit to its source chunk.
+    #[tokio::test]
+    async fn summary_payload_carries_chunk_id_and_source_chunk_id() {
+        use cognee_embedding::MockEmbeddingEngine;
+        use cognee_vector::MockVectorDB;
+
+        let engine = Arc::new(MockEmbeddingEngine::new(8));
+        let engine_dyn: Arc<dyn EmbeddingEngine> = engine.clone();
+        let mock = Arc::new(MockVectorDB::new());
+        let vector: Arc<dyn VectorDB> = mock.clone();
+
+        let doc_id = Uuid::new_v4();
+        let chunks = vec![test_chunk(Uuid::new_v4(), doc_id, "chunk text")];
+
+        let chunk_id = chunks[0].base.id;
+        let summaries = vec![TextSummary::new(
+            chunk_id,
+            "a summary".to_string(),
+            None,
+            "mock-model".to_string(),
+        )];
+        let summary_id = summaries[0].base.id;
+
+        let dataset_id = Uuid::new_v4();
+        let config = CognifyConfig::default();
+
+        let embeddings = generate_embeddings(&chunks, &[], &summaries, engine_dyn.clone())
+            .await
+            .unwrap();
+
+        index_data_points(
+            &chunks,
+            &[],
+            &summaries,
+            &[],
+            &[],
+            &[],
+            dataset_id,
+            None,
+            None,
+            engine_dyn,
+            vector,
+            &config,
+            &embeddings,
+        )
+        .await
+        .unwrap();
+
+        let payload = mock
+            .get_payload("TextSummary", "text", summary_id)
+            .expect("summary point must be indexed");
+
+        let expected = json!(chunk_id.to_string());
+        assert_eq!(payload.get("chunk_id"), Some(&expected));
+        assert_eq!(payload.get("source_chunk_id"), Some(&expected));
+        assert_eq!(payload.get("chunk_id"), payload.get("source_chunk_id"));
     }
 
     // Prints a before/after embedding-work comparison for a realistic fixture.

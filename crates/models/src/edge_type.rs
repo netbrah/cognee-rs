@@ -46,6 +46,23 @@ impl EdgeType {
         cognee_utils::data_point_id_for("EdgeType", &[relationship_name])
     }
 
+    /// Resolve the retrieval text for an edge, mirroring Python's
+    /// `get_edge_retrieval_text(edge_text, relationship_name)`
+    /// (`prepare_edges_for_storage.py:26-28` via `index_graph_edges.py:33-53`):
+    /// prefer the nonblank `edge_text`, fall back to the nonblank
+    /// `relationship_name`, else return an empty string (caller drops empties).
+    ///
+    /// Takes primitive `&str` params (not a `GraphEdgePair`, which lives in
+    /// `cognee-cognify` and would introduce a cyclic dependency) so any lane
+    /// can recompute the exact text an `EdgeType`/`Triplet` vector id was
+    /// derived from.
+    pub fn retrieval_text(edge_text: Option<&str>, relationship_name: &str) -> String {
+        if let Some(text) = edge_text.map(str::trim).filter(|s| !s.is_empty()) {
+            return text.to_string();
+        }
+        relationship_name.trim().to_string()
+    }
+
     /// Create a new EdgeType with a random UUID.
     ///
     /// # Arguments
@@ -274,6 +291,33 @@ mod tests {
         let id1 = EdgeType::deterministic_id("works_at");
         let id2 = EdgeType::deterministic_id("located_in");
         assert_ne!(id1, id2, "different names must produce different UUIDs");
+    }
+
+    #[test]
+    fn retrieval_text_prefers_nonblank_edge_text() {
+        assert_eq!(
+            EdgeType::retrieval_text(Some("Alice knows Bob"), "knows"),
+            "Alice knows Bob"
+        );
+    }
+
+    #[test]
+    fn retrieval_text_falls_back_when_edge_text_none() {
+        assert_eq!(EdgeType::retrieval_text(None, "knows"), "knows");
+    }
+
+    #[test]
+    fn retrieval_text_falls_back_when_edge_text_blank() {
+        assert_eq!(EdgeType::retrieval_text(Some("   "), "knows"), "knows");
+    }
+
+    #[test]
+    fn retrieval_text_trims_both_sources() {
+        assert_eq!(
+            EdgeType::retrieval_text(Some("  spaced text  "), "knows"),
+            "spaced text"
+        );
+        assert_eq!(EdgeType::retrieval_text(None, "  knows  "), "knows");
     }
 
     #[test]
