@@ -227,6 +227,12 @@ impl SearchBuilder {
             )),
         );
 
+        // NOTE: `SearchType::HybridCompletion` is deliberately NOT registered here.
+        // The wire/type surface exists (P1-01) but the `HybridRetriever` port lands
+        // in P1-09; until then `SearchTypeRegistry::get` falls through to
+        // `SearchError::UnsupportedSearchType` for it, which is the intended interim
+        // contract.
+
         self.retrievers.insert(
             SearchType::Feedback,
             Arc::new(FeedbackRetriever::new(

@@ -101,27 +101,27 @@ what can run in parallel.
 
 ## Full task index
 
-| Task | Phase | Title | Link |
-|---|---|---|---|
-| P1-01 | 1 | SearchType HYBRID_COMPLETION plumbing | [./phase-1/P1-01.md](./phase-1/P1-01.md) |
-| P1-02 | 1 | Vector retrieve-by-id | [./phase-1/P1-02.md](./phase-1/P1-02.md) |
-| P1-03 | 1 | Per-query Okapi BM25 chunk scorer | [./phase-1/P1-03.md](./phase-1/P1-03.md) |
-| P1-04 | 1 | importance_weight on DataPoint | [./phase-1/P1-04.md](./phase-1/P1-04.md) |
-| P1-05 | 1 | Shared helpers + payload fixes | [./phase-1/P1-05.md](./phase-1/P1-05.md) |
-| P1-06 | 1 | get_neighborhood on GraphDBTrait | [./phase-1/P1-06.md](./phase-1/P1-06.md) |
-| P1-07 | 1 | Hybrid module — chunk + BM25 lane | [./phase-1/P1-07.md](./phase-1/P1-07.md) |
-| P1-08 | 1 | Hybrid module — entity + facts lane | [./phase-1/P1-08.md](./phase-1/P1-08.md) |
-| P1-09 | 1 | Hybrid module — context, retriever impl, registration | [./phase-1/P1-09.md](./phase-1/P1-09.md) |
-| P1-10 | 1 | Orchestrator session-cache wiring + tests | [./phase-1/P1-10.md](./phase-1/P1-10.md) |
-| P1-11 | 1 | Cross-SDK harness coverage for HYBRID_COMPLETION | [./phase-1/P1-11.md](./phase-1/P1-11.md) |
-| P1-12 | 1 | Documentation updates for HYBRID_COMPLETION | [./phase-1/P1-12.md](./phase-1/P1-12.md) |
-| P2-01 | 2 | Truth-subspace: pure alignment math | [./phase-2/P2-01.md](./phase-2/P2-01.md) |
-| P2-02 | 2 | Truth-subspace: centroid slot logic | [./phase-2/P2-02.md](./phase-2/P2-02.md) |
-| P2-03 | 2 | Truth-subspace: vector persistence | [./phase-2/P2-03.md](./phase-2/P2-03.md) |
-| P2-04 | 2 | Truth-subspace: graph truth-state methods | [./phase-2/P2-04.md](./phase-2/P2-04.md) |
-| P2-05 | 2 | Session-learnings distillation gate | [./phase-2/P2-05.md](./phase-2/P2-05.md) |
-| P2-06 | 2 | build_truth_subspace orchestration | [./phase-2/P2-06.md](./phase-2/P2-06.md) |
-| P2-07 | 2 | Hybrid retriever truth-weight glue | [./phase-2/P2-07.md](./phase-2/P2-07.md) |
+| Task | Phase | Title | Link | Status |
+|---|---|---|---|---|
+| P1-01 | 1 | SearchType HYBRID_COMPLETION plumbing | [./phase-1/P1-01.md](./phase-1/P1-01.md) | completed |
+| P1-02 | 1 | Vector retrieve-by-id | [./phase-1/P1-02.md](./phase-1/P1-02.md) | pending |
+| P1-03 | 1 | Per-query Okapi BM25 chunk scorer | [./phase-1/P1-03.md](./phase-1/P1-03.md) | pending |
+| P1-04 | 1 | importance_weight on DataPoint | [./phase-1/P1-04.md](./phase-1/P1-04.md) | pending |
+| P1-05 | 1 | Shared helpers + payload fixes | [./phase-1/P1-05.md](./phase-1/P1-05.md) | pending |
+| P1-06 | 1 | get_neighborhood on GraphDBTrait | [./phase-1/P1-06.md](./phase-1/P1-06.md) | pending |
+| P1-07 | 1 | Hybrid module — chunk + BM25 lane | [./phase-1/P1-07.md](./phase-1/P1-07.md) | pending |
+| P1-08 | 1 | Hybrid module — entity + facts lane | [./phase-1/P1-08.md](./phase-1/P1-08.md) | pending |
+| P1-09 | 1 | Hybrid module — context, retriever impl, registration | [./phase-1/P1-09.md](./phase-1/P1-09.md) | pending |
+| P1-10 | 1 | Orchestrator session-cache wiring + tests | [./phase-1/P1-10.md](./phase-1/P1-10.md) | pending |
+| P1-11 | 1 | Cross-SDK harness coverage for HYBRID_COMPLETION | [./phase-1/P1-11.md](./phase-1/P1-11.md) | pending |
+| P1-12 | 1 | Documentation updates for HYBRID_COMPLETION | [./phase-1/P1-12.md](./phase-1/P1-12.md) | pending |
+| P2-01 | 2 | Truth-subspace: pure alignment math | [./phase-2/P2-01.md](./phase-2/P2-01.md) | pending |
+| P2-02 | 2 | Truth-subspace: centroid slot logic | [./phase-2/P2-02.md](./phase-2/P2-02.md) | pending |
+| P2-03 | 2 | Truth-subspace: vector persistence | [./phase-2/P2-03.md](./phase-2/P2-03.md) | pending |
+| P2-04 | 2 | Truth-subspace: graph truth-state methods | [./phase-2/P2-04.md](./phase-2/P2-04.md) | pending |
+| P2-05 | 2 | Session-learnings distillation gate | [./phase-2/P2-05.md](./phase-2/P2-05.md) | pending |
+| P2-06 | 2 | build_truth_subspace orchestration | [./phase-2/P2-06.md](./phase-2/P2-06.md) | pending |
+| P2-07 | 2 | Hybrid retriever truth-weight glue | [./phase-2/P2-07.md](./phase-2/P2-07.md) | pending |
 
 ## Fable validation
 

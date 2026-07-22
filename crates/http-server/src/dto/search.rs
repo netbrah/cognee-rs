@@ -40,6 +40,7 @@ pub enum WireSearchType {
     Temporal,
     CodingRules,
     ChunksLexical,
+    HybridCompletion,
 }
 
 impl From<WireSearchType> for cognee_search::types::SearchType {
@@ -62,6 +63,7 @@ impl From<WireSearchType> for cognee_search::types::SearchType {
             WireSearchType::Temporal => Core::Temporal,
             WireSearchType::CodingRules => Core::CodingRules,
             WireSearchType::ChunksLexical => Core::ChunksLexical,
+            WireSearchType::HybridCompletion => Core::HybridCompletion,
         }
     }
 }
@@ -314,6 +316,7 @@ mod tests {
             ("TEMPORAL", WireSearchType::Temporal),
             ("CODING_RULES", WireSearchType::CodingRules),
             ("CHUNKS_LEXICAL", WireSearchType::ChunksLexical),
+            ("HYBRID_COMPLETION", WireSearchType::HybridCompletion),
         ];
 
         for (wire, expected) in cases {

@@ -98,7 +98,7 @@ export interface CogneeCognifyResult {
 // Phase 4 types
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** All 15 search type wire names (SCREAMING_SNAKE_CASE, matching Rust serde). */
+/** All 16 search type wire names (SCREAMING_SNAKE_CASE, matching Rust serde). */
 export type SearchTypeString =
   | "SUMMARIES"
   | "CHUNKS"
@@ -114,7 +114,8 @@ export type SearchTypeString =
   | "FEEDBACK"
   | "TEMPORAL"
   | "CODING_RULES"
-  | "CHUNKS_LEXICAL";
+  | "CHUNKS_LEXICAL"
+  | "HYBRID_COMPLETION";
 
 /** Recall scope wire names (snake_case; "all" expands to all four concrete scopes). */
 export type RecallScopeString =

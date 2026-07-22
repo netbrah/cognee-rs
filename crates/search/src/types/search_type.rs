@@ -20,6 +20,7 @@ pub enum SearchType {
     Temporal,
     CodingRules,
     ChunksLexical,
+    HybridCompletion,
 }
 
 #[cfg(test)]
@@ -44,5 +45,20 @@ mod tests {
     fn deserializes_python_compatible_names() {
         let parsed: SearchType = serde_json::from_str("\"CHUNKS_LEXICAL\"").unwrap();
         assert_eq!(parsed, SearchType::ChunksLexical);
+    }
+
+    #[test]
+    fn serializes_hybrid_completion() {
+        let value = serde_json::to_value(SearchType::HybridCompletion).unwrap();
+        assert_eq!(
+            value,
+            serde_json::Value::String("HYBRID_COMPLETION".to_string())
+        );
+    }
+
+    #[test]
+    fn deserializes_hybrid_completion() {
+        let parsed: SearchType = serde_json::from_str("\"HYBRID_COMPLETION\"").unwrap();
+        assert_eq!(parsed, SearchType::HybridCompletion);
     }
 }

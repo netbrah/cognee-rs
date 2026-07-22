@@ -16,7 +16,8 @@ public enum SearchType {
     FEEDBACK,
     TEMPORAL,
     CODING_RULES,
-    CHUNKS_LEXICAL;
+    CHUNKS_LEXICAL,
+    HYBRID_COMPLETION;
 
     /** Wire string (identical to {@link #name()}). */
     public String wire() {

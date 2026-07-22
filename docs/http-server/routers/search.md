@@ -73,7 +73,7 @@ Companion docs: [../architecture.md](../architecture.md), [../auth.md](../auth.m
 - **Validation rules**:
   - `top_k`: when supplied, must be a positive integer (`> 0`). Python's underlying `search()` accepts any int but yields an empty list for `top_k <= 0`; Rust returns `400 BadRequest` with `detail="top_k must be positive"`. Cross-SDK note: this is a Rust strictness add — flag in §6.
   - `dataset_ids`: when supplied alongside `datasets`, the Python search function logs a warning and prefers `dataset_ids`. Rust matches: if both are non-empty, `dataset_ids` wins and `datasets` is silently ignored ([orchestrator §141-160](../../../crates/search/src/orchestration/search_orchestrator.rs)).
-  - `search_type`: must be one of the 14 wire variants below. Unknown values (including `"FEEDBACK"`) produce `422 ValidationError` from the custom `Json` extractor (matches Python's `RequestValidationError` handler).
+  - `search_type`: must be one of the 15 wire variants below. Unknown values (including `"FEEDBACK"`) produce `422 ValidationError` from the custom `Json` extractor (matches Python's `RequestValidationError` handler).
   - `query`: max length 100,000 chars (Rust safety cap — Python has no explicit limit). If exceeded, return `400`. Document in §6.
 - **Rate / size limits**: default body limit 100 MiB (architecture default). Per-handler request rate not enforced — see §6.
 - **Permission gate**: `state.lib.permissions().visible_datasets(user.id, "read")` is computed inside the orchestrator's `dataset_resolver` when `datasets` / `dataset_ids` are supplied. Datasets the user cannot read are silently dropped (Python: `get_authorized_existing_datasets("read", user)`). When the resulting set is empty, the orchestrator returns `Err(PermissionDenied)` which the handler maps to `403`.
@@ -202,7 +202,7 @@ pub struct ErrorResponseDTO {
 
 ### `SearchType` wire shapes
 
-The wire-facing `WireSearchType` enum is defined locally in [`crates/http-server/src/dto/search.rs`](../../../crates/http-server/src/dto/search.rs) with `#[serde(rename_all = "SCREAMING_SNAKE_CASE")]` and converts into the core [`cognee_search::types::SearchType`](../../../crates/search/src/types/search_type.rs) via `From`. Wire values match Python's [`SearchType`](https://github.com/topoteretes/cognee/blob/main/cognee/modules/search/types/SearchType.py) byte-for-byte. The wire DTO exposes **14** variants — the core Rust enum's extra `Feedback` variant is intentionally dropped from the wire (see the `FEEDBACK` row below):
+The wire-facing `WireSearchType` enum is defined locally in [`crates/http-server/src/dto/search.rs`](../../../crates/http-server/src/dto/search.rs) with `#[serde(rename_all = "SCREAMING_SNAKE_CASE")]` and converts into the core [`cognee_search::types::SearchType`](../../../crates/search/src/types/search_type.rs) via `From`. Wire values match Python's [`SearchType`](https://github.com/topoteretes/cognee/blob/main/cognee/modules/search/types/SearchType.py) byte-for-byte. The wire DTO exposes **15** variants — the core Rust enum's extra `Feedback` variant is intentionally dropped from the wire (see the `FEEDBACK` row below):
 
 | Wire value (string) | Rust enum variant | Python `SearchType` | Rust status | Notes |
 |---|---|---|---|---|
@@ -221,8 +221,9 @@ The wire-facing `WireSearchType` enum is defined locally in [`crates/http-server
 | `"FEEDBACK"` | `Feedback` (core enum only) | (no Python equivalent) | Not on the wire | The core `cognee_search::types::SearchType` has a `Feedback` variant, but `WireSearchType` **does not** include it: posting `"FEEDBACK"` deserializes as a validation error (`test_feedback_variant_is_dropped_from_wire`). Library callers reach `SearchType::Feedback` via the core enum directly. **See §6 Q1.** |
 | `"CODING_RULES"` | `CodingRules` | `CODING_RULES` | Implemented | Returns a `Vec<RulePayload>` matching the `Rule {node_set, text}` schema. Used by IDE plugins. |
 | `"CHUNKS_LEXICAL"` | `ChunksLexical` | `CHUNKS_LEXICAL` | Implemented | BM25 / lexical chunk retrieval (no embedding). Returns `Vec<ChunkPayload>`. |
+| `"HYBRID_COMPLETION"` | `HybridCompletion` | `HYBRID_COMPLETION` | **Not implemented (interim)** | Registered by P1-09; until then returns `SearchError::UnsupportedSearchType`. |
 
-Per the project guide, **9 of the 14** wire variants are covered by the E2E search-matrix test. The remaining 5 (`Cypher`, `NaturalLanguage`, `FeelingLucky`, `CodingRules`, `ChunksLexical`) have unit-level coverage but no cross-SDK comparison yet. Cross-SDK parity tests for the missing 5 should land in the same PR as the HTTP server (see §5 task list).
+Per the project guide, **9 of the 15** wire variants are covered by the E2E search-matrix test. The remaining 6 (`Cypher`, `NaturalLanguage`, `FeelingLucky`, `CodingRules`, `ChunksLexical`, and `HybridCompletion`) have unit-level coverage but no cross-SDK comparison yet (`HybridCompletion` has neither yet — it is not backed by a retriever until P1-09). Cross-SDK parity tests for the missing types should land in the same PR as the HTTP server (see §5 task list).
 
 ### Wire shape of `search_result` (per retriever)
 

@@ -96,6 +96,7 @@ def test_search_type_importable():
     assert st.FEEDBACK == "FEEDBACK"
     assert st.CODING_RULES == "CODING_RULES"
     assert st.CHUNKS_LEXICAL == "CHUNKS_LEXICAL"
+    assert st.HYBRID_COMPLETION == "HYBRID_COMPLETION"
 
 
 def test_search_type_in_all():

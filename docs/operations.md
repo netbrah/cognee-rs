@@ -90,12 +90,13 @@ indexes them into the `Triplet`/`text` vector collection for
 
 ### search (retrieval)
 
-Unified orchestration across 15 retrieval strategies selected by `SearchType`
+Unified orchestration across 16 retrieval strategies selected by `SearchType`
 ([`crates/search/src/types/search_type.rs`](../crates/search/src/types/search_type.rs)):
 `GraphCompletion` (default), `GraphCompletionCot`, `GraphCompletionContextExtension`,
 `GraphSummaryCompletion`, `TripletCompletion`, `RagCompletion`, `Chunks`,
 `Summaries`, `Temporal`, `Cypher`, `NaturalLanguage`, `FeelingLucky`, `Feedback`,
-`CodingRules`, `ChunksLexical`. Entry: [`cognee-search`](../crates/search/)
+`CodingRules`, `ChunksLexical`, `HybridCompletion` (not yet backed by a
+retriever). Entry: [`cognee-search`](../crates/search/)
 (`SearchBuilder` / `SearchOrchestrator`).
 
 ## Additional operations

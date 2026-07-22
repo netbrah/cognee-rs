@@ -14,7 +14,7 @@ minimal ``tracing_subscriber::Registry`` that forwards every Rust
 
 
 class SearchType(str, Enum):
-    """Enumeration of the 15 supported search strategy types.
+    """Enumeration of the 16 supported search strategy types.
 
     Inherits from ``str`` so values compare equal to their string forms and
     can be passed wherever a plain string search-type is accepted.  Matches
@@ -58,6 +58,7 @@ class SearchType(str, Enum):
     FEEDBACK = "FEEDBACK"
     CODING_RULES = "CODING_RULES"
     CHUNKS_LEXICAL = "CHUNKS_LEXICAL"
+    HYBRID_COMPLETION = "HYBRID_COMPLETION"
 
 
 from cognee_py._native import (
