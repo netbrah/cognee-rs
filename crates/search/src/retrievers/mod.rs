@@ -1,5 +1,6 @@
 mod advanced_graph_retrievers;
 mod base_retriever;
+mod bm25;
 mod chunks_retriever;
 mod completion_retriever;
 mod context_items;
@@ -16,6 +17,11 @@ pub use advanced_graph_retrievers::{
     GraphSummaryCompletionRetriever,
 };
 pub use base_retriever::{SearchRetriever, SearchRetrieverRef};
+#[allow(
+    unused_imports,
+    reason = "internal API for the later hybrid-assembly task (P1-07/P1-09)"
+)]
+pub(crate) use bm25::bm25_scored_chunks;
 pub use chunks_retriever::ChunksRetriever;
 pub use completion_retriever::CompletionRetriever;
 pub use cypher_nl_retrievers::{CypherSearchRetriever, NaturalLanguageRetriever};

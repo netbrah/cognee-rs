@@ -11,5 +11,6 @@ pub use completion::{
     resolve_system_prompt,
 };
 pub use feedback_detection::detect_feedback;
+pub(crate) use resolve_edges_to_text::DEFAULT_STOP_WORDS;
 pub use resolve_edges_to_text::resolve_edges_to_text as render_edges_context;
 pub use session_messages::build_messages_with_history;
