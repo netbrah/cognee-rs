@@ -257,6 +257,32 @@ impl PgVectorAdapter {
             metadata,
         })
     }
+
+    /// Decode one `(id, metadata)` retrieve row into a [`SearchResult`],
+    /// always setting `score: 0.0`. `retrieve` is a direct fetch (not a
+    /// similarity search), so the score is a placeholder — matching Python's
+    /// `ScoredResult(score=0)`. A separate decoder from `row_to_search_result`
+    /// because the retrieve query intentionally does not select a `score`
+    /// column (no fake `0 AS score` is added just to reuse the other decoder).
+    fn row_to_retrieve_result(row: &sea_orm::QueryResult) -> VectorDBResult<SearchResult> {
+        let id: Uuid = row
+            .try_get("", "id")
+            .map_err(|e| VectorDBError::StorageError(e.to_string()))?;
+        let metadata_val: serde_json::Value = row
+            .try_get("", "metadata")
+            .map_err(|e| VectorDBError::StorageError(e.to_string()))?;
+        let metadata = match metadata_val {
+            serde_json::Value::Object(map) => map
+                .into_iter()
+                .collect::<HashMap<String, serde_json::Value>>(),
+            _ => HashMap::new(),
+        };
+        Ok(SearchResult {
+            id,
+            score: 0.0,
+            metadata,
+        })
+    }
 }
 
 #[async_trait]
@@ -494,6 +520,66 @@ impl VectorDB for PgVectorAdapter {
         let mut results = Vec::with_capacity(rows.len());
         for row in &rows {
             results.push(Self::row_to_search_result(row)?);
+        }
+
+        Span::current().record(COGNEE_VECTOR_RESULT_COUNT, results.len() as i64);
+        Ok(results)
+    }
+
+    #[instrument(
+        name = "cognee.db.vector.retrieve",
+        level = "info",
+        skip_all,
+        fields(
+            cognee.db.system = "pgvector",
+            cognee.vector.collection = tracing::field::Empty,
+            cognee.vector.result_count = tracing::field::Empty,
+        ),
+        err,
+    )]
+    async fn retrieve(
+        &self,
+        data_type: &str,
+        field_name: &str,
+        ids: &[Uuid],
+    ) -> VectorDBResult<Vec<SearchResult>> {
+        let coll = Self::collection_name(data_type, field_name)?;
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        Span::current().record(COGNEE_VECTOR_COLLECTION, coll.as_str());
+
+        // Missing collection → empty (deliberate Python-parity divergence from
+        // search_similar/delete_points/collection_size; see the trait
+        // doc-comment on `retrieve`). Prefer the explicit pre-check over
+        // parsing a Postgres "relation does not exist" error.
+        if !self.has_collection(data_type, field_name).await? {
+            return Ok(vec![]);
+        }
+
+        // Chunk the IN-list by BATCH_SIZE (parameter-count safety), mirroring
+        // the placeholder-building shape used by `fetch_metadata`.
+        let mut results = Vec::new();
+        for chunk in ids.chunks(BATCH_SIZE) {
+            let placeholders: Vec<String> =
+                (1..=chunk.len()).map(|i| format!("${i}::uuid")).collect();
+            let sql = format!(
+                r#"SELECT id, metadata FROM "{coll}" WHERE id IN ({})"#,
+                placeholders.join(", ")
+            );
+            let values: Vec<sea_orm::Value> = chunk.iter().map(|id| (*id).into()).collect();
+            let rows = self
+                .db
+                .query_all(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    &sql,
+                    values,
+                ))
+                .await
+                .map_err(|e| VectorDBError::StorageError(e.to_string()))?;
+            for row in &rows {
+                results.push(Self::row_to_retrieve_result(row)?);
+            }
         }
 
         Span::current().record(COGNEE_VECTOR_RESULT_COUNT, results.len() as i64);

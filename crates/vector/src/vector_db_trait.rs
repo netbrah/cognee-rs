@@ -86,6 +86,33 @@ pub trait VectorDB: Send + Sync {
         Ok(())
     }
 
+    /// Fetch stored points by ID (direct lookup, no similarity search).
+    ///
+    /// Returns the stored `metadata` payload for each of the requested `ids`
+    /// that exists in the `(data_type, field_name)` collection, with a
+    /// placeholder `score` of `0.0` on every result (the field only carries
+    /// meaning for similarity search, so callers must not read it as a
+    /// similarity value). Direct port of Python's `VectorDBInterface.retrieve`.
+    ///
+    /// # Semantics
+    /// * **Empty `ids`** → `Ok(vec![])` without touching storage.
+    /// * **Unknown collection** → `Ok(vec![])` (a *deliberate* divergence from
+    ///   [`search_similar`](Self::search_similar) /
+    ///   [`delete_points`](Self::delete_points) /
+    ///   [`collection_size`](Self::collection_size), which return
+    ///   `CollectionNotFound`; faithful to Python, whose adapters special-case
+    ///   a missing collection to `[]`).
+    /// * **IDs not present** in the collection are silently absent from the
+    ///   result — no error, no placeholder entry.
+    /// * **Result order is NOT guaranteed** to match input-`ids` order; callers
+    ///   needing a specific order must re-index by [`SearchResult::id`].
+    async fn retrieve(
+        &self,
+        data_type: &str,
+        field_name: &str,
+        ids: &[Uuid],
+    ) -> VectorDBResult<Vec<SearchResult>>;
+
     /// Get collection statistics
     async fn collection_size(&self, data_type: &str, field_name: &str) -> VectorDBResult<usize>;
 

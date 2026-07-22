@@ -196,6 +196,37 @@ impl VectorDB for BruteForceVectorDB {
             .collect())
     }
 
+    async fn retrieve(
+        &self,
+        data_type: &str,
+        field_name: &str,
+        ids: &[Uuid],
+    ) -> VectorDBResult<Vec<SearchResult>> {
+        // Empty input short-circuits before taking the lock (mirrors
+        // index_points's empty-input guard).
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let key = Self::key(data_type, field_name);
+        let g = self.collections.read().await;
+        // Deliberate divergence from the CollectionNotFound idiom used
+        // elsewhere in this file: a missing collection yields an empty result
+        // (Python-parity — see the trait doc-comment on `retrieve`).
+        let Some(coll) = g.get(&key) else {
+            return Ok(vec![]);
+        };
+        Ok(coll
+            .points
+            .iter()
+            .filter(|p| ids.contains(&p.id))
+            .map(|p| SearchResult {
+                id: p.id,
+                score: 0.0,
+                metadata: p.metadata.clone(),
+            })
+            .collect())
+    }
+
     async fn delete_collection(&self, data_type: &str, field_name: &str) -> VectorDBResult<()> {
         let mut g = self.collections.write().await;
         g.remove(&Self::key(data_type, field_name));
@@ -434,6 +465,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(db.collection_size("T", "f").await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn retrieve_returns_matching_points_only() {
+        let db = BruteForceVectorDB::new();
+        db.create_collection("T", "f", 2).await.unwrap();
+        let mut p1 = point(1, vec![1.0, 0.0]);
+        p1.metadata.insert("k".to_string(), serde_json::json!("v1"));
+        let p2 = point(2, vec![0.0, 1.0]);
+        let p3 = point(3, vec![1.0, 1.0]);
+        db.index_points("T", "f", &[p1, p2, p3]).await.unwrap();
+
+        let unknown = Uuid::from_u128(999);
+        let results = db
+            .retrieve("T", "f", &[Uuid::from_u128(1), Uuid::from_u128(2), unknown])
+            .await
+            .unwrap();
+
+        // Exactly the two known ids, order-independent.
+        let ids: std::collections::HashSet<Uuid> = results.iter().map(|r| r.id).collect();
+        assert_eq!(
+            ids,
+            [Uuid::from_u128(1), Uuid::from_u128(2)]
+                .into_iter()
+                .collect()
+        );
+        for r in &results {
+            assert_eq!(r.score, 0.0, "retrieve always sets score to 0.0");
+        }
+        // Metadata is returned verbatim.
+        let r1 = results.iter().find(|r| r.id == Uuid::from_u128(1)).unwrap();
+        assert_eq!(r1.metadata.get("k"), Some(&serde_json::json!("v1")));
+    }
+
+    #[tokio::test]
+    async fn retrieve_missing_collection_returns_empty() {
+        let db = BruteForceVectorDB::new();
+        // Never created — must be Ok([]), not Err(CollectionNotFound).
+        let results = db
+            .retrieve("Nope", "field", &[Uuid::from_u128(1)])
+            .await
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn retrieve_empty_ids_returns_empty() {
+        let db = BruteForceVectorDB::new();
+        db.create_collection("T", "f", 2).await.unwrap();
+        db.index_points("T", "f", &[point(1, vec![1.0, 0.0])])
+            .await
+            .unwrap();
+        let results = db.retrieve("T", "f", &[]).await.unwrap();
+        assert!(results.is_empty());
     }
 
     #[tokio::test]

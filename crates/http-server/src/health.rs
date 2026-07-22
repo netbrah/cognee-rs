@@ -891,6 +891,14 @@ mod tests {
 
     #[async_trait]
     impl cognee_vector::VectorDB for FailingVectorDB {
+        async fn retrieve(
+            &self,
+            data_type: &str,
+            field_name: &str,
+            ids: &[uuid::Uuid],
+        ) -> cognee_vector::VectorDBResult<Vec<cognee_vector::SearchResult>> {
+            self.inner.retrieve(data_type, field_name, ids).await
+        }
         async fn create_collection(
             &self,
             data_type: &str,

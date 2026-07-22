@@ -3,6 +3,10 @@
     clippy::expect_used,
     reason = "test code — panics are acceptable failures"
 )]
+// Each integration binary (brute-force, pgvector, …) pulls in this shared
+// module but exercises a different subset of the contract helpers, so the
+// unused ones would otherwise trip dead-code warnings per test crate.
+#![allow(dead_code)]
 //! Shared VectorDB contract tests.
 //!
 //! Each function exercises one aspect of the [`VectorDB`] trait and can be
@@ -224,6 +228,80 @@ pub async fn test_delete_points(db: &dyn VectorDB) {
 
     db.delete_points("DelPts", "f", &[id1]).await.unwrap();
     assert_eq!(db.collection_size("DelPts", "f").await.unwrap(), 1);
+}
+
+// -- retrieve ---------------------------------------------------------------
+
+pub async fn test_retrieve_round_trip(db: &dyn VectorDB) {
+    db.create_collection("Retr", "f", 2).await.unwrap();
+    let id1 = Uuid::new_v4();
+    let id2 = Uuid::new_v4();
+    let id3 = Uuid::new_v4();
+    let points = vec![
+        VectorPoint::new(id1, vec![1.0, 0.0]).with_metadata("k", json!("v1")),
+        VectorPoint::new(id2, vec![0.0, 1.0]).with_metadata("k", json!("v2")),
+        VectorPoint::new(id3, vec![1.0, 1.0]).with_metadata("k", json!("v3")),
+    ];
+    db.index_points("Retr", "f", &points).await.unwrap();
+
+    let unknown = Uuid::new_v4();
+    // Subset + a duplicated id + a nonexistent id, all in one call.
+    let results = db
+        .retrieve("Retr", "f", &[id1, id1, id2, unknown])
+        .await
+        .unwrap();
+
+    // Order-independent set equality against the requested-known ids.
+    let got: std::collections::HashSet<Uuid> = results.iter().map(|r| r.id).collect();
+    let want: std::collections::HashSet<Uuid> = [id1, id2].into_iter().collect();
+    assert_eq!(
+        got, want,
+        "retrieve should return exactly the known requested ids"
+    );
+    for r in &results {
+        assert_eq!(r.score, 0.0, "retrieve always sets score to 0.0");
+    }
+    let r1 = results.iter().find(|r| r.id == id1).unwrap();
+    assert_eq!(r1.metadata.get("k"), Some(&json!("v1")));
+}
+
+pub async fn test_retrieve_missing_collection(db: &dyn VectorDB) {
+    // Never created — must be Ok([]), not Err.
+    let results = db
+        .retrieve("NoSuchRetr", "nope", &[Uuid::new_v4()])
+        .await
+        .unwrap();
+    assert!(results.is_empty(), "missing collection must retrieve to []");
+}
+
+pub async fn test_retrieve_empty_ids(db: &dyn VectorDB) {
+    db.create_collection("RetrEmpty", "f", 2).await.unwrap();
+    db.index_points(
+        "RetrEmpty",
+        "f",
+        &[VectorPoint::new(Uuid::new_v4(), vec![1.0, 0.0])],
+    )
+    .await
+    .unwrap();
+    let results = db.retrieve("RetrEmpty", "f", &[]).await.unwrap();
+    assert!(results.is_empty(), "empty ids must retrieve to []");
+}
+
+pub async fn test_retrieve_chunking(db: &dyn VectorDB) {
+    db.create_collection("RetrChunk", "f", 2).await.unwrap();
+    let ids: Vec<Uuid> = (0..101).map(|_| Uuid::new_v4()).collect();
+    let points: Vec<VectorPoint> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| VectorPoint::new(*id, vec![i as f32, 1.0]))
+        .collect();
+    db.index_points("RetrChunk", "f", &points).await.unwrap();
+
+    // 101 ids exceeds pgvector's BATCH_SIZE (100), exercising the chunk loop.
+    let results = db.retrieve("RetrChunk", "f", &ids).await.unwrap();
+    let got: std::collections::HashSet<Uuid> = results.iter().map(|r| r.id).collect();
+    let want: std::collections::HashSet<Uuid> = ids.iter().copied().collect();
+    assert_eq!(got, want, "all 101 ids should round-trip across batches");
 }
 
 // -- batch search -----------------------------------------------------------

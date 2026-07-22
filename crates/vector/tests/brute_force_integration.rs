@@ -9,6 +9,8 @@
     reason = "integration test — panics are acceptable"
 )]
 
+mod common;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -113,4 +115,26 @@ async fn brute_force_end_to_end_search_and_prune() {
     // prune() (default trait impl): list → delete each collection.
     db.prune().await.unwrap();
     assert!(db.list_collections().await.unwrap().is_empty());
+}
+
+// -- retrieve contract (shared helpers) -------------------------------------
+
+#[tokio::test]
+async fn brute_force_retrieve_round_trip() {
+    common::test_retrieve_round_trip(&BruteForceVectorDB::new()).await;
+}
+
+#[tokio::test]
+async fn brute_force_retrieve_missing_collection() {
+    common::test_retrieve_missing_collection(&BruteForceVectorDB::new()).await;
+}
+
+#[tokio::test]
+async fn brute_force_retrieve_empty_ids() {
+    common::test_retrieve_empty_ids(&BruteForceVectorDB::new()).await;
+}
+
+#[tokio::test]
+async fn brute_force_retrieve_chunking() {
+    common::test_retrieve_chunking(&BruteForceVectorDB::new()).await;
 }

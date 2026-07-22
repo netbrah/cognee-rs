@@ -66,3 +66,7 @@ pgvector_test!(test_metadata_preserved);
 pgvector_test!(test_uuid_round_trip);
 pgvector_test!(test_delete_points);
 pgvector_test!(test_batch_search);
+pgvector_test!(test_retrieve_round_trip);
+pgvector_test!(test_retrieve_missing_collection);
+pgvector_test!(test_retrieve_empty_ids);
+pgvector_test!(test_retrieve_chunking);

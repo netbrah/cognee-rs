@@ -265,6 +265,35 @@ impl VectorDB for MockVectorDB {
         Ok(results)
     }
 
+    async fn retrieve(
+        &self,
+        data_type: &str,
+        field_name: &str,
+        ids: &[Uuid],
+    ) -> VectorDBResult<Vec<SearchResult>> {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let key = Self::collection_key(data_type, field_name);
+        let collections = self.collections.lock().unwrap(); // lock poison is unrecoverable
+        // Deliberate divergence from the CollectionNotFound idiom: a missing
+        // collection yields an empty result (Python-parity — see the trait
+        // doc-comment on `retrieve`).
+        let Some(collection) = collections.get(&key) else {
+            return Ok(vec![]);
+        };
+        Ok(collection
+            .points
+            .iter()
+            .filter(|p| ids.contains(&p.id))
+            .map(|p| SearchResult {
+                id: p.id,
+                score: 0.0,
+                metadata: p.metadata.clone(),
+            })
+            .collect())
+    }
+
     async fn delete_collection(&self, data_type: &str, field_name: &str) -> VectorDBResult<()> {
         let key = Self::collection_key(data_type, field_name);
         let mut collections = self.collections.lock().unwrap(); // lock poison is unrecoverable
@@ -382,6 +411,57 @@ mod tests {
             collections.contains(&("Entity".to_string(), "name".to_string())),
             "Entity:name should be listed"
         );
+    }
+
+    #[tokio::test]
+    async fn test_mock_retrieve_returns_matching_points_only() {
+        let db = MockVectorDB::new();
+        db.create_collection("T", "f", 2).await.unwrap();
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let id3 = Uuid::new_v4();
+        let points = vec![
+            VectorPoint::new(id1, vec![1.0, 0.0]).with_metadata("k", json!("v1")),
+            VectorPoint::new(id2, vec![0.0, 1.0]),
+            VectorPoint::new(id3, vec![1.0, 1.0]),
+        ];
+        db.index_points("T", "f", &points).await.unwrap();
+
+        let unknown = Uuid::new_v4();
+        let results = db.retrieve("T", "f", &[id1, id2, unknown]).await.unwrap();
+
+        let ids: std::collections::HashSet<Uuid> = results.iter().map(|r| r.id).collect();
+        assert_eq!(ids, [id1, id2].into_iter().collect());
+        for r in &results {
+            assert_eq!(r.score, 0.0, "retrieve always sets score to 0.0");
+        }
+        let r1 = results.iter().find(|r| r.id == id1).unwrap();
+        assert_eq!(r1.metadata.get("k"), Some(&json!("v1")));
+    }
+
+    #[tokio::test]
+    async fn test_mock_retrieve_missing_collection_returns_empty() {
+        let db = MockVectorDB::new();
+        let results = db
+            .retrieve("Nope", "field", &[Uuid::new_v4()])
+            .await
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_mock_retrieve_empty_ids_returns_empty() {
+        let db = MockVectorDB::new();
+        db.create_collection("T", "f", 2).await.unwrap();
+        db.index_points(
+            "T",
+            "f",
+            &[VectorPoint::new(Uuid::new_v4(), vec![1.0, 0.0])],
+        )
+        .await
+        .unwrap();
+        let results = db.retrieve("T", "f", &[]).await.unwrap();
+        assert!(results.is_empty());
     }
 
     #[tokio::test]

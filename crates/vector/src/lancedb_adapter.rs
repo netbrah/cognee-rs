@@ -406,6 +406,58 @@ impl VectorDB for LanceDbAdapter {
         search_results_from_batches(batches)
     }
 
+    async fn retrieve(
+        &self,
+        data_type: &str,
+        field_name: &str,
+        ids: &[Uuid],
+    ) -> VectorDBResult<Vec<SearchResult>> {
+        // Avoid building an `id IN ()` predicate, which lance rejects as a
+        // parse error; a missing collection returns `[]` below.
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let name = collection_name(data_type, field_name);
+        let table = match self.connection.open_table(&name).execute().await {
+            Ok(t) => t,
+            // Deliberate divergence from search_similar/collection_size: a
+            // missing collection yields an empty result (Python-parity — see
+            // the trait doc-comment on `retrieve`).
+            Err(lancedb::Error::TableNotFound { .. }) => return Ok(vec![]),
+            Err(other) => return Err(map_lance_err(other)),
+        };
+        // Same hex-literal `id IN (X'..', ...)` predicate the writer path
+        // (index_points / delete_points) builds.
+        let id_values: Vec<String> = ids
+            .iter()
+            .map(|id| {
+                let hex: String = id.as_bytes().iter().map(|b| format!("{b:02X}")).collect();
+                format!("X'{hex}'")
+            })
+            .collect();
+        let predicate = format!("id IN ({})", id_values.join(", "));
+        let stream = table
+            .query()
+            .only_if(predicate)
+            .execute()
+            .await
+            .map_err(map_lance_err)?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(map_lance_err)?;
+        // `id_metadata_from_batches` decodes a plain (non-`nearest_to`) query
+        // with no `_distance` column, so `search_results_from_batches` cannot
+        // be reused here. Any requested id absent from storage is naturally
+        // dropped by the map — that is the missing-id behavior, for free.
+        let id_map = id_metadata_from_batches(batches)?;
+        Ok(id_map
+            .into_iter()
+            .map(|(id, metadata)| SearchResult {
+                id,
+                score: 0.0,
+                metadata,
+            })
+            .collect())
+    }
+
     async fn delete_collection(&self, data_type: &str, field_name: &str) -> VectorDBResult<()> {
         let name = collection_name(data_type, field_name);
         match self.connection.drop_table(&name, &[]).await {
@@ -732,6 +784,61 @@ mod tests {
             ),
             "expected DimensionMismatch, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn retrieve_returns_matching_points_only() {
+        let (adapter, _dir) = fresh_adapter().await;
+        adapter.create_collection("Chunk", "text", 2).await.unwrap();
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let id3 = Uuid::new_v4();
+        adapter
+            .index_points(
+                "Chunk",
+                "text",
+                &[
+                    point(id1, vec![1.0, 0.0], "a"),
+                    point(id2, vec![0.0, 1.0], "b"),
+                    point(id3, vec![1.0, 1.0], "c"),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let unknown = Uuid::new_v4();
+        // Duplicated id + a nonexistent id in the same call.
+        let results = adapter
+            .retrieve("Chunk", "text", &[id1, id1, id2, unknown])
+            .await
+            .unwrap();
+
+        let ids: std::collections::HashSet<Uuid> = results.iter().map(|r| r.id).collect();
+        assert_eq!(ids, [id1, id2].into_iter().collect());
+        for r in &results {
+            assert_eq!(r.score, 0.0, "retrieve always sets score to 0.0");
+        }
+        let r1 = results.iter().find(|r| r.id == id1).unwrap();
+        assert_eq!(r1.metadata.get("kind").unwrap(), &json!("a"));
+    }
+
+    #[tokio::test]
+    async fn retrieve_missing_collection_returns_empty() {
+        let (adapter, _dir) = fresh_adapter().await;
+        // Table was never created → TableNotFound must map to Ok([]).
+        let results = adapter
+            .retrieve("Nope", "text", &[Uuid::new_v4()])
+            .await
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn retrieve_empty_ids_returns_empty() {
+        let (adapter, _dir) = fresh_adapter().await;
+        adapter.create_collection("Chunk", "text", 2).await.unwrap();
+        let results = adapter.retrieve("Chunk", "text", &[]).await.unwrap();
+        assert!(results.is_empty());
     }
 
     #[tokio::test]
