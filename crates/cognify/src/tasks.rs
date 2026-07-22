@@ -218,6 +218,8 @@ pub async fn extract_chunks_from_documents(
                 if document.base.belongs_to_set.is_some() {
                     chunk.base.belongs_to_set = document.base.belongs_to_set.clone();
                 }
+                // Propagate importance_weight (always Some after classify) — unconditional.
+                chunk.base.importance_weight = document.base.importance_weight;
                 // Token count write-back
                 if let Some(db) = db
                     && let Err(e) = cognee_database::ops::data::update_data_token_count(
@@ -273,6 +275,12 @@ pub async fn extract_chunks_from_documents(
             for chunk in &mut chunks {
                 chunk.base.belongs_to_set = document.base.belongs_to_set.clone();
             }
+        }
+
+        // Propagate importance_weight from Document to each DocumentChunk
+        // (always Some after classify) — unconditional, unlike belongs_to_set.
+        for chunk in &mut chunks {
+            chunk.base.importance_weight = document.base.importance_weight;
         }
 
         // Accumulate token count and write back to the Data record.
@@ -3750,6 +3758,7 @@ mod tests {
         let doc_id = Uuid::new_v4();
         let mut base = DataPoint::new("TextDocument", None);
         base.id = doc_id;
+        base.importance_weight = Some(0.9);
         base.set_metadata("index_fields", serde_json::json!(["name"]));
         let doc = Document {
             base,
@@ -3781,6 +3790,14 @@ mod tests {
         .await
         .unwrap();
         assert!(!result.chunks.is_empty());
+        // importance_weight propagates from Document to every chunk (regular path).
+        assert!(
+            result
+                .chunks
+                .iter()
+                .all(|c| c.base.importance_weight == Some(0.9)),
+            "every chunk must inherit the document's importance_weight"
+        );
     }
 
     /// Drives the cognify-level provenance wrapper (`upsert_provenance`) and its
@@ -3884,6 +3901,7 @@ mod tests {
         let doc_id = Uuid::new_v4();
         let mut base = DataPoint::new("DltRowDocument", None);
         base.id = doc_id;
+        base.importance_weight = Some(0.7);
         base.set_metadata("index_fields", serde_json::json!(["text"]));
         let doc = Document {
             base,
@@ -3921,6 +3939,8 @@ mod tests {
         assert_eq!(chunk.cut_type, "dlt_row");
         assert_eq!(chunk.chunk_index, 0);
         assert_eq!(chunk.document_id, doc_id);
+        // importance_weight propagates on the DLT short-circuit path too.
+        assert_eq!(chunk.base.importance_weight, Some(0.7));
     }
 
     #[tokio::test]

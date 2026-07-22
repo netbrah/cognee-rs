@@ -174,10 +174,17 @@ impl SummaryExtractor {
         // stream yields owned items. Mapping a stream over borrowed `&chunk`
         // references trips a higher-ranked-lifetime inference bug when the
         // surrounding future is boxed; owning the items avoids it.
-        let inputs: Vec<(usize, String, uuid::Uuid)> = chunks
+        let inputs: Vec<(usize, String, uuid::Uuid, Option<f64>)> = chunks
             .iter()
             .enumerate()
-            .map(|(index, chunk)| (index, chunk.text.clone(), chunk.base.id))
+            .map(|(index, chunk)| {
+                (
+                    index,
+                    chunk.text.clone(),
+                    chunk.base.id,
+                    chunk.base.importance_weight,
+                )
+            })
             .collect();
 
         // Bounded-concurrency pipeline: at most `max_parallel` summarization
@@ -188,7 +195,7 @@ impl SummaryExtractor {
         // of order, so each future carries its chunk index and we re-sort to
         // preserve the input order the callers expect.
         let mut indexed: Vec<(usize, TextSummary)> = stream::iter(inputs)
-            .map(|(index, text, chunk_id)| {
+            .map(|(index, text, chunk_id, importance_weight)| {
                 let llm = Arc::clone(&self.llm);
                 let summary_schema = self.summary_schema.clone();
                 let model_name = model_name.clone();
@@ -196,8 +203,10 @@ impl SummaryExtractor {
                 async move {
                     let summarized =
                         summarize_one(&llm, &summary_schema, &text, prompt.as_deref()).await?;
-                    let summary =
+                    let mut summary =
                         TextSummary::from_summarized_content(chunk_id, summarized, model_name);
+                    // Port of summarize_text.py:81 — carry importance_weight from source chunk.
+                    summary.base.importance_weight = importance_weight;
                     Ok::<(usize, TextSummary), CognifyError>((index, summary))
                 }
             })
@@ -292,17 +301,22 @@ mod tests {
         let doc_id = Uuid::new_v4();
         let chunks: Vec<DocumentChunk> = (0..10)
             .map(|i| {
-                DocumentChunk::new(
+                let mut chunk = DocumentChunk::new(
                     Uuid::new_v4(),
                     format!("chunk text {i}"),
                     3,
                     i,
                     "paragraph_end".to_string(),
                     doc_id,
-                )
+                );
+                // Distinct non-default importance_weight per chunk to verify propagation.
+                chunk.base.importance_weight = Some(0.1 * (i as f64 + 1.0));
+                chunk
             })
             .collect();
         let expected: Vec<Option<Uuid>> = chunks.iter().map(|c| Some(c.base.id)).collect();
+        let expected_weights: Vec<Option<f64>> =
+            chunks.iter().map(|c| c.base.importance_weight).collect();
 
         let extractor = SummaryExtractor::new(llm).with_max_parallel(3);
         let summaries = extractor.summarize_chunks(&chunks, None).await.unwrap();
@@ -312,6 +326,14 @@ mod tests {
         assert_eq!(tracker.calls.load(Ordering::SeqCst), 10);
         let got: Vec<Option<Uuid>> = summaries.iter().map(|s| s.made_from).collect();
         assert_eq!(got, expected, "summaries must preserve input chunk order");
+
+        // Each summary carries its source chunk's importance_weight.
+        let got_weights: Vec<Option<f64>> =
+            summaries.iter().map(|s| s.base.importance_weight).collect();
+        assert_eq!(
+            got_weights, expected_weights,
+            "importance_weight must propagate from chunk to summary"
+        );
 
         // Concurrency was real (overlapping) but never exceeded the cap of 3.
         let peak = tracker.max_seen.load(Ordering::SeqCst);

@@ -102,6 +102,7 @@ impl EdgeType {
                 source_user: None,
                 source_content_hash: None,
                 feedback_weight: 0.5,
+                importance_weight: Some(0.5),
             },
             relationship_name: name,
             number_of_edges: 0,
