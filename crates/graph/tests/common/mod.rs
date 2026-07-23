@@ -529,3 +529,105 @@ pub async fn test_properties_json_round_trip(db: &dyn GraphDBTrait) {
         1
     );
 }
+
+// -- get_neighborhood --------------------------------------------------------
+
+pub async fn test_get_neighborhood_depth1(db: &dyn GraphDBTrait) {
+    db.delete_graph().await.unwrap();
+
+    // Fixture: `seed` is the stored TARGET of `source -> seed` (rel "in") and
+    // the stored SOURCE of `seed -> target` (rel "out"). `far` is two hops away
+    // via `target -> far` and must NOT appear at depth 1.
+    let seed = TestNode::new("seed", "Seed", "T", 0);
+    let target = TestNode::new("target", "Target", "T", 0);
+    let source = TestNode::new("source", "Source", "T", 0);
+    let far = TestNode::new("far", "Far", "T", 0);
+    db.add_nodes(&[&seed, &target, &source, &far])
+        .await
+        .unwrap();
+
+    db.add_edge("seed", "target", "out", None).await.unwrap();
+    db.add_edge("source", "seed", "in", None).await.unwrap();
+    db.add_edge("target", "far", "out", None).await.unwrap();
+
+    let (nodes, edges) = db.get_neighborhood(&["seed".to_string()], 1).await.unwrap();
+
+    // Node set is exactly {seed, target, source} — not `far`.
+    let node_ids: std::collections::HashSet<&str> =
+        nodes.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(node_ids.len(), 3, "expected exactly seed, target, source");
+    assert!(node_ids.contains("seed"));
+    assert!(node_ids.contains("target"));
+    assert!(node_ids.contains("source"));
+    assert!(!node_ids.contains("far"), "far is two hops away");
+
+    // Exact-direction (anti-flip) assertions — the regression guard for
+    // locked decision 6.
+    let edge_set: std::collections::HashSet<(&str, &str, &str)> = edges
+        .iter()
+        .map(|(s, t, r, _)| (s.as_str(), t.as_str(), r.as_str()))
+        .collect();
+    assert!(
+        edge_set.contains(&("source", "seed", "in")),
+        "stored direction source->seed must be preserved, got {edge_set:?}"
+    );
+    assert!(
+        edge_set.contains(&("seed", "target", "out")),
+        "stored direction seed->target must be preserved, got {edge_set:?}"
+    );
+    // The flipped forms must be ABSENT.
+    assert!(
+        !edge_set.contains(&("seed", "source", "in")),
+        "flipped edge seed->source must NOT appear"
+    );
+    assert!(
+        !edge_set.contains(&("target", "seed", "out")),
+        "flipped edge target->seed must NOT appear"
+    );
+    // The two-hop edge must not appear (far not in the resolved set).
+    assert!(!edge_set.contains(&("target", "far", "out")));
+    assert_eq!(edges.len(), 2, "exactly the two seed-incident edges");
+}
+
+pub async fn test_get_neighborhood_multiple_seeds(db: &dyn GraphDBTrait) {
+    db.delete_graph().await.unwrap();
+
+    // Two seeds (s1, s2) share one common neighbor (`shared`) and have one edge
+    // directly between them.
+    let s1 = TestNode::new("s1", "S1", "T", 0);
+    let s2 = TestNode::new("s2", "S2", "T", 0);
+    let shared = TestNode::new("shared", "Shared", "T", 0);
+    db.add_nodes(&[&s1, &s2, &shared]).await.unwrap();
+
+    db.add_edge("s1", "shared", "r", None).await.unwrap();
+    db.add_edge("s2", "shared", "r", None).await.unwrap();
+    db.add_edge("s1", "s2", "between", None).await.unwrap();
+
+    let (nodes, edges) = db
+        .get_neighborhood(&["s1".to_string(), "s2".to_string()], 1)
+        .await
+        .unwrap();
+
+    // `shared` must appear exactly once (dedup across the two seeds).
+    let shared_count = nodes.iter().filter(|(id, _)| id == "shared").count();
+    assert_eq!(shared_count, 1, "shared neighbor must be deduped");
+    assert_eq!(nodes.len(), 3, "expected exactly s1, s2, shared");
+
+    // The seed-seed edge must appear exactly once.
+    let between_count = edges
+        .iter()
+        .filter(|(s, t, r, _)| s == "s1" && t == "s2" && r == "between")
+        .count();
+    assert_eq!(between_count, 1, "seed-seed edge must appear exactly once");
+    assert_eq!(edges.len(), 3, "all three edges, no duplicates");
+}
+
+pub async fn test_get_neighborhood_empty_seeds(db: &dyn GraphDBTrait) {
+    db.delete_graph().await.unwrap();
+
+    // Empty seeds must short-circuit to an empty result without issuing a query
+    // that would error on an empty `IN (...)` / `unnest`.
+    let (nodes, edges) = db.get_neighborhood(&[], 1).await.unwrap();
+    assert!(nodes.is_empty());
+    assert!(edges.is_empty());
+}

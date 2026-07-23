@@ -65,3 +65,6 @@ ladybug_test!(test_get_id_filtered_graph_data);
 ladybug_test!(test_delete_graph);
 ladybug_test!(test_node_delete_cascades_edges);
 ladybug_test!(test_properties_json_round_trip);
+ladybug_test!(test_get_neighborhood_depth1);
+ladybug_test!(test_get_neighborhood_multiple_seeds);
+ladybug_test!(test_get_neighborhood_empty_seeds);

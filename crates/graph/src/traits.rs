@@ -50,6 +50,7 @@ pub type EdgeKey = (String, String, String);
 /// - `get_graph_metrics()` - Get graph statistics
 /// - `get_filtered_graph_data()` - Get filtered subgraph
 /// - `get_nodeset_subgraph()` - Get subgraph for specific nodes
+/// - `get_neighborhood()` - Get k-hop subgraph around a set of seed nodes
 #[async_trait]
 pub trait GraphDBTrait: Send + Sync {
     /// Initialize the database schema.
@@ -493,6 +494,107 @@ pub trait GraphDBTrait: Send + Sync {
             .collect();
 
         Ok((filtered_nodes, filtered_edges))
+    }
+
+    /// Fetch the raw k-hop neighborhood subgraph around a set of seed node ids.
+    ///
+    /// Returns every node reachable within `depth` hops of any seed, together
+    /// with every edge whose endpoints are both in that resolved set, in the
+    /// same `(nodes, edges)` shape as [`get_graph_data`]. Edges preserve their
+    /// **true stored** `(source_id, target_id)` direction; the caller is
+    /// responsible for any partitioning (e.g. keeping only edges incident to a
+    /// seed).
+    ///
+    /// Default implementation performs a layered BFS over [`get_connections`].
+    /// Backends should override with a single batched query for efficiency and,
+    /// in Ladybug's case, to return direction-correct edges (its
+    /// `get_connections`/`get_edges` report the queried node as the source
+    /// regardless of the stored direction).
+    ///
+    /// Note: at `depth == 0` this default path returns only the seed nodes with
+    /// no edges, whereas the real-backend overrides include seed-to-seed edges.
+    /// Phase 1 only ever calls with `depth == 1`.
+    async fn get_neighborhood(
+        &self,
+        node_ids: &[String],
+        depth: usize,
+    ) -> GraphDBResult<(Vec<GraphNode>, Vec<EdgeData>)> {
+        if node_ids.is_empty() {
+            return Ok((vec![], vec![]));
+        }
+
+        let mut nodes_by_id: HashMap<String, NodeData> = HashMap::new();
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut frontier: Vec<String> = Vec::new();
+
+        for id in node_ids {
+            if visited.insert(id.clone()) {
+                frontier.push(id.clone());
+                // Seed node lookup so isolated seeds still appear in the output.
+                if let Some(node) = self.get_node(id).await? {
+                    nodes_by_id.insert(id.clone(), node);
+                }
+            }
+        }
+
+        let mut edges: Vec<EdgeData> = Vec::new();
+        let mut edge_keys: HashSet<EdgeKey> = HashSet::new();
+
+        for _ in 0..depth {
+            let mut next_frontier: Vec<String> = Vec::new();
+            for id in &frontier {
+                for (source_node, edge_props, target_node) in self.get_connections(id).await? {
+                    let source_id = source_node
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let target_id = target_node
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let relationship_name = edge_props
+                        .get("relationship_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+
+                    let key: EdgeKey = (
+                        source_id.clone(),
+                        target_id.clone(),
+                        relationship_name.clone(),
+                    );
+                    if edge_keys.insert(key) {
+                        edges.push((
+                            source_id.clone(),
+                            target_id.clone(),
+                            relationship_name,
+                            edge_props,
+                        ));
+                    }
+
+                    // The endpoint that isn't the queried node is a candidate
+                    // neighbor for the next layer.
+                    let neighbor_id = if source_id == *id {
+                        target_id.clone()
+                    } else {
+                        source_id.clone()
+                    };
+                    nodes_by_id.insert(source_id, source_node);
+                    nodes_by_id.insert(target_id, target_node);
+                    if visited.insert(neighbor_id.clone()) {
+                        next_frontier.push(neighbor_id);
+                    }
+                }
+            }
+            if next_frontier.is_empty() {
+                break;
+            }
+            frontier = next_frontier;
+        }
+
+        Ok((nodes_by_id.into_iter().collect(), edges))
     }
 }
 

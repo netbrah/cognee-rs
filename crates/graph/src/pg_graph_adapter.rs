@@ -1265,6 +1265,79 @@ impl GraphDBTrait for PgGraphAdapter {
 
         Ok((nodes, edges))
     }
+
+    async fn get_neighborhood(
+        &self,
+        node_ids: &[String],
+        depth: usize,
+    ) -> GraphDBResult<(Vec<GraphNode>, Vec<EdgeData>)> {
+        if node_ids.is_empty() {
+            return Ok((vec![], vec![]));
+        }
+
+        // Single recursive-CTE round trip: expand the seed set out to `depth`
+        // hops, then return both the node rows and the edges internal to the
+        // resolved set. `ge.source_id`/`ge.target_id` are selected straight off
+        // graph_edge (no CASE swap), so the true stored direction is preserved.
+        // The two result halves are discriminated by a literal `kind` column;
+        // the edge half's properties are aliased `edge_properties` to avoid a
+        // collision with the node half's `properties` column.
+        let sql = "WITH RECURSIVE neighborhood(id, hops) AS ( \
+                       SELECT unnest($1::text[]), 0 \
+                       UNION \
+                       SELECT CASE WHEN e.source_id = n.id THEN e.target_id ELSE e.source_id END, \
+                              n.hops + 1 \
+                       FROM neighborhood n \
+                       JOIN graph_edge e ON (e.source_id = n.id OR e.target_id = n.id) \
+                       WHERE n.hops < $2 \
+                   ), \
+                   ids AS (SELECT DISTINCT id FROM neighborhood) \
+                   SELECT 'node' AS kind, gn.id, gn.name, gn.type, gn.properties, \
+                          NULL::text AS source_id, NULL::text AS target_id, \
+                          NULL::text AS relationship_name, NULL::jsonb AS edge_properties \
+                   FROM graph_node gn WHERE gn.id IN (SELECT id FROM ids) \
+                   UNION ALL \
+                   SELECT 'edge', NULL, NULL, NULL, NULL, \
+                          ge.source_id, ge.target_id, ge.relationship_name, ge.properties \
+                   FROM graph_edge ge \
+                   WHERE ge.source_id IN (SELECT id FROM ids) \
+                     AND ge.target_id IN (SELECT id FROM ids)";
+
+        let rows = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                sql,
+                [node_ids.to_vec().into(), (depth as i64).into()],
+            ))
+            .await
+            .map_err(|e| GraphDBError::QueryError(e.to_string()))?;
+
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        for row in &rows {
+            let kind: String = row.try_get("", "kind").unwrap_or_default();
+            if kind == "node" {
+                let data = Self::parse_node_row(row)?;
+                let id = data
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                nodes.push((id, data));
+            } else {
+                edges.push(Self::parse_edge_row_cols(
+                    row,
+                    "source_id",
+                    "target_id",
+                    "relationship_name",
+                    "edge_properties",
+                )?);
+            }
+        }
+
+        Ok((nodes, edges))
+    }
 }
 
 // ---------------------------------------------------------------------------

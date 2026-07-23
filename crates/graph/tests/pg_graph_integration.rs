@@ -71,3 +71,6 @@ pggraph_test!(test_get_id_filtered_graph_data);
 pggraph_test!(test_delete_graph);
 pggraph_test!(test_node_delete_cascades_edges);
 pggraph_test!(test_properties_json_round_trip);
+pggraph_test!(test_get_neighborhood_depth1);
+pggraph_test!(test_get_neighborhood_multiple_seeds);
+pggraph_test!(test_get_neighborhood_empty_seeds);

@@ -1439,6 +1439,105 @@ impl GraphDBTrait for LadybugAdapter {
         Ok((nodes, edges))
     }
 
+    async fn get_neighborhood(
+        &self,
+        node_ids: &[String],
+        depth: usize,
+    ) -> GraphDBResult<(Vec<GraphNode>, Vec<EdgeData>)> {
+        use std::collections::HashSet;
+
+        if node_ids.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        // Escaped, quoted, bracketed seed-id list for the traversal query.
+        let seed_list = node_ids
+            .iter()
+            .map(|id| format!("'{}'", id.replace('\\', "\\\\").replace('\'', "\\'")))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        // Resolve the full node-id set: seeds plus every node reachable within
+        // `depth` undirected hops. Undirected traversal is correct here —
+        // direction only matters for the edges we ultimately return, not for
+        // which node ids count as within range.
+        let mut all_ids: HashSet<String> = node_ids.iter().cloned().collect();
+
+        if depth > 0 {
+            let neighbor_query = format!(
+                "MATCH (seed:Node)-[r:EDGE*1..{depth}]-(neighbor:Node) WHERE seed.id IN [{seed_list}] RETURN DISTINCT neighbor.id"
+            );
+            let neighbor_results = self.execute_query(&neighbor_query)?;
+            for row in &neighbor_results {
+                if let Some(id) = row.first().and_then(|v| v.as_str()) {
+                    all_ids.insert(id.to_string());
+                }
+            }
+        }
+
+        let id_list = all_ids
+            .iter()
+            .map(|id| format!("'{}'", id.replace('\\', "\\\\").replace('\'', "\\'")))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        // Fetch full node rows for every id in the resolved set.
+        let nodes_query = format!(
+            "MATCH (n:Node) WHERE n.id IN [{id_list}] RETURN n.id AS id, n.name AS name, n.type AS type, n.properties AS properties"
+        );
+        let node_results = self.execute_query(&nodes_query)?;
+
+        let mut nodes: Vec<GraphNode> = Vec::new();
+        for row in node_results {
+            if row.len() >= Self::NODE_QUERY_COLUMN_COUNT {
+                let mut node_data = NodeData::new();
+                if let Some(id_str) = row[0].as_str() {
+                    node_data.insert(Cow::Borrowed("id"), json!(id_str));
+                }
+                if let Some(name_str) = row[1].as_str() {
+                    node_data.insert(Cow::Borrowed("name"), json!(name_str));
+                }
+                if let Some(type_str) = row[2].as_str() {
+                    node_data.insert(Cow::Borrowed("type"), json!(type_str));
+                }
+                if let Some(props_str) = row[3].as_str() {
+                    node_data.insert(Cow::Borrowed("properties"), json!(props_str));
+                }
+                let parsed_node = self.parse_node_data(node_data)?;
+                if let Some(id_str) = parsed_node.get("id").and_then(|v| v.as_str()) {
+                    nodes.push((id_str.to_string(), parsed_node));
+                }
+            }
+        }
+
+        // Fetch edges with the DIRECTED pattern so the true stored direction is
+        // preserved. This is the bug fix vs. the undirected
+        // get_connections/get_edges, which always report the queried node as the
+        // source: `a.id`/`b.id` come straight from the directed match here.
+        let edges_query = format!(
+            "MATCH (a:Node)-[r:EDGE]->(b:Node) WHERE a.id IN [{id_list}] AND b.id IN [{id_list}] RETURN a.id, b.id, r.relationship_name, r.properties"
+        );
+        let edge_results = self.execute_query(&edges_query)?;
+
+        let mut edges = Vec::new();
+        for row in edge_results {
+            if row.len() >= Self::EDGE_QUERY_COLUMN_COUNT {
+                let source_id = row[0].as_str().unwrap_or("").to_string();
+                let target_id = row[1].as_str().unwrap_or("").to_string();
+                let rel_name = row[2].as_str().unwrap_or("").to_string();
+                let props = if let Some(props_str) = row[3].as_str() {
+                    let clean = sanitize_json_control_chars(props_str);
+                    serde_json::from_str(&clean).unwrap_or_default()
+                } else {
+                    HashMap::new()
+                };
+                edges.push((source_id, target_id, rel_name, props));
+            }
+        }
+
+        Ok((nodes, edges))
+    }
+
     // -----------------------------------------------------------------
     // In-place property updates
     // -----------------------------------------------------------------
