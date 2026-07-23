@@ -6,6 +6,7 @@ mod completion_retriever;
 mod context_items;
 mod cypher_nl_retrievers;
 mod graph_completion_retriever;
+mod hybrid;
 mod lexical_retriever;
 mod lucky_feedback_rules_retrievers;
 mod summaries_retriever;
