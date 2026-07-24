@@ -203,7 +203,7 @@ jobs:
       # ── Phase-2: LLM-gated (requires OPENAI_KEY secret) ──────────────────
       # `env.HAS_OPENAI_KEY` is set at job level (see job env: block above).
       # Step-level `if:` can read job-level env; it cannot read step-level env.
-      - name: Phase-2 — cognify, remember, recall, memify, improve, llm (LLM-gated)
+      - name: Phase-2 — cognify, remember, recall, memify, improve, llm, hybrid (LLM-gated)
         if: ${{ env.HAS_OPENAI_KEY == 'true' }}
         env:
           OPENAI_TOKEN: ${{ secrets.OPENAI_KEY }}
@@ -214,7 +214,7 @@ jobs:
           -f cognee-rust/e2e-cross-sdk/docker-compose.yml
           run --rm e2e-http-tests
           pytest -vs /harness/
-          -k "test_http_cognify or test_http_remember or test_http_recall or test_http_memify or test_http_improve or test_http_llm"
+          -k "test_http_cognify or test_http_remember or test_http_recall or test_http_memify or test_http_improve or test_http_llm or test_http_hybrid"
           --tb=short
 
       # ── Cross-SDK provenance parity (LLM-gated) ─────────────────────────
