@@ -110,7 +110,7 @@ what can run in parallel.
 | P1-05 | 1 | Shared helpers + payload fixes | [./phase-1/P1-05.md](./phase-1/P1-05.md) | completed |
 | P1-06 | 1 | get_neighborhood on GraphDBTrait | [./phase-1/P1-06.md](./phase-1/P1-06.md) | completed |
 | P1-07 | 1 | Hybrid module — chunk + BM25 lane | [./phase-1/P1-07.md](./phase-1/P1-07.md) | completed |
-| P1-08 | 1 | Hybrid module — entity + facts lane | [./phase-1/P1-08.md](./phase-1/P1-08.md) | pending |
+| P1-08 | 1 | Hybrid module — entity + facts lane | [./phase-1/P1-08.md](./phase-1/P1-08.md) | completed |
 | P1-09 | 1 | Hybrid module — context, retriever impl, registration | [./phase-1/P1-09.md](./phase-1/P1-09.md) | pending |
 | P1-10 | 1 | Orchestrator session-cache wiring + tests | [./phase-1/P1-10.md](./phase-1/P1-10.md) | pending |
 | P1-11 | 1 | Cross-SDK harness coverage for HYBRID_COMPLETION | [./phase-1/P1-11.md](./phase-1/P1-11.md) | pending |

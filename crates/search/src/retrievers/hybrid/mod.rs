@@ -21,6 +21,16 @@
 mod chunks;
 #[allow(
     dead_code,
+    reason = "entity lane consumed by the later hybrid-assembly task (P1-09); exercised now by this module's tests"
+)]
+mod entities;
+#[allow(
+    dead_code,
+    reason = "facts lane consumed by the later hybrid-assembly task (P1-09) and the entity lane (P1-08); exercised now by this module's tests"
+)]
+mod facts;
+#[allow(
+    dead_code,
     reason = "shared helpers consumed by the later hybrid-assembly task (P1-09) and the entity/facts lane (P1-08); exercised now by this module's tests"
 )]
 mod pairs;
@@ -40,3 +50,13 @@ mod results;
     reason = "public surface consumed by the later hybrid-assembly task (P1-09); exercised now by this module's tests"
 )]
 pub(crate) use chunks::{HybridChunksResult, retrieve_hybrid_chunks};
+#[allow(
+    unused_imports,
+    reason = "public surface consumed by the later hybrid-assembly task (P1-09); exercised now by this module's tests"
+)]
+pub(crate) use entities::{build_entities, format_entities};
+#[allow(
+    unused_imports,
+    reason = "public surface consumed by the later hybrid-assembly task (P1-09); exercised now by this module's tests"
+)]
+pub(crate) use facts::{edge_rank_by_id, format_facts, select_facts};
