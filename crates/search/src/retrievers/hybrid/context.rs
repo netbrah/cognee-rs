@@ -90,13 +90,9 @@ pub(crate) fn format_hybrid_context(
 /// intentionally skipped: their ids are `EdgeType` vector rows, not graph nodes.
 /// Walks the tagged context by its `"kind"` payload discriminator — chunk ids
 /// via [`result_id`], entity ids plus each entity edge's `source_id`/`target_id`
-/// — and returns them sorted and deduplicated. Orchestrator consumption
-/// (`build_used_graph_element_ids`) is P1-10; this helper only provides the
-/// stable extraction the later task wires in.
-#[allow(
-    dead_code,
-    reason = "consumed by the orchestrator's used_graph_element_ids wiring in P1-10; exercised now by this module's tests"
-)]
+/// — and returns them sorted and deduplicated. Consumed by the orchestrator's
+/// `build_used_graph_element_ids` (P1-10) to fold hybrid node ids into the
+/// session-cache `used_graph_element_ids` snapshot.
 pub(crate) fn extract_used_ids(context: &[SearchItem]) -> Vec<String> {
     let mut node_ids: BTreeSet<String> = BTreeSet::new();
 

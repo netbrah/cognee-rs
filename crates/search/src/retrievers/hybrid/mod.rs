@@ -22,6 +22,7 @@ mod ranking;
 mod results;
 
 pub(crate) use chunks::{HybridChunksResult, retrieve_hybrid_chunks, search_collection};
+pub(crate) use context::extract_used_ids;
 pub(crate) use entities::{build_entities, format_entities};
 pub(crate) use facts::{edge_rank_by_id, format_facts, select_facts};
 
