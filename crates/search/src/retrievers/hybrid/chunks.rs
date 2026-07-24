@@ -65,7 +65,7 @@ pub(crate) fn summary_candidate_limit(
 /// over-fetch (`fetch_limit = (limit*4).max(limit + 20)`) then filter and
 /// truncate to `limit`.
 #[allow(clippy::too_many_arguments)]
-async fn search_collection(
+pub(crate) async fn search_collection(
     vector_db: &Arc<dyn VectorDB>,
     data_type: &str,
     field: &str,

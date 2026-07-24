@@ -28,8 +28,8 @@ pub use retrievers::{
     ChunksRetriever, CodingRulesRetriever, CompletionRetriever, CypherSearchRetriever,
     FeedbackRetriever, FeelingLuckyRetriever, GraphCompletionContextExtensionRetriever,
     GraphCompletionCotRetriever, GraphCompletionRetriever, GraphSummaryCompletionRetriever,
-    LexicalRetriever, NaturalLanguageRetriever, SearchRetriever, SearchRetrieverRef,
-    SummariesRetriever, TemporalRetriever, TripletRetriever,
+    HybridRetriever, LexicalRetriever, NaturalLanguageRetriever, SearchRetriever,
+    SearchRetrieverRef, SummariesRetriever, TemporalRetriever, TripletRetriever,
 };
 pub use types::{
     FeedbackDetectionResult, Rule, SearchContext, SearchError, SearchGraph, SearchGraphEdge,
