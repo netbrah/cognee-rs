@@ -95,8 +95,10 @@ Unified orchestration across 16 retrieval strategies selected by `SearchType`
 `GraphCompletion` (default), `GraphCompletionCot`, `GraphCompletionContextExtension`,
 `GraphSummaryCompletion`, `TripletCompletion`, `RagCompletion`, `Chunks`,
 `Summaries`, `Temporal`, `Cypher`, `NaturalLanguage`, `FeelingLucky`, `Feedback`,
-`CodingRules`, `ChunksLexical`, `HybridCompletion` (not yet backed by a
-retriever). Entry: [`cognee-search`](../crates/search/)
+`CodingRules`, `ChunksLexical`, `HybridCompletion` (combines a per-query BM25
+lexical pass over chunks, vector search over chunks/entities/edge-facts, and
+1-hop graph-neighborhood expansion around matched entities, then answers via
+LLM completion). Entry: [`cognee-search`](../crates/search/)
 (`SearchBuilder` / `SearchOrchestrator`).
 
 ## Additional operations

@@ -174,6 +174,60 @@ env bindings. The token counter is env-selected:
 | `COGNEE_TOKEN_COUNTER` | `tiktoken` / `word` / `huggingface`(`hf`) | auto from embedding provider |
 | `HUGGINGFACE_TOKENIZER` | model id when counter = `huggingface` | _(empty)_ |
 
+## Search — hybrid retriever knobs
+
+The `HYBRID_COMPLETION` search type (`SearchType::HybridCompletion`) accepts a
+set of per-request tuning knobs. Unlike the env-var knobs elsewhere on this
+page, these are **library / orchestrator-only** — they are typed
+`Option<...>` fields on
+[`SearchParams`](../crates/search/src/types/search_params.rs), populated in
+`impl From<&SearchRequest>` from the **snake_case JSON keys** inside
+`SearchRequest.retriever_specific_config`. They have no env binding.
+
+**Phase-1 reachability gap.** Every external adapter currently hardcodes
+`retriever_specific_config: None` (`http-server/src/routers/search.rs`,
+`http-server/src/responses_dispatch.rs`, `cli/src/commands/search.rs`,
+`bindings-common/src/ops/retrieval.rs`), so in Phase 1 these knobs are reachable
+**only by a direct Rust library caller** that constructs a `SearchRequest` with
+a populated `retriever_specific_config`. They are **not** wire fields on
+`SearchPayloadDTO` and are not exposed over HTTP, CLI, or the language bindings
+— the same class as `neighborhood_depth` and the other orchestrator-only
+`SearchParams` knobs (see the wire-passthrough open question in
+[`http-server/routers/search.md`](http-server/routers/search.md)).
+
+When a knob is unset the retriever falls back through a three-layer resolution:
+`retriever_specific_config.<knob>` → `SearchRequest.top_k` → the
+`HybridRetriever::new` constructor default. The effective defaults are:
+
+| `SearchParams` field | `retriever_specific_config` JSON key | Effective Rust default | Python parity |
+|---|---|---|---|
+| `chunks_top_k` | `chunks_top_k` | `top_k`, else `15` | `chunks_top_k` (derives from `top_k`) |
+| `entities_top_k` | `entities_top_k` | `top_k`, else `15` | `entities_top_k` |
+| `facts_top_k` | `facts_top_k` | `top_k`, else `15` | `facts_top_k` |
+| `max_edges_per_entity` | `max_edges_per_entity` | `10` | `max_edges_per_entity=10` |
+| `text_summaries_top_k` | `text_summaries_top_k` | `None` (no fallback) | `text_summaries_top_k=None` |
+| `use_importance_weight` | `use_importance_weight` | `true` | `use_importance_weight=True` |
+| `node_name` | `node_name` | `None` | reused query node filter |
+| `node_name_filter_operator` | `node_name_filter_operator` | `"OR"` | `"OR"` / `"AND"` |
+
+(NB: the `chunks_top_k` / `entities_top_k` / `facts_top_k` code comments in
+`search_params.rs` still say `unwrap_or(10)` — that is a stale comment; the
+constructor uses `DEFAULT_TOP_K = 15`.)
+
+**Reserved (Phase 2, inert).** These keys are parsed and stored but have no
+effect in Phase 1 — passing `true` must behave identically to the default:
+
+- `use_truth_weight` (default `false`) — truth-subspace weighting is Phase 2
+  only; the Python `build_truth_subspace` path runs on `improve()`, not
+  implemented on the Rust side yet.
+- `include_global_context_index` (default `false`) and
+  `global_context_index_top_k` (default `3`) — the global-context lane depends
+  on a `GlobalContextSummary` node type and global-context utilities not yet
+  ported to Rust.
+
+See [`http-server/routers/search.md` §7 Known limitations](http-server/routers/search.md)
+for the full degradation notes.
+
 ## Ontology
 
 | Env var | `Settings` field | Default |
@@ -253,7 +307,10 @@ product analytics. The **deep references** are
 The server binary reads its own env surface ([`crates/http-server/src/config.rs`](../crates/http-server/src/config.rs)) —
 host/port, auth, body limits, pipeline registry, notebooks, health probes. See
 [tools/http-server.md](tools/http-server.md) and
-[http-server/architecture.md §config](http-server/architecture.md).
+[http-server/architecture.md §config](http-server/architecture.md). Note that
+the `HYBRID_COMPLETION` tuning knobs are **not** part of the HTTP wire surface
+in Phase 1 — see [Search — hybrid retriever knobs](#search--hybrid-retriever-knobs)
+and [`http-server/routers/search.md`](http-server/routers/search.md).
 
 ## Cloud
 

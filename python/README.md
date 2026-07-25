@@ -214,11 +214,11 @@ result = await cognee.search(
 )
 ```
 
-All 15 search types are supported (via `SearchType` enum):
+All 16 search types are supported (via `SearchType` enum):
 `GRAPH_COMPLETION`, `SUMMARIES`, `CHUNKS`, `RAG_COMPLETION`, `TRIPLET_COMPLETION`,
 `GRAPH_SUMMARY_COMPLETION`, `CYPHER`, `NATURAL_LANGUAGE`, `GRAPH_COMPLETION_COT`,
 `GRAPH_COMPLETION_CONTEXT_EXTENSION`, `FEELING_LUCKY`, `FEEDBACK`, `TEMPORAL`,
-`CODING_RULES`, `CHUNKS_LEXICAL`.
+`CODING_RULES`, `CHUNKS_LEXICAL`, `HYBRID_COMPLETION`.
 
 #### recall
 
