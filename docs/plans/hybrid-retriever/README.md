@@ -116,7 +116,7 @@ what can run in parallel.
 | P1-11 | 1 | Cross-SDK harness coverage for HYBRID_COMPLETION | [./phase-1/P1-11.md](./phase-1/P1-11.md) | completed |
 | P1-12 | 1 | Documentation updates for HYBRID_COMPLETION | [./phase-1/P1-12.md](./phase-1/P1-12.md) | completed |
 | P2-01 | 2 | Truth-subspace: pure alignment math | [./phase-2/P2-01.md](./phase-2/P2-01.md) | completed |
-| P2-02 | 2 | Truth-subspace: centroid slot logic | [./phase-2/P2-02.md](./phase-2/P2-02.md) | pending |
+| P2-02 | 2 | Truth-subspace: centroid slot logic | [./phase-2/P2-02.md](./phase-2/P2-02.md) | completed |
 | P2-03 | 2 | Truth-subspace: vector persistence | [./phase-2/P2-03.md](./phase-2/P2-03.md) | pending |
 | P2-04 | 2 | Truth-subspace: graph truth-state methods | [./phase-2/P2-04.md](./phase-2/P2-04.md) | pending |
 | P2-05 | 2 | Session-learnings distillation gate | [./phase-2/P2-05.md](./phase-2/P2-05.md) | pending |

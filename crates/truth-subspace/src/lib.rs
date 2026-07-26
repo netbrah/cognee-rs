@@ -9,3 +9,13 @@
 #![forbid(unsafe_code)]
 
 pub mod align;
+pub mod centroids;
+pub mod constants;
+pub mod models;
+
+pub use centroids::{
+    build_centroids_from_learning_vectors, centroid_id, centroids_changed,
+    extend_centroids_with_learning_vectors, learning_id,
+};
+pub use constants::{DEFAULT_K, TRUTH_CENTROID_COLLECTION};
+pub use models::TruthCentroidPayload;
