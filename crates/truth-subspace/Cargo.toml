@@ -1,0 +1,21 @@
+[package]
+name = "cognee-truth-subspace"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Pure truth-subspace alignment math (cosine projection, truth scoring) for cognee's hybrid retriever."
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+sha2 = { workspace = true }
+
+[dev-dependencies]
+uuid = { workspace = true }

@@ -116,6 +116,8 @@ cognee-rs/
 
 **cognee-utils** — Shared utilities: retry logic, deterministic ID generation (`generate_node_id`, `NAMESPACE_OID`, …), secret redaction (`redact`), and tracing attribute keys.
 
+**cognee-truth-subspace** — Pure alignment math (cosine projection, query-relevance-weighted truth scoring, stable id signatures) for the Phase-2 hybrid-retriever truth-subspace re-ranking feature. No I/O; consumed by cognee-search once `use_truth_weight`/`build_truth_subspace` land.
+
 **cognee-test-utils** — Test helpers and mock implementations for integration tests.
 
 ## Architecture patterns
