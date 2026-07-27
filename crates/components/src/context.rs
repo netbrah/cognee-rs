@@ -102,15 +102,19 @@ pub struct LlmInputs {
     pub api_key: String,
     pub endpoint: String,
     pub max_retries: u32,
+    /// Output-token ceiling (Python's `llm_max_completion_tokens`), lowered from
+    /// `Settings.llm_max_completion_tokens` (`setLlmMaxCompletionTokens`). Applied
+    /// to LLM calls that pass no per-call generation options (the search/completion
+    /// retrievers) so the setter actually caps `recall`/`search`. Wired into the
+    /// OpenAI-compatible adapter via `OpenAIAdapter::with_default_max_tokens`;
+    /// adapters that must send an explicit `max_tokens` (Anthropic) clamp it
+    /// against the model's documented output limit.
+    pub max_completion_tokens: u32,
     /// Extra request parameters merged into every chat-completion request body,
     /// lowered from `LLM_ARGS` (Python `llm_config.llm_args`). Empty = no-op.
     /// Applied by the OpenAI-compatible factory via
     /// `OpenAIAdapter::with_extra_args`. See that field's docs for semantics.
     pub llm_args: serde_json::Map<String, serde_json::Value>,
-    /// Output-token ceiling (Python's `llm_max_completion_tokens`). Adapters that
-    /// must send an explicit `max_tokens` (Anthropic) clamp it against the
-    /// model's documented output limit.
-    pub max_completion_tokens: u32,
     /// Replaces the provider adapter with a cassette replay mock.
     pub mock: bool,
     /// Cassette path for the replay mock (consumed only under `mock-llm`).

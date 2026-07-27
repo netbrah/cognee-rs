@@ -1,5 +1,5 @@
 //! [`ComponentRegistry`] — the pluggable provider → factory map shared by the
-//! `ComponentManager` (cognee-lib) and the HTTP server's standalone wiring.
+//! `ComponentManager` (cognee) and the HTTP server's standalone wiring.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -406,8 +406,8 @@ mod tests {
                 api_key: "sk-test".to_string(),
                 endpoint: String::new(),
                 max_retries: 3,
+                max_completion_tokens: cognee_llm::OpenAIAdapter::DEFAULT_MAX_COMPLETION_TOKENS,
                 llm_args: serde_json::Map::new(),
-                max_completion_tokens: cognee_llm::DEFAULT_MAX_COMPLETION_TOKENS,
                 mock: false,
                 cassette: String::new(),
                 record_path: String::new(),
