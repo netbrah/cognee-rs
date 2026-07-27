@@ -944,14 +944,26 @@ impl Settings {
             if self.db_host.is_empty() || self.db_name.is_empty() {
                 return Err("Missing required Postgres vector credentials".into());
             }
-            // An empty username is the out-of-the-box default, so default it to
-            // `postgres` (Postgres's own superuser) rather than erroring — the
-            // previous behaviour returned a usable URL for the default config
-            // and pgvector deployments relied on it. Crucially this stays on the
-            // relational host/port/DATABASE, so vectors still land in the SAME
-            // database as the relational store; it does NOT resurrect the old
-            // per-field defaults (port 1234 / `cognee_vectors`) that silently
-            // split the stores across databases.
+            // A password set while the username is blank is a real
+            // misconfiguration, not the default: defaulting the user to
+            // `postgres` there would silently authenticate as the superuser with
+            // that password. Fail fast so it surfaces at startup, not as an
+            // opaque connect-time auth error.
+            if self.db_username.is_empty() && !self.db_password.is_empty() {
+                return Err(
+                    "Missing required Postgres vector credentials: DB_PASSWORD is set but \
+                     DB_USERNAME is empty"
+                        .into(),
+                );
+            }
+            // An empty username with an empty password is the out-of-the-box
+            // default, so default it to `postgres` (Postgres's own superuser)
+            // rather than erroring — the previous behaviour returned a usable URL
+            // for the default config and pgvector deployments relied on it.
+            // Crucially this stays on the relational host/port/DATABASE, so
+            // vectors still land in the SAME database as the relational store; it
+            // does NOT resurrect the old per-field defaults (port 1234 /
+            // `cognee_vectors`) that silently split the stores across databases.
             let user = if self.db_username.is_empty() {
                 "postgres"
             } else {
@@ -3363,6 +3375,20 @@ mod tests {
             s.resolved_vector_postgres_url().expect("url builds"),
             "postgres://postgres@localhost:5432/cognee_db"
         );
+    }
+
+    #[cfg(feature = "pgvector")]
+    #[test]
+    fn vector_postgres_url_errs_when_password_set_but_username_empty() {
+        // A password with a blank username is a misconfiguration, not the
+        // default: fail fast rather than silently authenticating as `postgres`.
+        let s = Settings {
+            vector_db_provider: "pgvector".to_string(),
+            db_username: String::new(),
+            db_password: "secret".to_string(),
+            ..Settings::default()
+        };
+        assert!(s.resolved_vector_postgres_url().is_err());
     }
 
     #[cfg(feature = "pgvector")]

@@ -120,9 +120,11 @@ pub async fn connect(url: &str) -> Result<DatabaseConnection, DatabaseError> {
 ///   power loss, which is the wrong default for a memory pipeline. If enabling
 ///   WAL fails — typically a network/FUSE filesystem with no shared-memory
 ///   support, where `PRAGMA journal_mode=WAL` cannot create the `-shm` sidecar
-///   — the connect retries once with the default rollback journal rather than
+///   — the connect retries once with an explicit rollback journal rather than
 ///   failing outright, so those deployments still open (they served reads
-///   before this crate configured WAL). `busy_timeout` makes the inevitable
+///   before this crate configured WAL). If that retry also fails, WAL was not
+///   the cause and the original error is surfaced. `busy_timeout` makes the
+///   inevitable
 ///   writer-vs-writer contention wait for the lock rather than failing
 ///   immediately with `SQLITE_BUSY`.
 /// - **Read-only (`mode=ro` / `immutable`, or a file that is not writable):**
@@ -228,23 +230,31 @@ async fn connect_sqlite(url: &str) -> Result<DatabaseConnection, DatabaseError> 
 
     let sqlx_pool = match pool_opts.clone().connect_with(conn_opts).await {
         Ok(pool) => pool,
-        // WAL requires a shared-memory `-shm` file, which some filesystems
-        // (NFS and other network/FUSE mounts) cannot provide, so enabling it
-        // fails the connect. Rather than leave such a deployment unable to open
-        // its database — it opened fine before this crate configured WAL — retry
-        // once with the default rollback journal (still `synchronous=FULL`).
-        Err(e) if want_wal => {
-            tracing::warn!(
-                error = %e,
-                "Enabling SQLite WAL failed (likely a network/FUSE filesystem without \
-                 shared-memory support); retrying with the default rollback journal. \
-                 Reader/writer concurrency will be reduced for this database."
-            );
-            let fallback_opts = base_opts.synchronous(SqliteSynchronous::Full);
-            pool_opts
-                .connect_with(fallback_opts)
-                .await
-                .map_err(|e| DatabaseError::ConnectionError(e.to_string()))?
+        // WAL needs a shared-memory `-shm` file, which some filesystems (NFS and
+        // other network/FUSE mounts) cannot provide, so enabling it can fail the
+        // connect. We cannot tell such a WAL/shm failure apart from an unrelated
+        // one (disk full, I/O error, a corrupt header) at this layer, so retry
+        // once with an *explicit* rollback journal — `Delete`, not the
+        // driver's implicit default, so a database persisted in WAL mode is
+        // actively downgraded rather than reopened in WAL. Only warn if that
+        // retry actually succeeds; if it fails too, WAL was almost certainly not
+        // the cause, so surface the ORIGINAL error, which is the real one.
+        Err(original) if want_wal => {
+            let fallback_opts = base_opts
+                .journal_mode(SqliteJournalMode::Delete)
+                .synchronous(SqliteSynchronous::Full);
+            match pool_opts.connect_with(fallback_opts).await {
+                Ok(pool) => {
+                    tracing::warn!(
+                        error = %original,
+                        "Enabling SQLite WAL failed; opened with a rollback journal instead \
+                         (this happens on a network/FUSE filesystem without shared-memory \
+                         support). Reader/writer concurrency is reduced for this database."
+                    );
+                    pool
+                }
+                Err(_) => return Err(DatabaseError::ConnectionError(original.to_string())),
+            }
         }
         Err(e) => return Err(DatabaseError::ConnectionError(e.to_string())),
     };
