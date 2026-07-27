@@ -677,6 +677,7 @@ impl HttpServerConfig {
                 model: self.llm_model.clone(),
                 api_key: self.llm_api_key.expose_secret().to_string(),
                 endpoint: self.llm_endpoint.clone(),
+                anthropic_base_url: cognee_components::anthropic_base_url_from_env(),
                 max_retries: self.llm_max_retries,
                 // Env-configurable via `LLM_MAX_COMPLETION_TOKENS`, mirroring
                 // `Settings.llm_max_completion_tokens` on the CLI/SDK path so

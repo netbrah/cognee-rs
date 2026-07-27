@@ -181,6 +181,40 @@ IMPORTANT: Return ONLY the JSON object. No additional text before or after."#
     )
 }
 
+/// Build a schema-aware validator for the type-erased raw structured-output path
+/// (which has no Rust type to deserialize into).
+///
+/// Enforces that every property named in the schema's top-level `required` array
+/// is present and non-null, so a tool/function input omitting a required field
+/// drives a corrective retry instead of being returned as `Ok`. Deliberately
+/// shallow (top-level only), matching the non-strict tool-calling path both
+/// adapters use — it does not recurse into `$defs` or set `additionalProperties`.
+///
+/// Shared by the OpenAI and Anthropic adapters so the raw path validates
+/// identically across providers (previously a verbatim copy in each adapter).
+pub fn schema_required_validator(schema: &Value) -> impl Fn(&Value) -> Result<(), String> + '_ {
+    move |value: &Value| {
+        let Some(required) = schema.get("required").and_then(Value::as_array) else {
+            return Ok(());
+        };
+        let Some(obj) = value.as_object() else {
+            return Err("expected a JSON object".to_string());
+        };
+        for field in required {
+            if let Some(name) = field.as_str() {
+                match obj.get(name) {
+                    None => return Err(format!("missing required field `{name}`")),
+                    Some(Value::Null) => {
+                        return Err(format!("required field `{name}` is null"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -190,6 +224,7 @@ mod tests {
     )]
     use super::*;
     use serde::{Deserialize, Serialize};
+    use serde_json::json;
 
     #[derive(Serialize, Deserialize, JsonSchema)]
     struct TestPerson {
@@ -246,5 +281,27 @@ mod tests {
 
         let pretty_str = graph_model_to_schema_string::<TestPerson>(true);
         assert!(pretty_str.contains('\n'));
+    }
+
+    #[test]
+    fn schema_required_validator_enforces_required_fields() {
+        // The raw structured-output path synthesises this validator so an omitted
+        // required field is a retryable miss (not silently accepted). Shared by
+        // the OpenAI and Anthropic adapters.
+        let schema = json!({
+            "type": "object",
+            "required": ["summary"],
+            "properties": {"summary": {"type": "string"}}
+        });
+        let validate = schema_required_validator(&schema);
+        assert!(validate(&json!({"summary": "hello"})).is_ok());
+        assert!(validate(&json!({"other": "x"})).is_err());
+        assert!(validate(&json!({"summary": null})).is_err());
+        assert!(validate(&json!("not an object")).is_err());
+
+        // No `required` array → nothing to enforce.
+        let loose = json!({"type": "object"});
+        let validate = schema_required_validator(&loose);
+        assert!(validate(&json!({})).is_ok());
     }
 }

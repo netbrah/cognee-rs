@@ -168,10 +168,25 @@ impl AnthropicAdapter {
     /// forwarded above a model's real cap and 400 the request.
     fn model_max_output_tokens(model: &str) -> u32 {
         let m = model.to_ascii_lowercase();
-        Self::MODEL_OUTPUT_CAPS
+        match Self::MODEL_OUTPUT_CAPS
             .iter()
             .find(|(pattern, _)| m.contains(*pattern))
-            .map_or(Self::UNKNOWN_MODEL_OUTPUT_CAP, |(_, cap)| *cap)
+        {
+            Some((_, cap)) => *cap,
+            None => {
+                // An unlisted model falls back to the conservative cap, which
+                // under-budgets a model that actually supports more until
+                // MODEL_OUTPUT_CAPS is refreshed. Surface it at debug level so the
+                // under-budgeting is diagnosable rather than silent (no per-request
+                // warn spam, but visible when tracing the LLM path).
+                debug!(
+                    model,
+                    fallback_cap = Self::UNKNOWN_MODEL_OUTPUT_CAP,
+                    "Anthropic model not in MODEL_OUTPUT_CAPS; using conservative output cap",
+                );
+                Self::UNKNOWN_MODEL_OUTPUT_CAP
+            }
+        }
     }
 
     /// The `max_tokens` to send: `min(caller value, configured ceiling, model cap)`.
@@ -370,38 +385,6 @@ impl AnthropicAdapter {
         body
     }
 
-    /// Build a schema-aware validator for the type-erased raw path (which has no
-    /// Rust type to deserialize into).
-    ///
-    /// Enforces that every property named in the schema's top-level `required`
-    /// array is present and non-null, so a tool input omitting a required field
-    /// drives a corrective retry instead of being returned as `Ok`. Mirrors the
-    /// OpenAI adapter's validator; folding the two into one shared helper belongs
-    /// with the `llm::http` extraction follow-up rather than churning `openai.rs`
-    /// here.
-    fn schema_required_validator(schema: &Value) -> impl Fn(&Value) -> Result<(), String> + '_ {
-        move |value: &Value| {
-            let Some(required) = schema.get("required").and_then(Value::as_array) else {
-                return Ok(());
-            };
-            let Some(obj) = value.as_object() else {
-                return Err("expected a JSON object".to_string());
-            };
-            for field in required {
-                if let Some(name) = field.as_str() {
-                    match obj.get(name) {
-                        None => return Err(format!("missing required field `{name}`")),
-                        Some(Value::Null) => {
-                            return Err(format!("required field `{name}` is null"));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Ok(())
-        }
-    }
-
     /// Append a corrective instruction to the last user turn so the next attempt
     /// carries the failure reason, the way instructor reasks with the validation
     /// error (mirrors `OpenAIAdapter::append_corrective_instruction`).
@@ -480,17 +463,32 @@ impl AnthropicAdapter {
                     // Re-ask instead of returning a partial object.
                     let truncated = response.stop_reason.as_deref() == Some("max_tokens");
                     match response.tool_input(STRUCTURED_OUTPUT_TOOL) {
-                        Some(_) if truncated => {
-                            // The tool input was cut off at max_tokens: present and
-                            // JSON-parseable, but incomplete. Re-asking with the SAME
-                            // budget would truncate again at the same point, so raise
-                            // it toward the model's documented cap for the next
-                            // attempt. If we are already at that cap a larger budget
-                            // is impossible, so fail terminally rather than re-ask
-                            // until MaxRetriesExceeded.
+                        Some(input) if truncated => {
+                            // The tool input was cut off at max_tokens. Re-asking
+                            // with the SAME budget would truncate again at the same
+                            // point, so raise it toward the model's documented cap
+                            // for the next attempt — this lets a *semantically*
+                            // truncated object (required fields present but a
+                            // cut-off list/string) be completed rather than returned
+                            // half-filled.
                             let model_cap = Self::model_max_output_tokens(&self.model);
                             let current = body["max_tokens"].as_u64().unwrap_or(0) as u32;
                             if current >= model_cap {
+                                // No headroom left to raise the budget: re-asking
+                                // cannot produce a longer answer, so this is the most
+                                // complete result obtainable. A stop at max_tokens can
+                                // still coincide with a complete, schema-valid object
+                                // that finished exactly at the cap, so return it as
+                                // best-effort rather than discarding a usable answer
+                                // as a hard failure. Only fail terminally when it is
+                                // actually unusable (fails the validator).
+                                let usable = match validator {
+                                    Some(v) => v(&input).is_ok(),
+                                    None => true,
+                                };
+                                if usable {
+                                    return Ok(input);
+                                }
                                 return Err(LlmError::InvalidResponse(format!(
                                     "Anthropic structured output was truncated at the model's \
                                      {model_cap}-token output cap and cannot be completed within \
@@ -588,10 +586,10 @@ impl Llm for AnthropicAdapter {
         options: Option<GenerationOptions>,
     ) -> LlmResult<Value> {
         // The raw path has no Rust type to deserialize into, so synthesise a
-        // schema-aware validator (same as the OpenAI adapter): a tool input that
-        // omits a required field drives a corrective retry instead of returning
-        // `Ok` and aborting the caller at deserialization.
-        let validator = Self::schema_required_validator(json_schema);
+        // schema-aware validator (shared with the OpenAI adapter): a tool input
+        // that omits a required field drives a corrective retry instead of
+        // returning `Ok` and aborting the caller at deserialization.
+        let validator = crate::schema::schema_required_validator(json_schema);
         self.structured_output_impl(messages, json_schema, options, Some(&validator))
             .await
     }
@@ -642,14 +640,24 @@ impl Llm for AnthropicAdapter {
             )));
         }
         let b64 = base64::engine::general_purpose::STANDARD.encode(image_bytes);
-        let max_tokens = options.as_ref().and_then(|o| o.max_tokens).unwrap_or(300);
+        // Clamp to the model's documented output cap, like the chat path's
+        // `effective_max_tokens`. A caller supplying GenerationOptions with the
+        // default max_tokens (16384) on a model whose cap is lower (e.g. Claude
+        // 3.5 at 8192) would otherwise 400 the vision request. Floored at 1 so a
+        // zero never 400s either.
+        let max_tokens = options
+            .as_ref()
+            .and_then(|o| o.max_tokens)
+            .unwrap_or(300)
+            .min(Self::model_max_output_tokens(&self.model))
+            .max(1);
 
         // Anthropic vision uses a base64 `image` content block (not OpenAI's
         // `image_url`). Built directly, not via `base_request`, so `LLM_ARGS` do
         // not bleed into the description request (matching the OpenAI adapter).
         let request_body = json!({
             "model": self.model,
-            "max_tokens": max_tokens.max(1),
+            "max_tokens": max_tokens,
             "messages": [{
                 "role": "user",
                 "content": [

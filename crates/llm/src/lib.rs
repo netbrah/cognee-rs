@@ -74,7 +74,7 @@ pub use llm_trait::{Llm, LlmExt};
 pub use responses_client::{OpenAIResponsesClient, ResponsesClient, ResponsesRequest};
 pub use schema::{
     build_schema_prompt, generate_json_schema, generate_json_schema_string, graph_model_to_schema,
-    graph_model_to_schema_string,
+    graph_model_to_schema_string, schema_required_validator,
 };
 pub use transcriber::{Transcriber, TranscriptionOutput, validate_audio_format};
 pub use types::{
