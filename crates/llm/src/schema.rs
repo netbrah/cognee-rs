@@ -5,7 +5,7 @@
 //! correctly structured output.
 
 use schemars::{JsonSchema, schema_for};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// Generate a JSON schema for a given type.
 ///
@@ -181,6 +181,87 @@ IMPORTANT: Return ONLY the JSON object. No additional text before or after."#
     )
 }
 
+/// Build a schema-aware validator for the type-erased raw structured-output path
+/// (which has no Rust type to deserialize into).
+///
+/// Enforces that every property named in the schema's top-level `required` array
+/// is present and non-null, so a tool/function input omitting a required field
+/// drives a corrective retry instead of being returned as `Ok`. Deliberately
+/// shallow (top-level only), matching the non-strict tool-calling path both
+/// adapters use — it does not recurse into `$defs` or set `additionalProperties`.
+///
+/// Shared by the OpenAI and Anthropic adapters so the raw path validates
+/// identically across providers (previously a verbatim copy in each adapter).
+pub fn schema_required_validator(schema: &Value) -> impl Fn(&Value) -> Result<(), String> + '_ {
+    move |value: &Value| {
+        let Some(required) = schema.get("required").and_then(Value::as_array) else {
+            return Ok(());
+        };
+        let Some(obj) = value.as_object() else {
+            return Err("expected a JSON object".to_string());
+        };
+        for field in required {
+            if let Some(name) = field.as_str() {
+                match obj.get(name) {
+                    None => return Err(format!("missing required field `{name}`")),
+                    Some(Value::Null) => {
+                        return Err(format!("required field `{name}` is null"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Append a corrective instruction to a chat request's `messages` array so the
+/// next structured-output attempt carries the failure reason, the way instructor
+/// reasks with the validation error. When `reason` is `Some`, it is surfaced
+/// verbatim (e.g. a serde "missing field type" message) so the model knows
+/// precisely which required field or structural constraint the previous response
+/// violated.
+///
+/// Extends the last user turn in place when there is one; otherwise (the last
+/// turn is an assistant message, or there is no turn) it pushes a new user turn
+/// carrying the instruction, so the correction is never silently dropped.
+/// `tool_name` / `tool_kind` name the forced extractor as the provider addresses
+/// it — e.g. `"extract_structured_data"` + `"tool"` for Anthropic, or
+/// `+ "function"` for OpenAI. Shared by both adapters (previously a near-verbatim
+/// copy in each) so the corrective-retry prompt stays consistent across
+/// providers.
+pub fn append_corrective_instruction(
+    request: &mut Value,
+    reason: Option<&str>,
+    tool_name: &str,
+    tool_kind: &str,
+) {
+    let detail = match reason {
+        Some(r) => format!("Your previous response failed validation: {r}. "),
+        None => {
+            "Your previous response could not be parsed into the required structure. ".to_string()
+        }
+    };
+    let instruction = format!(
+        "{detail}Call the `{tool_name}` {tool_kind} again and return ONE complete object that \
+         fills in every required field, strictly matching the schema. No extra text."
+    );
+    let Some(messages) = request["messages"].as_array_mut() else {
+        return;
+    };
+    match messages.last_mut() {
+        // Extend the existing user turn in place.
+        Some(last) if last["role"] == "user" => {
+            let original = last["content"].as_str().unwrap_or("").to_string();
+            last["content"] = json!(format!("{original}\n\n{instruction}"));
+        }
+        // Last turn is assistant, or there is no turn: a bare append would be a
+        // no-op and the correction would be silently dropped, so add a new user
+        // turn carrying it.
+        _ => messages.push(json!({ "role": "user", "content": instruction })),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -246,5 +327,27 @@ mod tests {
 
         let pretty_str = graph_model_to_schema_string::<TestPerson>(true);
         assert!(pretty_str.contains('\n'));
+    }
+
+    #[test]
+    fn schema_required_validator_enforces_required_fields() {
+        // The raw structured-output path synthesises this validator so an omitted
+        // required field is a retryable miss (not silently accepted). Shared by
+        // the OpenAI and Anthropic adapters.
+        let schema = json!({
+            "type": "object",
+            "required": ["summary"],
+            "properties": {"summary": {"type": "string"}}
+        });
+        let validate = schema_required_validator(&schema);
+        assert!(validate(&json!({"summary": "hello"})).is_ok());
+        assert!(validate(&json!({"other": "x"})).is_err());
+        assert!(validate(&json!({"summary": null})).is_err());
+        assert!(validate(&json!("not an object")).is_err());
+
+        // No `required` array → nothing to enforce.
+        let loose = json!({"type": "object"});
+        let validate = schema_required_validator(&loose);
+        assert!(validate(&json!({})).is_ok());
     }
 }

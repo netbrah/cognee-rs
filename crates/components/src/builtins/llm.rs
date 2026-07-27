@@ -101,17 +101,24 @@ impl LlmFactory for AnthropicLlmFactory {
                 "anthropic provider requires an API key (set LLM_API_KEY)".to_string(),
             ));
         }
-        // Do NOT inherit `ctx.llm.endpoint`: it aliases OPENAI_URL (a
-        // documented-required var in this repo), so flipping LLM_PROVIDER=anthropic
-        // while OPENAI_URL is still set would POST every request to the OpenAI host
-        // with an x-api-key header (404/401 on all traffic). Python's Anthropic
-        // path passes no base_url either, so use the Anthropic default.
-        let adapter = AnthropicAdapter::new(ctx.llm.model.clone(), ctx.llm.api_key.clone(), None)
-            .map_err(|e| ComponentError::Llm(e.to_string()))?
-            .with_structured_output_retries(ctx.llm.max_retries)
-            .with_network_retries(ctx.llm.max_retries)
-            .with_max_completion_tokens(ctx.llm.max_completion_tokens)
-            .with_extra_args(ctx.llm.llm_args.clone());
+        // Use the dedicated `ctx.llm.anthropic_base_url` (env `ANTHROPIC_BASE_URL`
+        // / `ANTHROPIC_API_BASE`), NOT `ctx.llm.endpoint`: the latter aliases
+        // OPENAI_URL (a documented-required var in this repo), so flipping
+        // LLM_PROVIDER=anthropic while OPENAI_URL is still set would POST every
+        // request to the OpenAI host with an x-api-key header (404/401 on all
+        // traffic). `None` (the default) uses the public Anthropic API, matching
+        // Python; the override exists for proxy / gateway / Bedrock-compatible
+        // endpoints.
+        let adapter = AnthropicAdapter::new(
+            ctx.llm.model.clone(),
+            ctx.llm.api_key.clone(),
+            ctx.llm.anthropic_base_url.clone(),
+        )
+        .map_err(|e| ComponentError::Llm(e.to_string()))?
+        .with_structured_output_retries(ctx.llm.max_retries)
+        .with_network_retries(ctx.llm.max_retries)
+        .with_max_completion_tokens(ctx.llm.max_completion_tokens)
+        .with_extra_args(ctx.llm.llm_args.clone());
         Ok(Arc::new(adapter))
     }
 

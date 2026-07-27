@@ -135,6 +135,7 @@ mod tests {
                 model: "gpt-4o-mini".to_string(),
                 api_key: "sk-test".to_string(),
                 endpoint: String::new(),
+                anthropic_base_url: None,
                 max_retries: 3,
                 max_completion_tokens: cognee_llm::OpenAIAdapter::DEFAULT_MAX_COMPLETION_TOKENS,
                 llm_args: serde_json::Map::new(),

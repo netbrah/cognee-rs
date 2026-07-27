@@ -525,47 +525,6 @@ impl OpenAIAdapter {
         serde_json::to_string_pretty(&example).unwrap_or_else(|_| "{}".to_string())
     }
 
-    /// Append a corrective instruction to the last user message of `request`,
-    /// nudging the model to return a single valid object on a retry attempt.
-    /// Mirrors instructor's repair prompt on a validation/parse failure.
-    ///
-    /// When `reason` is `Some`, it is surfaced verbatim (e.g. a serde
-    /// `missing field \`type\`` message) so the model knows precisely which
-    /// required field or structural constraint the previous response violated —
-    /// this threads `T`'s typed validation into the repair prompt, matching how
-    /// instructor feeds the validation error back to the model.
-    /// Build a schema-aware validator for the type-erased raw path (which has no
-    /// Rust type to deserialize into).
-    ///
-    /// Enforces that every property named in the schema's top-level `required`
-    /// array is present and non-null. This gives the raw path the same
-    /// required-field guarantee instructor provides for a typed model, *without*
-    /// strict/grammar-constrained decoding (`response_format: json_schema`, which
-    /// 501s on Baseten): a response omitting a required field is fed back into the
-    /// existing corrective-retry loop instead of being accepted or hard-failing.
-    fn schema_required_validator(schema: &Value) -> impl Fn(&Value) -> Result<(), String> + '_ {
-        move |value: &Value| {
-            let Some(required) = schema.get("required").and_then(Value::as_array) else {
-                return Ok(());
-            };
-            let Some(obj) = value.as_object() else {
-                return Err("expected a JSON object".to_string());
-            };
-            for field in required {
-                if let Some(name) = field.as_str() {
-                    match obj.get(name) {
-                        None => return Err(format!("missing required field `{name}`")),
-                        Some(Value::Null) => {
-                            return Err(format!("required field `{name}` is null"));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Ok(())
-        }
-    }
-
     /// Recompute the schema's top-level `required` array to list every property
     /// whose subschema carries no literal `"default"` key — a port of
     /// instructor's `generate_openai_schema` (`instructor/processing/schema.py`),
@@ -606,23 +565,17 @@ impl OpenAIAdapter {
         schema
     }
 
+    /// Append a corrective instruction so the next attempt carries the failure
+    /// reason. Thin wrapper over the shared
+    /// [`crate::schema::append_corrective_instruction`] naming the forced tool as
+    /// OpenAI addresses it (a `function` call).
     fn append_corrective_instruction(request: &mut Value, reason: Option<&str>) {
-        if let Some(messages) = request["messages"].as_array_mut()
-            && let Some(last_msg) = messages.last_mut()
-            && last_msg["role"] == "user"
-        {
-            let original = last_msg["content"].as_str().unwrap_or("");
-            let detail = match reason {
-                Some(r) => format!("Your previous response failed validation: {r}. "),
-                None => "Your previous response could not be parsed into the required structure. "
-                    .to_string(),
-            };
-            last_msg["content"] = json!(format!(
-                "{original}\n\n{detail}Call the `extract_structured_data` function again and \
-                 return ONE valid object that fills in every required field, strictly matching \
-                 the schema. No extra text."
-            ));
-        }
+        crate::schema::append_corrective_instruction(
+            request,
+            reason,
+            "extract_structured_data",
+            "function",
+        );
     }
 }
 
@@ -700,7 +653,7 @@ impl Llm for OpenAIAdapter {
         // `summarize_one` needs the `summary` field present). Synthesise a
         // schema-aware validator so an omitted required field drives the same
         // corrective retry a typed caller gets, matching instructor.
-        let validator = Self::schema_required_validator(json_schema);
+        let validator = crate::schema::schema_required_validator(json_schema);
         self.structured_output_impl(messages, json_schema, options, Some(&validator))
             .await
     }
@@ -1739,26 +1692,6 @@ mod tests {
         classic.apply_extra_args(&mut body);
         assert_eq!(body["max_tokens"], 16384);
         assert!(body.get("max_completion_tokens").is_none());
-    }
-
-    #[test]
-    fn test_schema_required_validator_enforces_required_fields() {
-        // #3: the raw path synthesises a schema-aware validator so an omitted
-        // required field is a retryable miss (not silently accepted).
-        let schema = json!({
-            "type": "object",
-            "required": ["summary"],
-            "properties": {"summary": {"type": "string"}}
-        });
-        let validate = OpenAIAdapter::schema_required_validator(&schema);
-        assert!(validate(&json!({"summary": "hello"})).is_ok());
-        assert!(validate(&json!({"other": "x"})).is_err());
-        assert!(validate(&json!({"summary": null})).is_err());
-
-        // No `required` array → nothing to enforce.
-        let loose = json!({"type": "object"});
-        let validate = OpenAIAdapter::schema_required_validator(&loose);
-        assert!(validate(&json!({})).is_ok());
     }
 
     #[test]

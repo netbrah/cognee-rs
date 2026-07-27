@@ -101,6 +101,12 @@ pub struct LlmInputs {
     pub model: String,
     pub api_key: String,
     pub endpoint: String,
+    /// Optional Anthropic Messages API base URL override (env `ANTHROPIC_BASE_URL`,
+    /// alias `ANTHROPIC_API_BASE`). `None` uses the public Anthropic API. Kept
+    /// separate from `endpoint` on purpose: `endpoint` aliases `OPENAI_URL`, so
+    /// inheriting it would point Anthropic traffic at the OpenAI host. Only the
+    /// Anthropic factory consumes it; other providers ignore it.
+    pub anthropic_base_url: Option<String>,
     pub max_retries: u32,
     /// Output-token ceiling (Python's `llm_max_completion_tokens`), lowered from
     /// `Settings.llm_max_completion_tokens` (`setLlmMaxCompletionTokens`). Applied
@@ -121,4 +127,19 @@ pub struct LlmInputs {
     pub cassette: String,
     /// When non-empty, wraps the real adapter in a recorder (`mock-llm`).
     pub record_path: String,
+}
+
+/// Read the optional Anthropic base-URL override from the environment
+/// (`ANTHROPIC_BASE_URL`, alias `ANTHROPIC_API_BASE`). Trims surrounding
+/// whitespace and treats an empty value as unset (`None`).
+///
+/// Lives here — the env-read boundary for [`LlmInputs`] — so both the SDK
+/// `Settings` and the standalone HTTP server resolve the same knob identically
+/// when lowering their config into a [`BackendBuildContext`].
+pub fn anthropic_base_url_from_env() -> Option<String> {
+    std::env::var("ANTHROPIC_BASE_URL")
+        .or_else(|_| std::env::var("ANTHROPIC_API_BASE"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }

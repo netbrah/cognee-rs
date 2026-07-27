@@ -76,10 +76,13 @@ factory): it authenticates with `x-api-key`, hoists the system prompt into the
 top-level `system` field, and produces structured output via a forced `tool_use`.
 It requires `LLM_API_KEY`, strips an `anthropic/` model prefix, honors `LLM_ARGS`
 (merged into each request), and supports image description (vision) but not audio
-transcription. The endpoint is always `https://api.anthropic.com/v1`: unlike the
+transcription. The endpoint defaults to `https://api.anthropic.com/v1`: unlike the
 OpenAI-compatible path it deliberately ignores `LLM_ENDPOINT`/`OPENAI_URL` (which
 alias each other) so a stray `OPENAI_URL` cannot misroute Anthropic traffic —
-matching the Python SDK, which passes no base URL. Native Azure and Bedrock
+matching the Python SDK, which passes no base URL. To route Anthropic traffic
+through a proxy / gateway / Bedrock-compatible endpoint, set the dedicated
+`ANTHROPIC_BASE_URL` (alias `ANTHROPIC_API_BASE`); it overrides the default only
+on the Anthropic path and other providers ignore it. Native Azure and Bedrock
 adapters are tracked separately in issue #17.
 
 > **Ollama embeddings:** set `EMBEDDING_ENDPOINT` explicitly when using

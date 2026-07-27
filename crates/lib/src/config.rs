@@ -843,6 +843,7 @@ impl Settings {
                 model: self.llm_model.clone(),
                 api_key: self.llm_api_key.clone(),
                 endpoint: self.llm_endpoint.clone(),
+                anthropic_base_url: cognee_components::anthropic_base_url_from_env(),
                 max_retries: self.llm_max_retries,
                 max_completion_tokens: self.llm_max_completion_tokens,
                 llm_args: self.llm_args.clone(),
