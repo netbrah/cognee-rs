@@ -452,20 +452,30 @@ impl AnthropicAdapter {
                             // finished at the budget from one whose nested
                             // list/string was cut off. Re-asking with the SAME budget
                             // would truncate again at the same point, so raise it
-                            // toward the model's documented cap for the next attempt.
-                            // If we are already at that cap a larger budget is
-                            // impossible, so fail terminally rather than re-ask until
-                            // MaxRetriesExceeded.
-                            let model_cap = Self::model_max_output_tokens(&self.model);
+                            // toward the effective output budget for the next attempt.
+                            // That budget is the model cap bounded by the configured
+                            // `llm_max_completion_tokens` ceiling: `effective_max_tokens`
+                            // documents the ceiling as an upper bound on *every* path,
+                            // so the retry must not exceed it — matching the Python
+                            // reference, which caps every path at
+                            // `llm_max_completion_tokens` and never raises the budget on
+                            // truncation. If we are already at that effective cap a
+                            // larger budget is not allowed, so fail terminally rather
+                            // than re-ask until MaxRetriesExceeded (a truncation under a
+                            // binding cost ceiling is unrecoverable by design).
+                            let effective_cap = Self::model_max_output_tokens(&self.model)
+                                .min(self.max_completion_tokens)
+                                .max(1);
                             let current = body["max_tokens"].as_u64().unwrap_or(0) as u32;
-                            if current >= model_cap {
+                            if current >= effective_cap {
                                 return Err(LlmError::InvalidResponse(format!(
-                                    "Anthropic structured output was truncated at the model's \
-                                     {model_cap}-token output cap and cannot be completed within \
-                                     that budget"
+                                    "Anthropic structured output was truncated at the effective \
+                                     {effective_cap}-token output budget (the lesser of the \
+                                     llm_max_completion_tokens ceiling and the model cap) and \
+                                     cannot be completed within that budget"
                                 )));
                             }
-                            body["max_tokens"] = json!(model_cap);
+                            body["max_tokens"] = json!(effective_cap);
                             let reason = "the previous answer was cut off at max_tokens before \
                                           the object was complete";
                             last_error = LlmError::InvalidResponse(format!(

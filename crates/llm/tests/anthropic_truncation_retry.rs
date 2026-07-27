@@ -8,10 +8,13 @@
 //!
 //! When Anthropic returns `stop_reason == "max_tokens"` the tool input was cut
 //! off mid-object. Re-asking with the *same* `max_tokens` would truncate again
-//! at the same point, so the adapter must raise the budget toward the model's
-//! documented output cap on the retry. This test pins that behavior: the first
-//! request (a low configured ceiling) truncates, and the retry must arrive with
-//! `max_tokens` raised to the model cap and then succeed.
+//! at the same point, so the adapter raises the budget toward the *effective*
+//! output cap — `min(llm_max_completion_tokens ceiling, model cap)` — on the
+//! retry, and fails terminally once that effective cap is reached (the ceiling
+//! is an upper bound on every path, matching the Python reference). These tests
+//! pin both behaviors: a caller request below the effective cap gets a raised
+//! retry that succeeds, while a budget already at the effective cap fails
+//! without looping.
 
 use cognee_llm::{AnthropicAdapter, GenerationOptions, LlmExt};
 use httpmock::prelude::*;
@@ -25,11 +28,12 @@ struct Person {
 }
 
 #[tokio::test]
-async fn truncation_retry_raises_max_tokens_to_the_model_cap() {
+async fn truncation_retry_raises_max_tokens_to_the_effective_cap() {
     let server = MockServer::start_async().await;
 
-    // First attempt is sent at the configured ceiling (1000). Return a
-    // tool_use that is present and JSON-parseable but flagged truncated.
+    // First attempt is sent at the caller-requested budget (1000), which is
+    // below the effective cap so there is headroom to raise. Return a tool_use
+    // that is present and JSON-parseable but flagged truncated.
     let truncated = server
         .mock_async(|when, then| {
             when.method(POST)
@@ -54,9 +58,9 @@ async fn truncation_retry_raises_max_tokens_to_the_model_cap() {
         })
         .await;
 
-    // The retry must arrive with max_tokens raised to the model cap (64000 for
-    // Claude Sonnet 4), not the original 1000. Only then do we return a
-    // complete object.
+    // The retry must arrive with max_tokens raised to the effective cap: 64000 =
+    // min(ceiling 64000, Claude Sonnet 4 model cap 64000), not the original 1000.
+    // Only then do we return a complete object.
     let completed = server
         .mock_async(|when, then| {
             when.method(POST)
@@ -81,14 +85,17 @@ async fn truncation_retry_raises_max_tokens_to_the_model_cap() {
         })
         .await;
 
-    // Sonnet 4 caps output at 64k; a 1000-token ceiling leaves headroom to raise.
+    // Ceiling is set to the model cap (64000), and the caller requests only 1000,
+    // so the effective cap is 64000 and there is headroom above the first budget
+    // to raise into. (A ceiling *below* the model cap that binds the first budget
+    // is the terminal case — see the test below.)
     let adapter = AnthropicAdapter::new(
         "claude-sonnet-4-20250514",
         "test-key",
         Some(server.base_url()),
     )
     .expect("construct AnthropicAdapter")
-    .with_max_completion_tokens(1000)
+    .with_max_completion_tokens(64_000)
     .with_network_retries(0);
 
     let person: Person = adapter
@@ -97,6 +104,7 @@ async fn truncation_retry_raises_max_tokens_to_the_model_cap() {
             "Extract the person's name and age.",
             Some(GenerationOptions {
                 temperature: Some(0.0),
+                max_tokens: Some(1000),
                 ..Default::default()
             }),
         )
@@ -106,10 +114,73 @@ async fn truncation_retry_raises_max_tokens_to_the_model_cap() {
     assert_eq!(person.name, "Ada Lovelace");
     assert_eq!(person.age, 36);
 
-    // Both exchanges must have happened exactly once: the truncated first ask
-    // at the ceiling, then the raised retry at the model cap.
+    // Both exchanges must have happened exactly once: the truncated first ask at
+    // the caller budget, then the raised retry at the effective cap.
     truncated.assert_calls_async(1).await;
     completed.assert_calls_async(1).await;
+}
+
+#[tokio::test]
+async fn truncation_at_a_binding_ceiling_fails_terminally_without_raising() {
+    // When `llm_max_completion_tokens` is the binding constraint (below the model
+    // cap), the first request already goes out at the ceiling, so there is no
+    // headroom to raise: the effective cap == the budget that just truncated. The
+    // call must fail terminally rather than silently exceed the operator's cost
+    // ceiling by jumping to the model cap. Matches the Python reference, where
+    // `llm_max_completion_tokens` bounds every path and truncation is not
+    // recovered by enlarging the budget.
+    let server = MockServer::start_async().await;
+
+    // Sonnet 4's model cap is 64000, but the ceiling is 1000, so the first (and
+    // only) request goes out at 1000 and there is no room to raise.
+    let truncated = server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/messages")
+                .body_includes("\"max_tokens\":1000");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(
+                    r#"{
+                        "id": "msg_trunc_ceiling",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "claude-sonnet-4-20250514",
+                        "content": [
+                            {"type": "tool_use", "name": "extract_structured_data",
+                             "input": {"name": "Ada", "age": 36}}
+                        ],
+                        "stop_reason": "max_tokens",
+                        "usage": {"input_tokens": 10, "output_tokens": 1000}
+                    }"#,
+                );
+        })
+        .await;
+
+    let adapter = AnthropicAdapter::new(
+        "claude-sonnet-4-20250514",
+        "test-key",
+        Some(server.base_url()),
+    )
+    .expect("construct AnthropicAdapter")
+    .with_max_completion_tokens(1000)
+    .with_network_retries(0);
+
+    let err = adapter
+        .create_structured_output::<Person>(
+            "Ada Lovelace was 36.",
+            "Extract the person's name and age.",
+            None,
+        )
+        .await
+        .expect_err("a truncation at the binding ceiling must fail, not raise past it");
+
+    // Exactly one exchange: it did not raise the budget past the ceiling.
+    truncated.assert_calls_async(1).await;
+    assert!(
+        err.to_string().contains("output budget"),
+        "unexpected error: {err}"
+    );
 }
 
 #[tokio::test]
@@ -167,7 +238,7 @@ async fn truncation_at_the_model_cap_fails_terminally_without_looping() {
     // Exactly one exchange: it did not re-ask at the same budget.
     truncated.assert_calls_async(1).await;
     assert!(
-        err.to_string().contains("output cap"),
+        err.to_string().contains("output budget"),
         "unexpected error: {err}"
     );
 }
