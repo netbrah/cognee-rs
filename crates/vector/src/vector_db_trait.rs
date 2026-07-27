@@ -1,4 +1,4 @@
-use crate::error::VectorDBResult;
+use crate::error::{VectorDBError, VectorDBResult};
 use crate::models::{SearchResult, VectorPoint};
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -84,6 +84,51 @@ pub trait VectorDB: Send + Sync {
     ) -> VectorDBResult<()> {
         let _ = (data_type, field_name, point_ids);
         Ok(())
+    }
+
+    /// Upsert caller-provided vectors into `(data_type, field_name)` without
+    /// invoking any embedding engine.
+    ///
+    /// This is the escape hatch for **small, system-owned vector state**
+    /// (e.g. truth-subspace centroids) where the caller has *already* computed
+    /// the vector and re-embedding it from text would be wrong. It is NOT the
+    /// content-indexing path — use [`index_points`](Self::index_points) for
+    /// content-addressed data points.
+    ///
+    /// Direct port of Python's `VectorDBInterface.upsert_raw_vectors`
+    /// (`vector_db_interface.py:66-79`), whose base likewise
+    /// `raise NotImplementedError`. Only the four real adapters (Mock,
+    /// BruteForce, LanceDB, PgVector) override it; every other implementor
+    /// inherits this error-returning default (the correct "unsupported" answer).
+    ///
+    /// # Semantics (for overriding adapters)
+    /// * **Empty `points`** → `Ok(())` no-op (never touches storage; do not
+    ///   read `points[0]`).
+    /// * **Missing collection** → self-created with `points[0].vector.len()` as
+    ///   the dimension (nothing else ever creates a system-owned collection like
+    ///   `TruthCentroid_vector`, so the raw-upsert path must bootstrap it).
+    /// * **By-id insert-or-replace with FULL metadata replace** — unlike
+    ///   [`index_points`](Self::index_points), this does **not** union
+    ///   `dataset_ids`/`dataset_id` membership from a prior point at the same id.
+    ///   Each raw point is written verbatim (its id already scopes it), matching
+    ///   Python's raw write.
+    ///
+    /// # API divergence from Python
+    /// Python threads a `payload_schema: Optional[Any]` argument for
+    /// provider-side schema declaration. Rust has no adapter-level runtime schema
+    /// hook — validation happens where the caller deserializes the retrieved
+    /// metadata — so the parameter is dropped entirely rather than threaded
+    /// through and ignored.
+    async fn upsert_raw_vectors(
+        &self,
+        data_type: &str,
+        field_name: &str,
+        points: &[VectorPoint],
+    ) -> VectorDBResult<()> {
+        let _ = (data_type, field_name, points);
+        Err(VectorDBError::StorageError(
+            "upsert_raw_vectors is not implemented for this adapter".to_string(),
+        ))
     }
 
     /// Fetch stored points by ID (direct lookup, no similarity search).

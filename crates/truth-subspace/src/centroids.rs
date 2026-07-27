@@ -2,16 +2,20 @@
 //! `cognee/modules/truth_subspace/centroids.py`.
 //!
 //! The core invariant is simple: slot `i` always means the centroid stored in
-//! slot `i` for the current truth epoch. Everything here is deterministic so a
-//! rebuild from the same learning statements produces the same slots. No I/O
-//! and no vector-engine dependency — `load_centroids`/`upsert_centroids`
-//! (`centroids.py:165-194`) need a live vector engine and are deferred to P2-03.
+//! slot `i` for the current truth epoch. The bulk of this module is
+//! deterministic pure math, so a rebuild from the same learning statements
+//! produces the same slots. The two exceptions are the vector-engine-backed
+//! persistence pair [`load_centroids`] / [`upsert_centroids`]
+//! (`centroids.py:165-194`), which read and write centroid payloads through a
+//! [`VectorDB`] so truth-subspace reranking survives restarts.
 
 use std::collections::{HashMap, HashSet};
 
+use cognee_vector::{VectorDB, VectorDBError, VectorDBResult, VectorPoint};
 use uuid::Uuid;
 
 use crate::align::cosine;
+use crate::constants::TRUTH_CENTROID_COLLECTION;
 use crate::models::TruthCentroidPayload;
 
 /// Deterministic UUIDv5 id for a `(dataset_id, slot)` centroid.
@@ -289,6 +293,99 @@ pub fn centroids_changed(
         }
     }
     false
+}
+
+/// Load the persisted centroid slots for `dataset_id`. Ports
+/// `centroids.py:165-176`.
+///
+/// Builds the `k` deterministic centroid ids (`slot in 0..k`), fetches whatever
+/// exists via [`VectorDB::retrieve`] (a fresh DB with no `TruthCentroid_vector`
+/// collection returns an empty list, never an error), deserializes each row's
+/// metadata blob back into a [`TruthCentroidPayload`], and returns them sorted
+/// by `slot`.
+///
+/// - Rows whose metadata fails to deserialize are silently skipped (mirrors
+///   Python's `if not isinstance(payload, dict): continue` guard).
+/// - The `dataset_id` equality filter is kept defensively even though the id
+///   already scopes each centroid to one dataset — it guards against a hash
+///   collision or a stale/corrupted payload (`centroids.py:172-174`).
+/// - `retrieve` does not guarantee result order, so the final `sort_by_key`
+///   restores `0..k` slot order.
+/// - The reconstructed `centroid: Vec<f64>` comes from the JSON payload, NOT
+///   from the `f32`-narrowed ANN vector column, so the payload round-trips at
+///   full `f64` precision (see [`upsert_centroids`]).
+pub async fn load_centroids(
+    vector: &dyn VectorDB,
+    dataset_id: &str,
+    k: usize,
+) -> VectorDBResult<Vec<TruthCentroidPayload>> {
+    let (data_type, field_name) = TRUTH_CENTROID_COLLECTION;
+    let ids: Vec<Uuid> = (0..k).map(|slot| centroid_id(dataset_id, slot)).collect();
+    let rows = vector.retrieve(data_type, field_name, &ids).await?;
+    let mut centroids: Vec<TruthCentroidPayload> = rows
+        .into_iter()
+        .filter_map(|row| {
+            // `retrieve` returns metadata as a HashMap; rebuild a JSON object so
+            // serde can validate it against the payload schema.
+            let value = serde_json::Value::Object(row.metadata.into_iter().collect());
+            serde_json::from_value(value).ok()
+        })
+        .filter(|c: &TruthCentroidPayload| c.dataset_id == dataset_id)
+        .collect();
+    centroids.sort_by_key(|c| c.slot);
+    Ok(centroids)
+}
+
+/// Persist centroid slots as raw vectors. Ports `centroids.py:179-194`.
+///
+/// Each centroid becomes a [`VectorPoint`] keyed by its deterministic
+/// [`centroid_id`], with the `f32`-narrowed centroid as the ANN-searchable
+/// vector column and the ENTIRE [`TruthCentroidPayload`] (including its own
+/// full-precision `centroid: Vec<f64>`) serialized into the metadata blob — so
+/// a later [`load_centroids`] reconstructs the payload at full `f64` precision
+/// even though the vector column is `f32`. Writes go through
+/// [`VectorDB::upsert_raw_vectors`], which self-creates the
+/// `TruthCentroid_vector` collection on first write.
+///
+/// An empty slice short-circuits to `Ok(())` without any adapter call (Python's
+/// `if not centroids: return`), avoiding a needless empty-batch round trip.
+///
+/// # Precision note (Rust-only divergence)
+/// `TruthCentroidPayload.centroid` is `Vec<f64>` but `VectorPoint.vector` is
+/// `Vec<f32>`; the ANN vector column narrows `f64 -> f32`. This is an accepted,
+/// documented divergence — the full-precision payload lives in the metadata
+/// blob, so nearest-slot cosine assignment is unaffected at the tolerances this
+/// project already accepts.
+pub async fn upsert_centroids(
+    vector: &dyn VectorDB,
+    centroids: &[TruthCentroidPayload],
+) -> VectorDBResult<()> {
+    if centroids.is_empty() {
+        return Ok(());
+    }
+    let (data_type, field_name) = TRUTH_CENTROID_COLLECTION;
+    let mut points: Vec<VectorPoint> = Vec::with_capacity(centroids.len());
+    for c in centroids {
+        let id = centroid_id(&c.dataset_id, c.slot);
+        // Documented f64 -> f32 narrowing for the ANN vector column.
+        let vector_col: Vec<f32> = c.centroid.iter().map(|&x| x as f32).collect();
+        // The metadata blob carries the entire payload (full-precision f64).
+        let serde_json::Value::Object(map) = serde_json::to_value(c)? else {
+            // TruthCentroidPayload is a struct — serde always yields an object;
+            // this branch is unreachable but handled without a panic.
+            return Err(VectorDBError::StorageError(
+                "TruthCentroidPayload did not serialize to a JSON object".to_string(),
+            ));
+        };
+        points.push(VectorPoint {
+            id,
+            vector: vector_col,
+            metadata: map.into_iter().collect(),
+        });
+    }
+    vector
+        .upsert_raw_vectors(data_type, field_name, &points)
+        .await
 }
 
 #[cfg(test)]

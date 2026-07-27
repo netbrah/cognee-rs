@@ -70,3 +70,5 @@ pgvector_test!(test_retrieve_round_trip);
 pgvector_test!(test_retrieve_missing_collection);
 pgvector_test!(test_retrieve_empty_ids);
 pgvector_test!(test_retrieve_chunking);
+pgvector_test!(test_upsert_raw_vectors_round_trip);
+pgvector_test!(test_upsert_raw_vectors_empty_noop);

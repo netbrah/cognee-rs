@@ -138,3 +138,15 @@ async fn brute_force_retrieve_empty_ids() {
 async fn brute_force_retrieve_chunking() {
     common::test_retrieve_chunking(&BruteForceVectorDB::new()).await;
 }
+
+// -- upsert_raw_vectors contract (shared helpers) ---------------------------
+
+#[tokio::test]
+async fn brute_force_upsert_raw_vectors_round_trip() {
+    common::test_upsert_raw_vectors_round_trip(&BruteForceVectorDB::new()).await;
+}
+
+#[tokio::test]
+async fn brute_force_upsert_raw_vectors_empty_noop() {
+    common::test_upsert_raw_vectors_empty_noop(&BruteForceVectorDB::new()).await;
+}

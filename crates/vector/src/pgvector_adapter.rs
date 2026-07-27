@@ -476,6 +476,100 @@ impl VectorDB for PgVectorAdapter {
     }
 
     #[instrument(
+        name = "cognee.db.vector.upsert_raw",
+        level = "info",
+        skip_all,
+        fields(
+            cognee.db.system = "pgvector",
+            cognee.vector.collection = tracing::field::Empty,
+            cognee.db.row_count = tracing::field::Empty,
+        ),
+        err,
+    )]
+    async fn upsert_raw_vectors(
+        &self,
+        data_type: &str,
+        field_name: &str,
+        points: &[VectorPoint],
+    ) -> VectorDBResult<()> {
+        // Empty input is a no-op — must not touch `points[0]`.
+        if points.is_empty() {
+            return Ok(());
+        }
+
+        let coll = Self::collection_name(data_type, field_name)?;
+        Span::current().record(COGNEE_VECTOR_COLLECTION, coll.as_str());
+
+        // Dimension check across the batch.
+        let expected_dim = points[0].vector.len();
+        for p in points {
+            if p.vector.len() != expected_dim {
+                return Err(VectorDBError::DimensionMismatch {
+                    collection: coll.clone(),
+                    expected: expected_dim,
+                    actual: p.vector.len(),
+                });
+            }
+        }
+
+        // Self-create the collection when absent, sized from the first vector
+        // (nothing else ever creates a system-owned collection like
+        // TruthCentroid_vector).
+        if !self.has_collection(data_type, field_name).await? {
+            self.create_collection(data_type, field_name, expected_dim)
+                .await?;
+        }
+
+        // Batched upsert. Unlike `index_points`, we do NOT read + union prior
+        // dataset membership via `fetch_metadata`; the incoming metadata is
+        // written verbatim (full replace on conflict).
+        for chunk in points.chunks(BATCH_SIZE) {
+            let mut sql = format!(r#"INSERT INTO "{coll}" (id, vector, metadata) VALUES "#);
+            let mut values: Vec<sea_orm::Value> = Vec::with_capacity(chunk.len() * 3);
+            let mut idx = 1u32;
+
+            for (i, pt) in chunk.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push_str(&format!(
+                    "(${}, ${}::vector, ${}::jsonb)",
+                    idx,
+                    idx + 1,
+                    idx + 2
+                ));
+                idx += 3;
+
+                values.push(pt.id.into());
+                values.push(Self::format_vector(&pt.vector).into());
+                let metadata_obj: serde_json::Value = serde_json::Value::Object(
+                    pt.metadata
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                );
+                values.push(metadata_obj.into());
+            }
+
+            sql.push_str(
+                " ON CONFLICT (id) DO UPDATE SET vector = EXCLUDED.vector, metadata = EXCLUDED.metadata",
+            );
+
+            self.db
+                .execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    &sql,
+                    values,
+                ))
+                .await
+                .map_err(|e| VectorDBError::StorageError(e.to_string()))?;
+        }
+
+        Span::current().record(COGNEE_DB_ROW_COUNT, points.len() as i64);
+        Ok(())
+    }
+
+    #[instrument(
         name = "cognee.db.vector.search",
         level = "info",
         skip_all,

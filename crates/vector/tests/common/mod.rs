@@ -304,6 +304,67 @@ pub async fn test_retrieve_chunking(db: &dyn VectorDB) {
     assert_eq!(got, want, "all 101 ids should round-trip across batches");
 }
 
+// -- upsert_raw_vectors ------------------------------------------------------
+
+pub async fn test_upsert_raw_vectors_round_trip(db: &dyn VectorDB) {
+    use std::collections::HashMap;
+
+    let id1 = Uuid::new_v4();
+    let id2 = Uuid::new_v4();
+
+    // Create-on-absent: no prior `create_collection` call — the raw upsert must
+    // self-create the collection sized from the first vector.
+    let points = vec![
+        VectorPoint::new(id1, vec![1.0, 0.0])
+            .with_metadata("k", json!("a"))
+            .with_metadata("n", json!(1)),
+        VectorPoint::new(id2, vec![0.0, 1.0]).with_metadata("k", json!("b")),
+    ];
+    db.upsert_raw_vectors("RawUp", "vec", &points)
+        .await
+        .unwrap();
+    assert!(
+        db.has_collection("RawUp", "vec").await.unwrap(),
+        "upsert_raw_vectors must self-create the collection"
+    );
+
+    let got = db.retrieve("RawUp", "vec", &[id1, id2]).await.unwrap();
+    let by_id: HashMap<Uuid, _> = got.into_iter().map(|r| (r.id, r.metadata)).collect();
+    assert_eq!(by_id.len(), 2, "both raw points must round-trip");
+    assert_eq!(by_id[&id1].get("k"), Some(&json!("a")));
+    assert_eq!(by_id[&id1].get("n"), Some(&json!(1)));
+    assert_eq!(by_id[&id2].get("k"), Some(&json!("b")));
+
+    // Full-metadata replace: re-upsert id1 with entirely different metadata (no
+    // dataset-membership union — the old `n` field must be gone).
+    let replace = vec![VectorPoint::new(id1, vec![0.5, 0.5]).with_metadata("k", json!("z"))];
+    db.upsert_raw_vectors("RawUp", "vec", &replace)
+        .await
+        .unwrap();
+    let got = db.retrieve("RawUp", "vec", &[id1]).await.unwrap();
+    assert_eq!(got.len(), 1, "replace must not create a second row");
+    assert_eq!(
+        got[0].metadata.get("k"),
+        Some(&json!("z")),
+        "metadata must be fully replaced"
+    );
+    assert!(
+        !got[0].metadata.contains_key("n"),
+        "old metadata field must be dropped by full replace"
+    );
+}
+
+pub async fn test_upsert_raw_vectors_empty_noop(db: &dyn VectorDB) {
+    let empty: Vec<VectorPoint> = vec![];
+    db.upsert_raw_vectors("RawEmpty", "vec", &empty)
+        .await
+        .unwrap();
+    assert!(
+        !db.has_collection("RawEmpty", "vec").await.unwrap(),
+        "empty upsert_raw_vectors must be a no-op and not create a collection"
+    );
+}
+
 // -- batch search -----------------------------------------------------------
 
 pub async fn test_batch_search(db: &dyn VectorDB) {

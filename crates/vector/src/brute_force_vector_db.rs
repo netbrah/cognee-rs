@@ -148,6 +148,39 @@ impl VectorDB for BruteForceVectorDB {
         Ok(())
     }
 
+    async fn upsert_raw_vectors(
+        &self,
+        data_type: &str,
+        field_name: &str,
+        points: &[VectorPoint],
+    ) -> VectorDBResult<()> {
+        // Empty input is a no-op — must not touch `points[0]`.
+        if points.is_empty() {
+            return Ok(());
+        }
+        let key = Self::key(data_type, field_name);
+        let mut g = self.collections.write().await;
+
+        // Self-create the collection when absent, sized from the first vector
+        // (nothing else ever creates a system-owned collection like
+        // TruthCentroid_vector). `index_points` deliberately does NOT do this.
+        let coll = g.entry(key).or_insert_with(|| Collection {
+            dimension: points[0].vector.len(),
+            points: Vec::new(),
+        });
+
+        // Full-metadata by-id insert-or-replace — NO dataset-membership union
+        // (that is index_points' job; raw upsert writes each point verbatim).
+        for p in points {
+            if let Some(existing) = coll.points.iter_mut().find(|x| x.id == p.id) {
+                *existing = p.clone();
+            } else {
+                coll.points.push(p.clone());
+            }
+        }
+        Ok(())
+    }
+
     async fn search_similar(
         &self,
         data_type: &str,

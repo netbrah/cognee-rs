@@ -220,6 +220,41 @@ impl VectorDB for MockVectorDB {
         Ok(())
     }
 
+    async fn upsert_raw_vectors(
+        &self,
+        data_type: &str,
+        field_name: &str,
+        points: &[VectorPoint],
+    ) -> VectorDBResult<()> {
+        // Empty input is a no-op — must not touch `points[0]`.
+        if points.is_empty() {
+            return Ok(());
+        }
+
+        let key = Self::collection_key(data_type, field_name);
+        let mut collections = self.collections.lock().unwrap(); // lock poison is unrecoverable
+
+        // Self-create the collection when absent, sized from the first vector
+        // (nothing else ever creates a system-owned collection like
+        // TruthCentroid_vector). `index_points` deliberately does NOT do this.
+        let collection = collections.entry(key).or_insert_with(|| CollectionData {
+            dimension: points[0].vector.len(),
+            points: Vec::new(),
+        });
+
+        // Full-metadata by-id insert-or-replace — NO dataset-membership union
+        // (that is index_points' job; raw upsert writes each point verbatim).
+        for new_point in points {
+            if let Some(existing) = collection.points.iter_mut().find(|p| p.id == new_point.id) {
+                *existing = new_point.clone();
+            } else {
+                collection.points.push(new_point.clone());
+            }
+        }
+
+        Ok(())
+    }
+
     async fn search_similar(
         &self,
         data_type: &str,
@@ -462,6 +497,33 @@ mod tests {
         .unwrap();
         let results = db.retrieve("T", "f", &[]).await.unwrap();
         assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_mock_upsert_raw_vectors_creates_and_replaces() {
+        let db = MockVectorDB::new();
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+
+        // No prior create_collection — upsert_raw_vectors self-creates it.
+        let points = vec![
+            VectorPoint::new(id1, vec![1.0, 0.0]).with_metadata("k", json!("a")),
+            VectorPoint::new(id2, vec![0.0, 1.0]).with_metadata("k", json!("b")),
+        ];
+        db.upsert_raw_vectors("Raw", "vec", &points).await.unwrap();
+        assert!(db.has_collection("Raw", "vec").await.unwrap());
+        assert_eq!(db.collection_size("Raw", "vec").await.unwrap(), 2);
+
+        // Re-upsert id1 with fully different metadata — full replace, no merge.
+        let replace = vec![VectorPoint::new(id1, vec![0.5, 0.5]).with_metadata("k", json!("z"))];
+        db.upsert_raw_vectors("Raw", "vec", &replace).await.unwrap();
+        assert_eq!(db.collection_size("Raw", "vec").await.unwrap(), 2);
+        let got = db.get_payload("Raw", "vec", id1).unwrap();
+        assert_eq!(got.get("k"), Some(&json!("z")));
+
+        // Empty upsert is a no-op and does not create a new collection.
+        db.upsert_raw_vectors("Other", "vec", &[]).await.unwrap();
+        assert!(!db.has_collection("Other", "vec").await.unwrap());
     }
 
     #[tokio::test]
