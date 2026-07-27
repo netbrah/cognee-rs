@@ -74,3 +74,5 @@ pggraph_test!(test_properties_json_round_trip);
 pggraph_test!(test_get_neighborhood_depth1);
 pggraph_test!(test_get_neighborhood_multiple_seeds);
 pggraph_test!(test_get_neighborhood_empty_seeds);
+pggraph_test!(test_node_truth_state_round_trip);
+pggraph_test!(test_node_truth_state_missing_and_invalid);

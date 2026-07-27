@@ -1694,6 +1694,78 @@ impl GraphDBTrait for LadybugAdapter {
         Ok(out)
     }
 
+    async fn get_node_truth_state(
+        &self,
+        node_ids: &[String],
+    ) -> GraphDBResult<HashMap<String, crate::NodeTruthState>> {
+        if node_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let id_list = node_ids
+            .iter()
+            .map(|id| format!("'{}'", id.replace('\\', "\\\\").replace('\'', "\\'")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "MATCH (n:Node) WHERE n.id IN [{id_list}] RETURN n.id AS id, n.properties AS properties"
+        );
+        let rows = self.execute_query(&query)?;
+        let mut out = HashMap::with_capacity(rows.len());
+        for row in rows {
+            if row.len() < 2 {
+                continue;
+            }
+            let id = match row[0].as_str() {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            // Every returned row is an existing node; include it with defaulted
+            // fields even when the truth-state properties are absent.
+            let (truth_alignment, truth_epoch) = if let Some(props_str) = row[1].as_str() {
+                let clean = sanitize_json_control_chars(props_str);
+                match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&clean) {
+                    Ok(map) => (
+                        crate::traits::extract_truth_alignment(map.get("truth_alignment")),
+                        crate::traits::extract_truth_epoch(map.get("truth_epoch")),
+                    ),
+                    Err(_) => (Vec::new(), -1),
+                }
+            } else {
+                (Vec::new(), -1)
+            };
+            out.insert(
+                id,
+                crate::NodeTruthState {
+                    truth_alignment,
+                    truth_epoch,
+                },
+            );
+        }
+        Ok(out)
+    }
+
+    async fn set_node_truth_state(
+        &self,
+        updates: &HashMap<String, crate::NodeTruthState>,
+    ) -> GraphDBResult<HashMap<String, bool>> {
+        // Ladybug's `update_node_property` is an in-place JSON-merge SET, so two
+        // calls per id is cheap. A single `UNWIND` batched write is an optional
+        // follow-up (see P2-04 Risks), not required here.
+        let mut out = HashMap::with_capacity(updates.len());
+        for (id, state) in updates {
+            let align_ok = self
+                .update_node_property(id, "truth_alignment", json!(state.truth_alignment))
+                .await
+                .is_ok();
+            let epoch_ok = self
+                .update_node_property(id, "truth_epoch", json!(state.truth_epoch))
+                .await
+                .is_ok();
+            out.insert(id.clone(), align_ok && epoch_ok);
+        }
+        Ok(out)
+    }
+
     async fn get_edge_feedback_weights(
         &self,
         edge_keys: &[crate::traits::EdgeKey],

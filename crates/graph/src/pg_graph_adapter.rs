@@ -543,6 +543,68 @@ impl GraphDBTrait for PgGraphAdapter {
         rows.iter().map(Self::parse_node_row).collect()
     }
 
+    async fn get_node_truth_state(
+        &self,
+        node_ids: &[String],
+    ) -> GraphDBResult<HashMap<String, crate::NodeTruthState>> {
+        let nodes = self.get_nodes(node_ids).await?;
+        let mut out = HashMap::with_capacity(nodes.len());
+        for node in nodes {
+            let Some(id) = node.get("id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            out.insert(
+                id.to_string(),
+                crate::NodeTruthState {
+                    truth_alignment: crate::traits::extract_truth_alignment(
+                        node.get("truth_alignment"),
+                    ),
+                    truth_epoch: crate::traits::extract_truth_epoch(node.get("truth_epoch")),
+                },
+            );
+        }
+        Ok(out)
+    }
+
+    async fn set_node_truth_state(
+        &self,
+        updates: &HashMap<String, crate::NodeTruthState>,
+    ) -> GraphDBResult<HashMap<String, bool>> {
+        // Fetch current full property maps in one round-trip, merge the two
+        // truth-state fields into each, then upsert via `add_nodes_raw`
+        // (`INSERT ... ON CONFLICT DO UPDATE`), which never touches edges — so
+        // unlike the default's per-property delete+re-add it cannot drop edges.
+        let ids: Vec<String> = updates.keys().cloned().collect();
+        let nodes = self.get_nodes(&ids).await?;
+
+        // Default every requested id to `false`; flip to `true` when the node
+        // was actually present in the fetch (and thus included in the upsert).
+        let mut out: HashMap<String, bool> = ids.iter().map(|id| (id.clone(), false)).collect();
+
+        let mut merged: Vec<Value> = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            let Some(id) = node.get("id").and_then(|v| v.as_str()).map(str::to_string) else {
+                continue;
+            };
+            let Some(state) = updates.get(&id) else {
+                continue;
+            };
+            let mut obj = serde_json::Map::new();
+            for (k, v) in node {
+                obj.insert(k.into_owned(), v);
+            }
+            obj.insert("truth_alignment".to_string(), json!(state.truth_alignment));
+            obj.insert("truth_epoch".to_string(), json!(state.truth_epoch));
+            merged.push(Value::Object(obj));
+            out.insert(id, true);
+        }
+
+        if !merged.is_empty() {
+            self.add_nodes_raw(merged).await?;
+        }
+        Ok(out)
+    }
+
     // -- edge operations (sea_query) -----------------------------------------
 
     async fn has_edge(

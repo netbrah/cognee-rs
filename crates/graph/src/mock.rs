@@ -58,7 +58,9 @@ impl MockGraphDB {
     /// Get a snapshot of the call log — the names of methods invoked on
     /// this mock in invocation order.
     ///
-    /// Currently records `"get_graph_data"` and `"get_nodeset_subgraph"`.
+    /// Currently records `"get_graph_data"`, `"get_nodeset_subgraph"`,
+    /// `"get_neighborhood"`, `"get_node_truth_state"`, and
+    /// `"set_node_truth_state"`.
     pub fn get_call_log(&self) -> Vec<String> {
         self.call_log.lock().unwrap().clone() // lock poison is unrecoverable
     }
@@ -563,6 +565,62 @@ impl GraphDBTrait for MockGraphDB {
 
         Ok((nodes_by_id.into_iter().collect(), edges))
     }
+
+    async fn get_node_truth_state(
+        &self,
+        node_ids: &[String],
+    ) -> GraphDBResult<HashMap<String, crate::NodeTruthState>> {
+        self.call_log
+            .lock()
+            .unwrap() // lock poison is unrecoverable
+            .push("get_node_truth_state".to_string());
+
+        let nodes = self.nodes.lock().unwrap(); // lock poison is unrecoverable
+        let mut out = HashMap::with_capacity(node_ids.len());
+        for id in node_ids {
+            if let Some(node) = nodes.get(id) {
+                out.insert(
+                    id.clone(),
+                    crate::NodeTruthState {
+                        truth_alignment: crate::traits::extract_truth_alignment(
+                            node.get("truth_alignment"),
+                        ),
+                        truth_epoch: crate::traits::extract_truth_epoch(node.get("truth_epoch")),
+                    },
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    async fn set_node_truth_state(
+        &self,
+        updates: &HashMap<String, crate::NodeTruthState>,
+    ) -> GraphDBResult<HashMap<String, bool>> {
+        self.call_log
+            .lock()
+            .unwrap() // lock poison is unrecoverable
+            .push("set_node_truth_state".to_string());
+
+        let mut nodes = self.nodes.lock().unwrap(); // lock poison is unrecoverable
+        let mut out = HashMap::with_capacity(updates.len());
+        for (id, state) in updates {
+            if let Some(node) = nodes.get_mut(id) {
+                node.insert(
+                    Cow::Borrowed("truth_alignment"),
+                    serde_json::json!(state.truth_alignment),
+                );
+                node.insert(
+                    Cow::Borrowed("truth_epoch"),
+                    serde_json::json!(state.truth_epoch),
+                );
+                out.insert(id.clone(), true);
+            } else {
+                out.insert(id.clone(), false);
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -867,6 +925,37 @@ mod tests {
         // mock override must carry the stored rel name through.
         assert!(!edges[0].2.is_empty());
         assert_eq!(edges[0].2, "connects_to");
+    }
+
+    #[tokio::test]
+    async fn node_truth_state_round_trip_and_logs_calls() {
+        let db = MockGraphDB::new();
+        db.add_node_raw(serde_json::json!({"id": "n1", "type": "T"}))
+            .await
+            .unwrap();
+
+        let mut updates = HashMap::new();
+        updates.insert(
+            "n1".to_string(),
+            crate::NodeTruthState {
+                truth_alignment: vec![0.5, 1.5],
+                truth_epoch: 7,
+            },
+        );
+        // Missing node reports false; present node reports true.
+        updates.insert("ghost".to_string(), crate::NodeTruthState::default());
+        let set_res = db.set_node_truth_state(&updates).await.unwrap();
+        assert_eq!(set_res.get("n1"), Some(&true));
+        assert_eq!(set_res.get("ghost"), Some(&false));
+
+        let got = db.get_node_truth_state(&["n1".to_string()]).await.unwrap();
+        let state = got.get("n1").expect("n1 present");
+        assert_eq!(state.truth_alignment, vec![0.5, 1.5]);
+        assert_eq!(state.truth_epoch, 7);
+
+        let log = db.get_call_log();
+        assert!(log.contains(&"set_node_truth_state".to_string()));
+        assert!(log.contains(&"get_node_truth_state".to_string()));
     }
 
     #[tokio::test]

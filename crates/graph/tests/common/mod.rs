@@ -9,7 +9,7 @@
 //! with *any* backend (Ladybug, PostgreSQL, Mock, …). Backend-specific
 //! integration tests construct their adapter and call these helpers.
 
-use cognee_graph::{EdgeData, GraphDBTrait, GraphDBTraitExt};
+use cognee_graph::{EdgeData, GraphDBTrait, GraphDBTraitExt, NodeTruthState};
 use serde::Serialize;
 use serde_json::json;
 use std::borrow::Cow;
@@ -528,6 +528,108 @@ pub async fn test_properties_json_round_trip(db: &dyn GraphDBTrait) {
             .unwrap(),
         1
     );
+}
+
+// -- node truth state --------------------------------------------------------
+
+pub async fn test_node_truth_state_round_trip(db: &dyn GraphDBTrait) {
+    db.delete_graph().await.unwrap();
+
+    let a = TestNode::new("ts_a", "A", "T", 0);
+    let b = TestNode::new("ts_b", "B", "T", 0);
+    db.add_nodes(&[&a, &b]).await.unwrap();
+
+    let mut updates = HashMap::new();
+    updates.insert(
+        "ts_a".to_string(),
+        NodeTruthState {
+            truth_alignment: vec![0.1, 0.2, 0.3],
+            truth_epoch: 5,
+        },
+    );
+    // Epoch 0 is a legitimate real epoch and must survive as 0, not -1.
+    updates.insert(
+        "ts_b".to_string(),
+        NodeTruthState {
+            truth_alignment: vec![],
+            truth_epoch: 0,
+        },
+    );
+
+    let set_result = db.set_node_truth_state(&updates).await.unwrap();
+    assert_eq!(set_result.get("ts_a"), Some(&true));
+    assert_eq!(set_result.get("ts_b"), Some(&true));
+
+    let got = db
+        .get_node_truth_state(&["ts_a".to_string(), "ts_b".to_string()])
+        .await
+        .unwrap();
+
+    let a_state = got.get("ts_a").expect("ts_a present");
+    assert_eq!(a_state.truth_alignment, vec![0.1, 0.2, 0.3]);
+    assert_eq!(a_state.truth_epoch, 5);
+
+    let b_state = got.get("ts_b").expect("ts_b present");
+    assert_eq!(b_state.truth_alignment, Vec::<f64>::new());
+    assert_eq!(b_state.truth_epoch, 0);
+}
+
+pub async fn test_node_truth_state_missing_and_invalid(db: &dyn GraphDBTrait) {
+    db.delete_graph().await.unwrap();
+
+    // (a) never-added id -> absent from the result map.
+    let ghost = db
+        .get_node_truth_state(&["ghost".to_string()])
+        .await
+        .unwrap();
+    assert!(!ghost.contains_key("ghost"));
+
+    // (b) plain node with no truth props -> present with defaults ([], -1).
+    let plain = TestNode::new("ts_plain", "P", "T", 0);
+    db.add_node(&plain).await.unwrap();
+
+    // (c) numeric-string epoch "3" parses to 3; non-array alignment -> [].
+    db.add_node_raw(json!({
+        "id": "ts_str",
+        "name": "Str",
+        "type": "T",
+        "truth_epoch": "3",
+        "truth_alignment": "not-an-array"
+    }))
+    .await
+    .unwrap();
+
+    // non-numeric epoch "bad" -> -1 sentinel.
+    db.add_node_raw(json!({
+        "id": "ts_bad",
+        "name": "Bad",
+        "type": "T",
+        "truth_epoch": "bad"
+    }))
+    .await
+    .unwrap();
+
+    let got = db
+        .get_node_truth_state(&[
+            "ts_plain".to_string(),
+            "ts_str".to_string(),
+            "ts_bad".to_string(),
+        ])
+        .await
+        .unwrap();
+
+    let plain_state = got
+        .get("ts_plain")
+        .expect("ts_plain present with defaults, not omitted");
+    assert_eq!(plain_state.truth_alignment, Vec::<f64>::new());
+    assert_eq!(plain_state.truth_epoch, -1);
+
+    let str_state = got.get("ts_str").expect("ts_str present");
+    assert_eq!(str_state.truth_epoch, 3);
+    assert_eq!(str_state.truth_alignment, Vec::<f64>::new());
+
+    let bad_state = got.get("ts_bad").expect("ts_bad present");
+    assert_eq!(bad_state.truth_epoch, -1);
 }
 
 // -- get_neighborhood --------------------------------------------------------
