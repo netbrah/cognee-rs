@@ -15,7 +15,7 @@ authors.workspace = true
 workspace = true
 
 [features]
-sqlite   = ["sea-orm/sqlx-sqlite", "dep:log"]
+sqlite   = ["sea-orm/sqlx-sqlite", "dep:log", "dep:tokio"]
 postgres = ["sea-orm/sqlx-postgres"]
 
 [dependencies]
@@ -41,6 +41,9 @@ serde.workspace = true
 # `to_dict()` helpers (e.g. `session_record::Model::to_dict`) can match
 # the field ordering of Python's `to_dict()` byte-for-byte.
 serde_json = { workspace = true, features = ["preserve_order"] }
+# Only the sqlite connect path uses `spawn_blocking` (for the WAL writability
+# probe); gated behind the `sqlite` feature so non-sqlite builds don't link it.
+tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 cognee-test-utils = { path = "../test-utils" }

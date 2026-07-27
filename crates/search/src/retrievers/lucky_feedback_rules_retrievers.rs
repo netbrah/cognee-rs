@@ -218,6 +218,10 @@ impl FeelingLuckyRetriever {
     async fn select_retriever(&self, query: &str) -> Result<SearchRetrieverRef, SearchError> {
         let selector_prompt = DEFAULT_FEELING_LUCKY_PROMPT.to_string();
 
+        // Retriever selection: the output must parse back into a SearchType
+        // token, so floor the token cap — a low user-facing
+        // LLM_MAX_COMPLETION_TOKENS must not truncate the selector's answer
+        // (see `floored_internal_options`).
         let response = self
             .llm
             .generate(
@@ -225,7 +229,9 @@ impl FeelingLuckyRetriever {
                     Message::system(selector_prompt),
                     Message::user(query.to_string()),
                 ],
-                self.generation_options.clone(),
+                crate::retrievers::base_retriever::floored_internal_options(
+                    &self.generation_options,
+                ),
             )
             .await;
 

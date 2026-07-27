@@ -941,14 +941,27 @@ impl Settings {
                 "Postgres vector credentials not fully configured; falling back to the \
                  relational database configuration. Set VECTOR_DB_* explicitly to avoid this."
             );
-            if self.db_host.is_empty() || self.db_name.is_empty() || self.db_username.is_empty() {
+            if self.db_host.is_empty() || self.db_name.is_empty() {
                 return Err("Missing required Postgres vector credentials".into());
             }
+            // An empty username is the out-of-the-box default, so default it to
+            // `postgres` (Postgres's own superuser) rather than erroring — the
+            // previous behaviour returned a usable URL for the default config
+            // and pgvector deployments relied on it. Crucially this stays on the
+            // relational host/port/DATABASE, so vectors still land in the SAME
+            // database as the relational store; it does NOT resurrect the old
+            // per-field defaults (port 1234 / `cognee_vectors`) that silently
+            // split the stores across databases.
+            let user = if self.db_username.is_empty() {
+                "postgres"
+            } else {
+                self.db_username.as_str()
+            };
             (
                 self.db_host.as_str(),
                 self.db_port,
                 self.db_name.as_str(),
-                self.db_username.as_str(),
+                user,
                 self.db_password.as_str(),
             )
         };
@@ -3335,12 +3348,31 @@ mod tests {
 
     #[cfg(feature = "pgvector")]
     #[test]
-    fn vector_postgres_url_errs_without_any_creds() {
-        // No VECTOR_DB_* and no relational db_* creds → explicit error, not a
-        // silent localhost/1234 URL that fails obscurely at connect time.
+    fn vector_postgres_url_defaults_username_for_out_of_box_config() {
+        // The out-of-the-box config leaves db_username empty. Rather than
+        // erroring, resolve a usable URL by defaulting the username to
+        // `postgres`, while staying on the relational host/port/DATABASE
+        // (localhost/5432/cognee_db) — NOT the old per-field defaults
+        // (port 1234 / `cognee_vectors`) that split the stores.
         let s = Settings {
             vector_db_provider: "pgvector".to_string(),
             db_username: String::new(),
+            ..Settings::default()
+        };
+        assert_eq!(
+            s.resolved_vector_postgres_url().expect("url builds"),
+            "postgres://postgres@localhost:5432/cognee_db"
+        );
+    }
+
+    #[cfg(feature = "pgvector")]
+    #[test]
+    fn vector_postgres_url_errs_when_relational_host_or_name_missing() {
+        // If even the relational host/name are blank there is nothing to fall
+        // back to, so surface an explicit error rather than a bogus URL.
+        let s = Settings {
+            vector_db_provider: "pgvector".to_string(),
+            db_host: String::new(),
             ..Settings::default()
         };
         assert!(s.resolved_vector_postgres_url().is_err());

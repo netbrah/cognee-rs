@@ -225,6 +225,9 @@ impl NaturalLanguageRetriever {
             .replace("{edge_schemas}", &edge_schema_text)
             .replace("{previous_attempts}", previous_attempts);
 
+        // NL→Cypher synthesis: the output must be a valid Cypher query, so floor
+        // the token cap — a low user-facing LLM_MAX_COMPLETION_TOKENS must not
+        // truncate it into unparseable Cypher (see `floored_internal_options`).
         let response = self
             .llm
             .generate(
@@ -232,7 +235,9 @@ impl NaturalLanguageRetriever {
                     Message::system(system_prompt),
                     Message::user(query.to_string()),
                 ],
-                self.generation_options.clone(),
+                crate::retrievers::base_retriever::floored_internal_options(
+                    &self.generation_options,
+                ),
             )
             .await?;
 

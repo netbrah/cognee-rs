@@ -78,9 +78,10 @@ fn classify_sqlite_url(url: &str) -> SqliteUrlKind {
 /// True when a SQLite URL points at an in-memory database, in either spelling
 /// (`sqlite::memory:` / `sqlite://:memory:` or `?mode=memory`).
 ///
-/// Shared with `cognee-lib`, which must skip filesystem preparation (parent
-/// directory creation) for such URLs; keeping one predicate here prevents the
-/// layers from diverging on what counts as in-memory.
+/// Shared with `cognee-components` (`builtins::database`), which must skip
+/// filesystem preparation (parent directory creation) for such URLs; keeping
+/// one predicate here prevents the layers from diverging on what counts as
+/// in-memory.
 pub fn sqlite_url_is_in_memory(url: &str) -> bool {
     url.starts_with("sqlite") && classify_sqlite_url(url).in_memory
 }
@@ -111,14 +112,19 @@ pub async fn connect(url: &str) -> Result<DatabaseConnection, DatabaseError> {
 /// Build the SQLite connection pool directly on sqlx so per-connection pragmas
 /// and per-pool reaping can be controlled precisely.
 ///
-/// - **File-backed, writable:** WAL + `synchronous=NORMAL` gives real
+/// - **File-backed, writable:** WAL + `synchronous=FULL` gives real
 ///   reader/writer concurrency (writers no longer block readers), which is
-///   what justifies a multi-connection pool for SQLite. `busy_timeout` makes
-///   the inevitable writer-vs-writer contention wait for the lock rather than
-///   failing immediately with `SQLITE_BUSY`. Note the durability trade: NORMAL
-///   under WAL can lose the last transactions on power loss (not on process
-///   crash), and converting a database to WAL leaves recent commits in the
-///   `-wal` sidecar until checkpoint.
+///   what justifies a multi-connection pool for SQLite, while `FULL` keeps
+///   every committed transaction durable across an OS crash or power loss —
+///   `NORMAL` under WAL trades that away, silently losing the last commits on
+///   power loss, which is the wrong default for a memory pipeline. If enabling
+///   WAL fails — typically a network/FUSE filesystem with no shared-memory
+///   support, where `PRAGMA journal_mode=WAL` cannot create the `-shm` sidecar
+///   — the connect retries once with the default rollback journal rather than
+///   failing outright, so those deployments still open (they served reads
+///   before this crate configured WAL). `busy_timeout` makes the inevitable
+///   writer-vs-writer contention wait for the lock rather than failing
+///   immediately with `SQLITE_BUSY`.
 /// - **Read-only (`mode=ro` / `immutable`, or a file that is not writable):**
 ///   the connection is opened read-only and no journal-mode pragma is issued.
 ///   `PRAGMA journal_mode=WAL` writes to the database file and would fail the
@@ -151,28 +157,54 @@ async fn connect_sqlite(url: &str) -> Result<DatabaseConnection, DatabaseError> 
     // which the Postgres path still goes through; raw sqlx defaults to DEBUG.
     // `busy_timeout` lets a writer wait for the lock (WAL still serializes
     // writers) instead of erroring out immediately with `SQLITE_BUSY`.
-    let mut conn_opts = SqliteConnectOptions::from_str(url)
+    let base_opts = SqliteConnectOptions::from_str(url)
         .map_err(|e| DatabaseError::ConnectionError(e.to_string()))?
         .log_statements(log::LevelFilter::Info)
         .busy_timeout(SQLITE_BUSY_TIMEOUT);
 
     // In-memory has no file to journal, and sqlx's default WAL is a no-op there.
+    let mut want_wal = false;
+    let mut conn_opts = base_opts.clone();
     if !kind.in_memory {
         // Probe the driver's own filename rather than the raw URL: sqlx
         // percent-decodes the path while parsing, so re-deriving it here would
         // test a path that does not exist (`my%20app.db`) and wrongly report a
-        // read-only file as writable.
-        let writable = sqlite_path_is_writable(conn_opts.get_filename());
-        if kind.read_only || !writable {
-            // A read-only URL, or a file we cannot write (read-only mount or
-            // permissions): open read-only so sqlx issues no journal-mode
-            // pragma. `PRAGMA journal_mode=WAL` writes to the file and would
-            // otherwise fail the connect, where before it served reads.
+        // read-only file as writable. The probe touches the filesystem
+        // (open/create/unlink), which can block on a slow or hung mount, so run
+        // it off the async runtime thread.
+        let probe_path = conn_opts.get_filename().to_path_buf();
+        let writable = tokio::task::spawn_blocking(move || sqlite_path_is_writable(&probe_path))
+            .await
+            .map_err(|e| DatabaseError::ConnectionError(e.to_string()))?;
+        if kind.read_only {
+            // The URL explicitly asked for a read-only open (`mode=ro` /
+            // `immutable`): honour it and issue no journal-mode pragma.
+            conn_opts = conn_opts.read_only(true);
+        } else if !writable {
+            // The URL wanted write access but the file/parent is not writable
+            // (read-only mount, permissions, or on Windows a transient
+            // share-lock from another process). Fall back to a read-only open
+            // so `PRAGMA journal_mode=WAL` does not fail the connect — but warn,
+            // because a genuinely write-intended database opened read-only will
+            // fail the first `add`/`cognify` with an opaque "attempt to write a
+            // readonly database" far from here.
+            tracing::warn!(
+                path = %conn_opts.get_filename().display(),
+                "SQLite database is not writable; opening read-only. Writes will fail. \
+                 Check file and parent-directory permissions (and, on Windows, other \
+                 processes holding the file) if this database is meant to be written."
+            );
             conn_opts = conn_opts.read_only(true);
         } else {
+            // synchronous=FULL keeps every committed transaction durable across
+            // an OS crash or power loss; WAL still gives reader/writer
+            // concurrency. `want_wal` records that WAL is best-effort: if the
+            // connect fails because the filesystem cannot back WAL (no
+            // shared-memory support, e.g. NFS/FUSE), we retry without it below.
+            want_wal = true;
             conn_opts = conn_opts
                 .journal_mode(SqliteJournalMode::Wal)
-                .synchronous(SqliteSynchronous::Normal);
+                .synchronous(SqliteSynchronous::Full);
         }
     }
 
@@ -194,10 +226,28 @@ async fn connect_sqlite(url: &str) -> Result<DatabaseConnection, DatabaseError> 
         }
     }
 
-    let sqlx_pool = pool_opts
-        .connect_with(conn_opts)
-        .await
-        .map_err(|e| DatabaseError::ConnectionError(e.to_string()))?;
+    let sqlx_pool = match pool_opts.clone().connect_with(conn_opts).await {
+        Ok(pool) => pool,
+        // WAL requires a shared-memory `-shm` file, which some filesystems
+        // (NFS and other network/FUSE mounts) cannot provide, so enabling it
+        // fails the connect. Rather than leave such a deployment unable to open
+        // its database — it opened fine before this crate configured WAL — retry
+        // once with the default rollback journal (still `synchronous=FULL`).
+        Err(e) if want_wal => {
+            tracing::warn!(
+                error = %e,
+                "Enabling SQLite WAL failed (likely a network/FUSE filesystem without \
+                 shared-memory support); retrying with the default rollback journal. \
+                 Reader/writer concurrency will be reduced for this database."
+            );
+            let fallback_opts = base_opts.synchronous(SqliteSynchronous::Full);
+            pool_opts
+                .connect_with(fallback_opts)
+                .await
+                .map_err(|e| DatabaseError::ConnectionError(e.to_string()))?
+        }
+        Err(e) => return Err(DatabaseError::ConnectionError(e.to_string())),
+    };
 
     Ok(SqlxSqliteConnector::from_sqlx_sqlite_pool(sqlx_pool))
 }
