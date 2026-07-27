@@ -386,32 +386,11 @@ impl AnthropicAdapter {
     }
 
     /// Append a corrective instruction to the last user turn so the next attempt
-    /// carries the failure reason, the way instructor reasks with the validation
-    /// error (mirrors `OpenAIAdapter::append_corrective_instruction`).
+    /// carries the failure reason. Thin wrapper over the shared
+    /// [`crate::schema::append_corrective_instruction`] naming the forced tool as
+    /// Anthropic addresses it (`tool_use`).
     fn append_corrective_instruction(body: &mut Value, reason: Option<&str>) {
-        let detail = match reason {
-            Some(r) => format!("Your previous response failed validation: {r}. "),
-            None => "Your previous response could not be parsed into the required structure. "
-                .to_string(),
-        };
-        let instruction = format!(
-            "{detail}Call the `{STRUCTURED_OUTPUT_TOOL}` tool again and return ONE complete \
-             object that fills in every required field, strictly matching the schema. No extra text."
-        );
-        let Some(messages) = body["messages"].as_array_mut() else {
-            return;
-        };
-        match messages.last_mut() {
-            // Extend the existing user turn in place.
-            Some(last) if last["role"] == "user" => {
-                let original = last["content"].as_str().unwrap_or("").to_string();
-                last["content"] = json!(format!("{original}\n\n{instruction}"));
-            }
-            // Last turn is assistant, or there is no turn: a bare append would be
-            // a no-op and the correction would be silently dropped, so add a new
-            // user turn carrying it.
-            _ => messages.push(json!({ "role": "user", "content": instruction })),
-        }
+        crate::schema::append_corrective_instruction(body, reason, STRUCTURED_OUTPUT_TOOL, "tool");
     }
 
     /// Shared structured-output loop with instructor-style corrective retries.
@@ -463,32 +442,23 @@ impl AnthropicAdapter {
                     // Re-ask instead of returning a partial object.
                     let truncated = response.stop_reason.as_deref() == Some("max_tokens");
                     match response.tool_input(STRUCTURED_OUTPUT_TOOL) {
-                        Some(input) if truncated => {
-                            // The tool input was cut off at max_tokens. Re-asking
-                            // with the SAME budget would truncate again at the same
-                            // point, so raise it toward the model's documented cap
-                            // for the next attempt — this lets a *semantically*
-                            // truncated object (required fields present but a
-                            // cut-off list/string) be completed rather than returned
-                            // half-filled.
+                        Some(_) if truncated => {
+                            // The tool input was cut off at max_tokens: present and
+                            // JSON-parseable, but incomplete. Match the Python
+                            // reference (instructor), which rejects a length-truncated
+                            // structured response outright — before validation —
+                            // rather than returning a partial object: a shallow
+                            // top-level check cannot tell a complete object that
+                            // finished at the budget from one whose nested
+                            // list/string was cut off. Re-asking with the SAME budget
+                            // would truncate again at the same point, so raise it
+                            // toward the model's documented cap for the next attempt.
+                            // If we are already at that cap a larger budget is
+                            // impossible, so fail terminally rather than re-ask until
+                            // MaxRetriesExceeded.
                             let model_cap = Self::model_max_output_tokens(&self.model);
                             let current = body["max_tokens"].as_u64().unwrap_or(0) as u32;
                             if current >= model_cap {
-                                // No headroom left to raise the budget: re-asking
-                                // cannot produce a longer answer, so this is the most
-                                // complete result obtainable. A stop at max_tokens can
-                                // still coincide with a complete, schema-valid object
-                                // that finished exactly at the cap, so return it as
-                                // best-effort rather than discarding a usable answer
-                                // as a hard failure. Only fail terminally when it is
-                                // actually unusable (fails the validator).
-                                let usable = match validator {
-                                    Some(v) => v(&input).is_ok(),
-                                    None => true,
-                                };
-                                if usable {
-                                    return Ok(input);
-                                }
                                 return Err(LlmError::InvalidResponse(format!(
                                     "Anthropic structured output was truncated at the model's \
                                      {model_cap}-token output cap and cannot be completed within \

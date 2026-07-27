@@ -5,7 +5,7 @@
 //! correctly structured output.
 
 use schemars::{JsonSchema, schema_for};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// Generate a JSON schema for a given type.
 ///
@@ -215,6 +215,53 @@ pub fn schema_required_validator(schema: &Value) -> impl Fn(&Value) -> Result<()
     }
 }
 
+/// Append a corrective instruction to a chat request's `messages` array so the
+/// next structured-output attempt carries the failure reason, the way instructor
+/// reasks with the validation error. When `reason` is `Some`, it is surfaced
+/// verbatim (e.g. a serde "missing field type" message) so the model knows
+/// precisely which required field or structural constraint the previous response
+/// violated.
+///
+/// Extends the last user turn in place when there is one; otherwise (the last
+/// turn is an assistant message, or there is no turn) it pushes a new user turn
+/// carrying the instruction, so the correction is never silently dropped.
+/// `tool_name` / `tool_kind` name the forced extractor as the provider addresses
+/// it — e.g. `"extract_structured_data"` + `"tool"` for Anthropic, or
+/// `+ "function"` for OpenAI. Shared by both adapters (previously a near-verbatim
+/// copy in each) so the corrective-retry prompt stays consistent across
+/// providers.
+pub fn append_corrective_instruction(
+    request: &mut Value,
+    reason: Option<&str>,
+    tool_name: &str,
+    tool_kind: &str,
+) {
+    let detail = match reason {
+        Some(r) => format!("Your previous response failed validation: {r}. "),
+        None => {
+            "Your previous response could not be parsed into the required structure. ".to_string()
+        }
+    };
+    let instruction = format!(
+        "{detail}Call the `{tool_name}` {tool_kind} again and return ONE complete object that \
+         fills in every required field, strictly matching the schema. No extra text."
+    );
+    let Some(messages) = request["messages"].as_array_mut() else {
+        return;
+    };
+    match messages.last_mut() {
+        // Extend the existing user turn in place.
+        Some(last) if last["role"] == "user" => {
+            let original = last["content"].as_str().unwrap_or("").to_string();
+            last["content"] = json!(format!("{original}\n\n{instruction}"));
+        }
+        // Last turn is assistant, or there is no turn: a bare append would be a
+        // no-op and the correction would be silently dropped, so add a new user
+        // turn carrying it.
+        _ => messages.push(json!({ "role": "user", "content": instruction })),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -224,7 +271,6 @@ mod tests {
     )]
     use super::*;
     use serde::{Deserialize, Serialize};
-    use serde_json::json;
 
     #[derive(Serialize, Deserialize, JsonSchema)]
     struct TestPerson {

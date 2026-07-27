@@ -117,9 +117,12 @@ async fn truncation_at_the_model_cap_fails_terminally_without_looping() {
     let server = MockServer::start_async().await;
 
     // Claude 3.5 Sonnet caps output at 8192, which is also the default ceiling
-    // that gets sent, so there is no headroom to raise. A truncation whose object
-    // is genuinely incomplete (missing the required `age`) must fail immediately
-    // rather than re-ask at the same budget until MaxRetriesExceeded.
+    // that gets sent, so there is no headroom to raise. A max_tokens stop here
+    // must fail immediately rather than re-ask at the same budget until
+    // MaxRetriesExceeded — and, matching the Python reference (instructor rejects
+    // any length-truncated structured response before validation), it fails even
+    // though the tool input parses as a complete object: the truncation flag, not
+    // shallow validity, decides.
     let truncated = server
         .mock_async(|when, then| {
             when.method(POST)
@@ -135,7 +138,7 @@ async fn truncation_at_the_model_cap_fails_terminally_without_looping() {
                         "model": "claude-3-5-sonnet-20241022",
                         "content": [
                             {"type": "tool_use", "name": "extract_structured_data",
-                             "input": {"name": "Ada"}}
+                             "input": {"name": "Ada", "age": 36}}
                         ],
                         "stop_reason": "max_tokens",
                         "usage": {"input_tokens": 10, "output_tokens": 8192}
@@ -167,62 +170,4 @@ async fn truncation_at_the_model_cap_fails_terminally_without_looping() {
         err.to_string().contains("output cap"),
         "unexpected error: {err}"
     );
-}
-
-#[tokio::test]
-async fn truncated_but_complete_object_at_cap_is_returned_not_discarded() {
-    // Regression (review finding #1): `stop_reason == "max_tokens"` can still
-    // carry a complete, schema-valid object when generation finished exactly at
-    // the budget. When there is no headroom left to raise the budget, re-asking
-    // cannot produce a longer answer, so the usable object must be returned as
-    // best-effort rather than discarded as a hard failure.
-    let server = MockServer::start_async().await;
-
-    // Claude 3.5 Sonnet caps at 8192 == the default ceiling: no headroom. The
-    // response is flagged truncated but the object is complete and valid.
-    let at_cap = server
-        .mock_async(|when, then| {
-            when.method(POST)
-                .path("/messages")
-                .body_includes("\"max_tokens\":8192");
-            then.status(200)
-                .header("content-type", "application/json")
-                .body(
-                    r#"{
-                        "id": "msg_trunc_complete",
-                        "type": "message",
-                        "role": "assistant",
-                        "model": "claude-3-5-sonnet-20241022",
-                        "content": [
-                            {"type": "tool_use", "name": "extract_structured_data",
-                             "input": {"name": "Ada Lovelace", "age": 36}}
-                        ],
-                        "stop_reason": "max_tokens",
-                        "usage": {"input_tokens": 10, "output_tokens": 8192}
-                    }"#,
-                );
-        })
-        .await;
-
-    let adapter = AnthropicAdapter::new(
-        "claude-3-5-sonnet-20241022",
-        "test-key",
-        Some(server.base_url()),
-    )
-    .expect("construct AnthropicAdapter")
-    .with_network_retries(0);
-
-    let person: Person = adapter
-        .create_structured_output::<Person>(
-            "Ada Lovelace was 36.",
-            "Extract the person's name and age.",
-            None,
-        )
-        .await
-        .expect("a complete object at the cap must be returned, not discarded");
-
-    assert_eq!(person.name, "Ada Lovelace");
-    assert_eq!(person.age, 36);
-    // Returned on the first response: no wasteful re-ask at the same budget.
-    at_cap.assert_calls_async(1).await;
 }

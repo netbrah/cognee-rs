@@ -566,39 +566,16 @@ impl OpenAIAdapter {
     }
 
     /// Append a corrective instruction so the next attempt carries the failure
-    /// reason, the way instructor reasks with the validation error. When `reason`
-    /// is `Some`, it is surfaced verbatim (e.g. a serde `missing field type`
-    /// message) so the model knows precisely which required field or structural
-    /// constraint the previous response violated.
-    ///
-    /// Extends the last user turn in place when there is one; otherwise (the last
-    /// turn is an assistant message, or there is no turn) it pushes a new user
-    /// turn carrying the instruction, so the correction is never silently
-    /// dropped. Mirrors `AnthropicAdapter::append_corrective_instruction`.
+    /// reason. Thin wrapper over the shared
+    /// [`crate::schema::append_corrective_instruction`] naming the forced tool as
+    /// OpenAI addresses it (a `function` call).
     fn append_corrective_instruction(request: &mut Value, reason: Option<&str>) {
-        let detail = match reason {
-            Some(r) => format!("Your previous response failed validation: {r}. "),
-            None => "Your previous response could not be parsed into the required structure. "
-                .to_string(),
-        };
-        let instruction = format!(
-            "{detail}Call the `extract_structured_data` function again and return ONE valid \
-             object that fills in every required field, strictly matching the schema. No extra text."
+        crate::schema::append_corrective_instruction(
+            request,
+            reason,
+            "extract_structured_data",
+            "function",
         );
-        let Some(messages) = request["messages"].as_array_mut() else {
-            return;
-        };
-        match messages.last_mut() {
-            // Extend the existing user turn in place.
-            Some(last) if last["role"] == "user" => {
-                let original = last["content"].as_str().unwrap_or("").to_string();
-                last["content"] = json!(format!("{original}\n\n{instruction}"));
-            }
-            // Last turn is assistant, or there is no turn: a bare append would be a
-            // no-op and the correction would be silently dropped, so add a new user
-            // turn carrying it.
-            _ => messages.push(json!({ "role": "user", "content": instruction })),
-        }
     }
 }
 
