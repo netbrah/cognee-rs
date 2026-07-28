@@ -201,7 +201,12 @@ pub fn extend_centroids_with_learning_vectors(
             continue;
         }
         let normalized_vector = normalize(vector);
-        if slots.len() < k {
+        // `slots.is_empty()` guards the `k == 0` case: without it, the nearest-slot
+        // branch below indexes `slots[0]` on an empty vec and panics. Python has the
+        // same latent bug (`max(range(0))` raises), but `build_truth_subspace` must be
+        // infallible, so we treat an empty slot set as room for a new slot. For any
+        // `k >= 1` this is a no-op (an empty `slots` already satisfies `slots.len() < k`).
+        if slots.is_empty() || slots.len() < k {
             slots.push(WorkingSlot {
                 centroid: normalized_vector,
                 count: 1,
@@ -627,5 +632,42 @@ mod tests {
         let parsed: TruthCentroidPayload =
             serde_json::from_str(no_ids).expect("deserialize without learning_ids");
         assert!(parsed.learning_ids.is_empty());
+    }
+
+    // 13 — Rust-specific: k == 0 must not panic (empty slots -> index out of
+    // bounds on the nearest-slot branch). build_truth_subspace is infallible.
+    #[test]
+    fn extend_with_k_zero_does_not_panic() {
+        let centroids = extend_centroids_with_learning_vectors(
+            "dataset-1",
+            &[],
+            &[
+                ("a".to_string(), vec![1.0, 0.0]),
+                ("b".to_string(), vec![0.0, 1.0]),
+            ],
+            1,
+            Some(123),
+            0,
+        );
+        // Contract for k == 0 is only "does not panic"; assert the run
+        // completed and every emitted learning id is unique.
+        let mut ids: Vec<String> = centroids
+            .iter()
+            .flat_map(|c| c.learning_ids.clone())
+            .collect();
+        let total = ids.len();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), total, "learning ids must not be duplicated");
+
+        // Also via the build_* wrapper with a single learning vector.
+        let built = build_centroids_from_learning_vectors(
+            "dataset-1",
+            &[("a".to_string(), vec![1.0])],
+            1,
+            Some(123),
+            0,
+        );
+        assert_eq!(built.iter().map(|c| c.count).sum::<usize>(), 1);
     }
 }
