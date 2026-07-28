@@ -13,7 +13,8 @@ use axum::{Json, Router, extract::State, http::StatusCode, response::IntoRespons
 use cognee_cognify::memify::sync_graph_session::DEFAULT_MAX_LINES;
 use cognee_cognify::{
     ChunkStrategy, CognifyConfig, DEFAULT_K, MemifyConfig, apply_feedback_weights_pipeline,
-    build_truth_subspace, persist_sessions_in_knowledge_graph, run_memify, sync_graph_to_session,
+    build_truth_subspace, distill_sessions_in_knowledge_graph, persist_sessions_in_knowledge_graph,
+    run_memify, sync_graph_to_session,
 };
 use cognee_database::{IngestDb, NoopPipelineRunRepository};
 use cognee_ingestion::AddPipeline;
@@ -322,6 +323,63 @@ async fn run_real_improve(
             _ => {
                 tracing::warn!(
                     "improve stage 2: session_store and llm are required; skipping persist_sessions"
+                );
+            }
+        }
+    }
+
+    // ---- Stage 2c: Distill Sessions into Learnings ----
+    //
+    // Mirrors the SDK `improve()`'s Stage 2c (`distill_sessions_in_knowledge_graph`).
+    // Each session's Q&A is curated into durable, entity-anchored lesson documents
+    // tagged with the `session_learnings` node-set and cognified into the graph.
+    // Gated on sessions being present, same as the SDK. Without this the HTTP
+    // improve() would build a different graph than an identical SDK call.
+    // Log-only; never aborts (matches the surrounding stage style).
+    if let Some(sids) = session_ids.as_ref() {
+        match (components.session_store.as_ref(), components.llm.as_ref()) {
+            (Some(store), Some(llm)) => {
+                let add_pipeline = AddPipeline::new(storage.clone(), database.clone())
+                    .with_thread_pool(thread_pool.clone())
+                    .with_graph_db(graph_db.clone())
+                    .with_vector_db(vector_db.clone())
+                    .with_database(database.clone())
+                    .with_pipeline_run_repo(NoopPipelineRunRepository::arc());
+
+                let mut cognify_config =
+                    CognifyConfig::default().with_chunk_strategy(ChunkStrategy::Paragraph);
+                if let Some(ref t) = components.transcriber {
+                    cognify_config = cognify_config.with_transcriber(Arc::clone(t));
+                }
+
+                let r = distill_sessions_in_knowledge_graph(
+                    sids,
+                    dataset_name,
+                    user.id,
+                    user.tenant_id,
+                    Arc::clone(store),
+                    &add_pipeline,
+                    Arc::clone(llm),
+                    storage.clone(),
+                    graph_db.clone(),
+                    vector_db.clone(),
+                    embedding_engine.clone(),
+                    database.clone(),
+                    NoopPipelineRunRepository::arc(),
+                    thread_pool.clone(),
+                    Arc::clone(&ontology_resolver),
+                    &cognify_config,
+                )
+                .await;
+                tracing::info!(
+                    sessions_distilled = r.sessions_distilled,
+                    lessons_published = r.lessons_published,
+                    "improve stage 2c (distill_sessions) complete"
+                );
+            }
+            _ => {
+                tracing::warn!(
+                    "improve stage 2c: session_store and llm are required; skipping distill_sessions"
                 );
             }
         }
