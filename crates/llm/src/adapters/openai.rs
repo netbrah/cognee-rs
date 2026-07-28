@@ -130,10 +130,52 @@ pub struct OpenAIAdapter {
 /// shape is correct. A deployment that needs the opposite can point the model at
 /// a loopback bind or use Ollama's port.
 fn compute_reasoning_model(model: &str, base_url: &str) -> bool {
+    if is_local_base_url(base_url) {
+        return false;
+    }
+    // Name-based detection on the request-body model, plus a fallback on the
+    // Azure deployment segment: Azure ignores the body model (the deployment in
+    // the URL routes the request), and the config docs tell operators the model
+    // is inert, so an o-series/gpt-5 deployment named after its model would
+    // otherwise go undetected and 400 on `max_tokens`+`temperature`.
+    is_reasoning_model_name(model)
+        || azure_deployment_name(base_url).is_some_and(|d| is_reasoning_model_name(&d))
+}
+
+/// Whether a model name belongs to an OpenAI reasoning family (`gpt-5*`, `o1*`,
+/// `o3*`, `o4*`), case-insensitively.
+fn is_reasoning_model_name(model: &str) -> bool {
     let m = model.to_lowercase();
-    let is_reasoning_name =
-        m.starts_with("gpt-5") || m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4");
-    is_reasoning_name && !is_local_base_url(base_url)
+    m.starts_with("gpt-5") || m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4")
+}
+
+/// Extract the Azure deployment name from a deployment-style base URL
+/// (`https://<resource>.openai.azure.com/openai/deployments/<deployment>`) — the
+/// path segment immediately following a `deployments` segment. Returns `None`
+/// for any URL without that shape, so it is a no-op for standard OpenAI /
+/// OpenAI-compatible endpoints.
+///
+/// Gated on the Azure host (`*.openai.azure.com`): only Azure encodes the model
+/// in a `deployments/<name>` segment, so a non-Azure gateway whose path happens
+/// to contain a `deployments` route segment (e.g.
+/// `https://gw.example.com/deployments/o3-router/v1`) is NOT misclassified as a
+/// reasoning model.
+fn azure_deployment_name(base_url: &str) -> Option<String> {
+    let url = reqwest::Url::parse(base_url).ok()?;
+    let host = url.host_str()?;
+    if !host.to_ascii_lowercase().ends_with(".openai.azure.com") {
+        return None;
+    }
+    let mut segments = url.path_segments()?;
+    while let Some(seg) = segments.next() {
+        if seg.eq_ignore_ascii_case("deployments") {
+            return segments
+                .next()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+        }
+    }
+    None
 }
 
 /// Heuristic for a local / non-OpenAI-compatible host that does not accept the
@@ -281,6 +323,24 @@ impl OpenAIAdapter {
         self
     }
 
+    /// Override reasoning-model auto-detection (see [`compute_reasoning_model`]).
+    /// `Some(true)` forces the reasoning parameter shape (`max_completion_tokens`,
+    /// suppressed `temperature`/`top_p`/penalties), `Some(false)` forces the
+    /// legacy shape (`max_tokens` + sampling params), and `None` leaves the
+    /// name/host auto-detection untouched.
+    ///
+    /// Wired from `LLM_REASONING` (`auto` | `always` | `never`) so an operator can
+    /// correct a misclassified endpoint — e.g. a remote OpenAI-compatible gateway
+    /// serving a reasoning-*named* model that nonetheless only accepts the legacy
+    /// parameters (`LLM_REASONING=never`), or a proxy that hides the reasoning
+    /// nature of its model behind an opaque alias (`LLM_REASONING=always`).
+    pub fn with_reasoning_override(mut self, force: Option<bool>) -> Self {
+        if let Some(force) = force {
+            self.reasoning_model = force;
+        }
+        self
+    }
+
     /// Resolve caller options for the plain-completion ([`generate`](Self::generate))
     /// path. When the caller passes no options at all, the config-derived
     /// [`default_max_tokens`](Self::default_max_tokens) becomes the output cap
@@ -306,20 +366,34 @@ impl OpenAIAdapter {
         if self.extra_args.is_empty() {
             return;
         }
-        // Reasoning models (`gpt-5*`/`o1*`/`o3*`/`o4*` on api.openai.com) reject
-        // `max_tokens` and require `max_completion_tokens`. The request body's
-        // output cap is written by `write_max_tokens` as `max_completion_tokens`,
-        // so a bare `max_tokens` coming from `LLM_ARGS` here would land alongside
-        // it and OpenAI rejects a request carrying *both* keys with a 400. Fold a
-        // `LLM_ARGS` `max_tokens` into `max_completion_tokens` (only filling the
-        // gap) so exactly one of the two keys is ever emitted.
+        // Reasoning models (`gpt-5*`/`o1*`/`o3*`/`o4*`, detected by name/host —
+        // NOT gated on api.openai.com, so this covers Azure o-series deployments
+        // and remote gateways too) constrain the request body two ways:
+        //   1. they require `max_completion_tokens` and reject `max_tokens`, and
+        //   2. they reject `temperature`/`top_p`/`frequency_penalty`/
+        //      `presence_penalty`.
+        // The request builder already honours both (writes `max_completion_tokens`
+        // via `write_max_tokens` and omits the sampling params for reasoning
+        // models), so an `LLM_ARGS` value must not re-introduce a rejected key
+        // here: fold a bare `max_tokens` into `max_completion_tokens`, drop the
+        // suppressed sampling params, and only fill gaps for everything else
+        // (matching Python's `{**self.llm_args, **kwargs}`).
         let reasoning = self.is_reasoning_model();
         if let Some(obj) = body.as_object_mut() {
             for (key, value) in &self.extra_args {
-                if reasoning && key == "max_tokens" {
-                    obj.entry("max_completion_tokens")
-                        .or_insert_with(|| value.clone());
-                    continue;
+                if reasoning {
+                    if key == "max_tokens" {
+                        obj.entry("max_completion_tokens")
+                            .or_insert_with(|| value.clone());
+                        continue;
+                    }
+                    if matches!(
+                        key.as_str(),
+                        "temperature" | "top_p" | "frequency_penalty" | "presence_penalty"
+                    ) {
+                        // Suppressed for reasoning models; re-adding 400s the call.
+                        continue;
+                    }
                 }
                 obj.entry(key.clone()).or_insert_with(|| value.clone());
             }
@@ -375,25 +449,62 @@ impl OpenAIAdapter {
 
     /// Build a request URL for `path`, appending `api-version=<v>` in Azure mode.
     ///
-    /// The api-version is added through `Url::query_pairs_mut`, so the query
+    /// `path` is appended to the base URL's **path segments**, not by raw string
+    /// concatenation. This matters when `base_url` already carries a query — e.g.
+    /// an Azure portal endpoint copied with a trailing `?api-version=...`: a naive
+    /// `{base_url}/{path}` would splice `chat/completions` into the *query* value
+    /// (`?api-version=…/chat/completions`), leaving the request path without
+    /// `/chat/completions` so every request 404s. Building on the parsed path
+    /// keeps the existing query and the route segment separate.
+    ///
+    /// The api-version is then added through `Url::query_pairs_mut`, so the query
     /// separator is chosen correctly even if `base_url` already carries a query
     /// (no malformed double-`?`) and the value is percent-encoded rather than
-    /// interpolated raw. If `base_url` does not parse as a URL we fall back to a
-    /// manual append that still picks `?` vs `&` from the existing query, so the
-    /// api-version is never silently dropped (Azure 400s without it).
+    /// interpolated raw. Any `api-version` already present on `base_url` (e.g. a
+    /// copied Azure portal "Target URI") is dropped first so the request never
+    /// carries duplicate/conflicting `api-version` params — the configured
+    /// `LLM_API_VERSION` wins, and other query params are preserved. If `base_url`
+    /// does not parse as a URL we fall back to a manual append that still picks
+    /// `?` vs `&` from the existing query, so the api-version is never silently
+    /// dropped (Azure 400s without it).
     fn endpoint_url(&self, path: &str) -> String {
+        if let Ok(mut url) = reqwest::Url::parse(&self.base_url) {
+            if let Ok(mut segments) = url.path_segments_mut() {
+                // Drop a trailing empty segment (a base_url ending in `/`) before
+                // extending so we never emit `//`. The constructor trims one
+                // trailing slash, but a bare-host base_url (`https://x.com`) still
+                // parses with a single empty segment.
+                segments
+                    .pop_if_empty()
+                    .extend(path.split('/').filter(|s| !s.is_empty()));
+            }
+            // A cannot-be-a-base URL (e.g. `mailto:`) has no path segments; that
+            // never happens for the http(s) endpoints we accept, so leave it.
+            if let Some(v) = &self.api_version {
+                // Preserve every existing query pair EXCEPT a stray `api-version`,
+                // then append the configured one, so a base_url that already
+                // carries `api-version=...` yields exactly one (the configured
+                // value wins) rather than a duplicate Azure may reject.
+                let preserved: Vec<(String, String)> = url
+                    .query_pairs()
+                    .filter(|(k, _)| k != "api-version")
+                    .map(|(k, val)| (k.into_owned(), val.into_owned()))
+                    .collect();
+                url.query_pairs_mut()
+                    .clear()
+                    .extend_pairs(preserved)
+                    .append_pair("api-version", v);
+            }
+            return url.into();
+        }
+        // base_url did not parse as a URL: fall back to a raw append that still
+        // chooses `?` vs `&` so the api-version is never silently dropped.
         let base = format!("{}/{path}", self.base_url);
         match &self.api_version {
-            Some(v) => match reqwest::Url::parse(&base) {
-                Ok(mut url) => {
-                    url.query_pairs_mut().append_pair("api-version", v);
-                    url.into()
-                }
-                Err(_) => {
-                    let sep = if base.contains('?') { '&' } else { '?' };
-                    format!("{base}{sep}api-version={v}")
-                }
-            },
+            Some(v) => {
+                let sep = if base.contains('?') { '&' } else { '?' };
+                format!("{base}{sep}api-version={v}")
+            }
             None => base,
         }
     }
@@ -1739,6 +1850,43 @@ mod tests {
             url.contains("api-version=2024-12-01-preview"),
             "api-version appended: {url}"
         );
+        // The route must stay in the PATH, not slide into the query value: a
+        // raw `{base}?foo=bar` + `/chat/completions` concat would leave the path
+        // at `.../gpt-4o-mini` and 404 every request.
+        let parsed = reqwest::Url::parse(&url).expect("endpoint_url produced a valid URL");
+        assert!(
+            parsed
+                .path()
+                .ends_with("/openai/deployments/gpt-4o-mini/chat/completions"),
+            "route stays in the path when base_url carries a query: {}",
+            parsed.path()
+        );
+
+        // A base_url that already carries `api-version=...` (e.g. a copied Azure
+        // portal Target URI) must NOT yield a duplicate: the configured version
+        // wins and appears exactly once.
+        let dup = OpenAIAdapter::new(
+            "gpt-4o-mini",
+            "sk-test",
+            Some(
+                "https://res.openai.azure.com/openai/deployments/gpt-4o-mini?api-version=2023-05-15"
+                    .to_string(),
+            ),
+        )
+        .unwrap()
+        .with_api_version("2024-12-01-preview");
+        let url = dup.endpoint_url("chat/completions");
+        let parsed = reqwest::Url::parse(&url).expect("valid URL");
+        let versions: Vec<_> = parsed
+            .query_pairs()
+            .filter(|(k, _)| k == "api-version")
+            .map(|(_, v)| v.into_owned())
+            .collect();
+        assert_eq!(
+            versions,
+            vec!["2024-12-01-preview".to_string()],
+            "exactly one api-version, configured value wins: {url}"
+        );
 
         // A value with a reserved character is percent-encoded, not interpolated raw.
         let odd = OpenAIAdapter::new(
@@ -1889,6 +2037,78 @@ mod tests {
     }
 
     #[test]
+    fn is_reasoning_model_detected_from_azure_deployment_segment() {
+        // Azure ignores the request-body model for routing (the deployment is in
+        // the URL) and the docs tell operators the value is inert, so a reasoning
+        // deployment is reachable with a non-reasoning LLM_MODEL. The deployment
+        // segment must still trigger detection, else Azure 400s on max_tokens +
+        // temperature for every call.
+        let by_deployment = OpenAIAdapter::new(
+            "gpt-4o-mini", // a non-reasoning placeholder, as .env.example ships
+            "sk-test",
+            Some("https://my-resource.openai.azure.com/openai/deployments/o3-prod".to_string()),
+        )
+        .unwrap()
+        .with_api_version("2024-12-01-preview");
+        assert!(by_deployment.is_reasoning_model());
+
+        // A non-reasoning deployment name with a non-reasoning model stays legacy.
+        let non_reasoning = OpenAIAdapter::new(
+            "gpt-4o-mini",
+            "sk-test",
+            Some("https://my-resource.openai.azure.com/openai/deployments/chat-prod".to_string()),
+        )
+        .unwrap()
+        .with_api_version("2024-12-01-preview");
+        assert!(!non_reasoning.is_reasoning_model());
+
+        // The deployment fallback is gated on the Azure host: a NON-Azure gateway
+        // whose path merely contains a `deployments/<reasoning-name>` route
+        // segment must NOT be misclassified (it may only accept legacy params).
+        let non_azure_deployments_path = OpenAIAdapter::new(
+            "my-alias", // non-reasoning model name
+            "sk-test",
+            Some("https://gw.example.com/deployments/o3-router/v1".to_string()),
+        )
+        .unwrap();
+        assert!(!non_azure_deployments_path.is_reasoning_model());
+    }
+
+    #[test]
+    fn with_reasoning_override_forces_detection_either_way() {
+        // `never` un-fires a name/host match (remote gateway serving a
+        // reasoning-named model that only accepts legacy parameters).
+        let forced_off = OpenAIAdapter::new(
+            "gpt-5",
+            "sk-test",
+            Some("https://gateway.example.com/v1".to_string()),
+        )
+        .unwrap()
+        .with_reasoning_override(Some(false));
+        assert!(!forced_off.is_reasoning_model());
+
+        // `always` fires even for an opaque non-reasoning-looking alias.
+        let forced_on = OpenAIAdapter::new(
+            "my-alias",
+            "sk-test",
+            Some("https://gateway.example.com/v1".to_string()),
+        )
+        .unwrap()
+        .with_reasoning_override(Some(true));
+        assert!(forced_on.is_reasoning_model());
+
+        // `None` (auto) leaves auto-detection untouched.
+        let auto = OpenAIAdapter::new(
+            "gpt-5",
+            "sk-test",
+            Some("https://gateway.example.com/v1".to_string()),
+        )
+        .unwrap()
+        .with_reasoning_override(None);
+        assert!(auto.is_reasoning_model());
+    }
+
+    #[test]
     fn test_write_max_tokens_renames_key_for_reasoning_models() {
         let mut body = json!({"model": "gpt-5-mini"});
         let reasoning = OpenAIAdapter::new("gpt-5-mini", "test-key", None).unwrap();
@@ -1907,6 +2127,30 @@ mod tests {
         reasoning.write_max_tokens(&mut body, None);
         assert!(body.get("max_tokens").is_none());
         assert!(body.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn default_max_tokens_governs_option_less_generate_in_azure_mode() {
+        // The behaviour the Azure factory relies on (`.with_default_max_tokens`):
+        // an option-less generate() must send the configured ceiling, not the
+        // hardcoded 16384. Regression guard for the Azure factory previously
+        // omitting the setter, which made Azure ignore LLM_MAX_COMPLETION_TOKENS.
+        let azure = OpenAIAdapter::new(
+            "gpt-4o-mini",
+            "sk-test",
+            Some("https://res.openai.azure.com/openai/deployments/gpt-4o-mini".to_string()),
+        )
+        .unwrap()
+        .with_api_version("2024-12-01-preview")
+        .with_default_max_tokens(Some(4096));
+        assert_eq!(azure.resolve_options(None).max_tokens, Some(4096));
+
+        // Explicit caller options still win over the configured default.
+        let explicit = GenerationOptions {
+            max_tokens: Some(256),
+            ..GenerationOptions::default()
+        };
+        assert_eq!(azure.resolve_options(Some(explicit)).max_tokens, Some(256));
     }
 
     #[test]
@@ -1974,6 +2218,54 @@ mod tests {
         classic.apply_extra_args(&mut body);
         assert_eq!(body["max_tokens"], 16384);
         assert!(body.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn test_apply_extra_args_drops_suppressed_sampling_params_for_reasoning() {
+        // Reasoning models reject temperature/top_p/frequency_penalty/
+        // presence_penalty, and the request builder omits them. An LLM_ARGS value
+        // for any of these must NOT be re-added by apply_extra_args, else the call
+        // 400s ("Unsupported value: temperature").
+        let args = json!({
+            "temperature": 0.3,
+            "top_p": 0.9,
+            "frequency_penalty": 0.1,
+            "presence_penalty": 0.2,
+            "logit_bias": {"50256": -100}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let reasoning = OpenAIAdapter::new("gpt-5-mini", "test-key", None)
+            .unwrap()
+            .with_extra_args(args.clone());
+        let mut body = json!({"model": "gpt-5-mini"});
+        reasoning.apply_extra_args(&mut body);
+        for suppressed in [
+            "temperature",
+            "top_p",
+            "frequency_penalty",
+            "presence_penalty",
+        ] {
+            assert!(
+                body.get(suppressed).is_none(),
+                "reasoning model must not carry {suppressed}"
+            );
+        }
+        // Non-sampling extra args (e.g. logit_bias) are still applied.
+        assert_eq!(body["logit_bias"]["50256"], -100);
+
+        // A classic model keeps all of them (they are valid there).
+        let classic = OpenAIAdapter::new("gpt-4o-mini", "test-key", None)
+            .unwrap()
+            .with_extra_args(args);
+        let mut body = json!({"model": "gpt-4o-mini"});
+        classic.apply_extra_args(&mut body);
+        assert_eq!(body["temperature"], 0.3);
+        assert_eq!(body["top_p"], 0.9);
+        assert_eq!(body["frequency_penalty"], 0.1);
+        assert_eq!(body["presence_penalty"], 0.2);
     }
 
     #[test]

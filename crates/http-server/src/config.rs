@@ -202,6 +202,10 @@ pub struct HttpServerConfig {
     /// Env: `LLM_API_VERSION`.
     pub llm_api_version: String,
 
+    /// Reasoning-model detection override: `auto` (default), `always`, `never`.
+    /// Env: `LLM_REASONING`.
+    pub llm_reasoning: String,
+
     /// LLM retry count for both structured-output and network retries.
     /// Env: `LLM_MAX_RETRIES`.
     pub llm_max_retries: u32,
@@ -356,6 +360,7 @@ impl Default for HttpServerConfig {
             llm_api_key: SecretString::new(String::new().into()),
             llm_endpoint: String::new(),
             llm_api_version: String::new(),
+            llm_reasoning: "auto".to_string(),
             llm_max_retries: 3,
             llm_max_completion_tokens: cognee_llm::OpenAIAdapter::DEFAULT_MAX_COMPLETION_TOKENS,
             session_store_backend: "seaorm".to_string(),
@@ -547,6 +552,9 @@ impl HttpServerConfig {
         if let Ok(v) = std::env::var("LLM_API_VERSION") {
             cfg.llm_api_version = v;
         }
+        if let Ok(v) = std::env::var("LLM_REASONING") {
+            cfg.llm_reasoning = v;
+        }
         if let Ok(v) = std::env::var("LLM_MAX_RETRIES") {
             cfg.llm_max_retries = v
                 .parse::<u32>()
@@ -697,6 +705,9 @@ impl HttpServerConfig {
                 // `cognee::Settings`.
                 llm_args: serde_json::Map::new(),
                 api_version: self.llm_api_version.clone(),
+                reasoning_override: cognee_components::parse_reasoning_override(
+                    &self.llm_reasoning,
+                ),
                 mock: false,
                 cassette: String::new(),
                 record_path: String::new(),

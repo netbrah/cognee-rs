@@ -412,6 +412,7 @@ mod tests {
                 max_completion_tokens: cognee_llm::OpenAIAdapter::DEFAULT_MAX_COMPLETION_TOKENS,
                 llm_args: serde_json::Map::new(),
                 api_version: String::new(),
+                reasoning_override: None,
                 mock: false,
                 cassette: String::new(),
                 record_path: String::new(),

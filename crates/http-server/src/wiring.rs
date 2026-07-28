@@ -296,9 +296,17 @@ fn wire_responses_client(cfg: &HttpServerConfig) -> Option<Arc<dyn ResponsesClie
         provider.as_str(),
         "openai" | "" | "custom" | "openai_compatible"
     ) {
-        tracing::info!(
-            "responses client not wired for provider '{provider}' \
-             (its gateway does not serve the OpenAI /responses route)"
+        // Reaching here means the operator *explicitly* enabled the responses
+        // client (the disabled case returned above), so warn rather than info:
+        // POST /api/v1/responses will 500 ("responses client is not wired") until
+        // they either drop the flag or switch to `custom`/`openai_compatible`
+        // (which keeps Bearer auth + a custom endpoint, so an OpenAI-style
+        // gateway fronting this provider still works).
+        tracing::warn!(
+            "responses client enabled but not wired for provider '{provider}': \
+             it is not on the OpenAI /responses allowlist \
+             (openai / custom / openai_compatible). POST /api/v1/responses will be \
+             unavailable; set LLM_PROVIDER=custom if your gateway serves /responses."
         );
         return None;
     }
