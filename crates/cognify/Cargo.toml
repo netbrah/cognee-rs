@@ -34,6 +34,7 @@ cognee-vector = { path = "../vector", version = "0.1.3" }
 cognee-ontology = { path = "../ontology", version = "0.1.3" }
 cognee-database = { path = "../database", version = "0.1.3" }
 cognee-session = { path = "../session", version = "0.1.3" }
+cognee-truth-subspace = { path = "../truth-subspace", version = "0.1.3" }
 
 chrono.workspace = true
 uuid = { workspace = true, features = ["v4"] }

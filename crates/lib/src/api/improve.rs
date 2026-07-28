@@ -106,6 +106,13 @@ pub struct ImproveParams<'a> {
     /// Default `false` (opt-in) — matches Python parity.
     pub build_global_context_index: bool,
 
+    /// When `true` and sessions are present, build/refresh the truth-subspace
+    /// centroid slots and per-chunk alignment (Stage 2d, Phase-2 join point).
+    ///
+    /// Mirrors Python's `build_truth_subspace` parameter. Default `false`
+    /// (opt-in) — the entire truth-subspace path is inert unless this is set.
+    pub build_truth_subspace: bool,
+
     /// When `true`, treat this as a background run: skips stages that
     /// require the prior stage to have completed synchronously (e.g. the
     /// global context index and the sync-graph stage).
@@ -169,6 +176,7 @@ pub async fn improve(params: ImproveParams<'_>) -> Result<ImproveResult, ApiErro
         checkpoint_store,
         cognify_config,
         build_global_context_index,
+        build_truth_subspace,
         run_in_background,
         // E-05 v2 power-user fields — currently informational; the orchestrator
         // does not yet branch on them. Accepting them here keeps the struct
@@ -573,6 +581,56 @@ pub async fn improve(params: ImproveParams<'_>) -> Result<ImproveResult, ApiErro
                     "improve stage 2c: session_store, add_pipeline, and DatabaseConnection are required; skipping distill_sessions"
                 );
             }
+        }
+    }
+
+    // ---- Stage 2d: Build Truth Subspace (opt-in) ----
+    //
+    // Phase-2 join point. Mirrors Python's `build_truth_subspace` stage
+    // (improve.py:207-221). Gated on `has_sessions && build_truth_subspace`, so
+    // it is fully inert (zero graph/vector I/O) unless the caller opts in. Never
+    // aborts improve() — `build_truth_subspace` is infallible and internal
+    // failures merely warn.
+    if has_sessions && build_truth_subspace {
+        #[allow(clippy::expect_used, reason = "invariant is upheld by construction")]
+        let sids = session_ids
+            .as_ref()
+            .expect("has_sessions guarantees session_ids is Some with non-empty vec");
+        if let Some(database) = db.as_ref() {
+            // Resolve the dataset the same way Stage 4 does.
+            match cognee_database::ops::datasets::get_dataset_by_name(
+                database.as_ref(),
+                &dataset_name,
+                owner_id,
+                tenant_id,
+            )
+            .await
+            {
+                Ok(Some(ds)) => {
+                    let ts = cognee_cognify::build_truth_subspace(
+                        ds.id,
+                        sids,
+                        Arc::clone(&graph_db),
+                        Arc::clone(&vector_db),
+                        Arc::clone(&embedding_engine),
+                        cognee_cognify::DEFAULT_K,
+                    )
+                    .await;
+                    info!(
+                        anchors = ts.anchors,
+                        nodes_scored = ts.nodes_scored,
+                        truth_epoch = ts.truth_epoch,
+                        "improve stage 2d (build_truth_subspace) complete"
+                    );
+                    result.stages_run.push("build_truth_subspace".to_string());
+                }
+                Ok(None) => warn!("improve stage 2d: dataset not found; skipping"),
+                Err(e) => {
+                    warn!("improve stage 2d: dataset lookup failed (non-fatal): {e}")
+                }
+            }
+        } else {
+            warn!("improve stage 2d: DatabaseConnection required; skipping build_truth_subspace");
         }
     }
 

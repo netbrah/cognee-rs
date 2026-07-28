@@ -118,6 +118,7 @@ async fn improve_without_sessions_runs_only_memify() {
         enrichment_tasks: None,
         data: None,
         build_global_context_index: false,
+        build_truth_subspace: false,
         run_in_background: false,
     })
     .await
@@ -162,6 +163,7 @@ async fn improve_skips_stage1_when_session_backends_missing() {
         enrichment_tasks: None,
         data: None,
         build_global_context_index: false,
+        build_truth_subspace: false,
         run_in_background: false,
     })
     .await
@@ -210,6 +212,7 @@ async fn improve_omits_distill_sessions_when_no_qa() {
         enrichment_tasks: None,
         data: None,
         build_global_context_index: false,
+        build_truth_subspace: false,
         run_in_background: false,
     })
     .await

@@ -16,6 +16,13 @@ pub const DEFAULT_K: usize = 8;
 /// destructure it for `vector_engine` calls.
 pub const TRUTH_CENTROID_COLLECTION: (&str, &str) = ("TruthCentroid", "vector");
 
-// NOTE: `TRUTH_NODE_SET` and `truth_session_node_set` (`constants.py:2,6-7`)
-// belong to the graph nodeset-query path used by `build.py` and are deferred
-// to P2-03 — out of scope for this task.
+/// Default node-set names holding a dataset's accepted session learnings when
+/// no explicit session ids are supplied (`constants.py:2`). Used by
+/// `build_truth_subspace` to fetch learning statements from the graph.
+pub const TRUTH_NODE_SET: &[&str] = &["session_learnings"];
+
+/// Per-session node-set name for a session's learnings (`constants.py:6-7`):
+/// `session_learnings:{session_id}`.
+pub fn truth_session_node_set(session_id: &str) -> String {
+    format!("session_learnings:{session_id}")
+}

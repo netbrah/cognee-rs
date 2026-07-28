@@ -16,6 +16,7 @@
 //! ).await?;
 //! ```
 
+pub mod build_truth_subspace;
 pub mod config;
 pub mod distill_sessions;
 pub mod error;
@@ -26,6 +27,7 @@ pub mod persist_sessions;
 pub mod pipeline;
 pub mod sync_graph_session;
 
+pub use build_truth_subspace::{NODE_EMBED_BATCH_SIZE, TruthSubspaceResult, build_truth_subspace};
 pub use config::{MemifyConfig, MemifyTask};
 pub use distill_sessions::{
     CuratorBatchOutput, DistillError, DistillSessionsResult, DistillationResult,

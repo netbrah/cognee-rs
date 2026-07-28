@@ -22,5 +22,5 @@ pub use centroids::{
     build_centroids_from_learning_vectors, centroid_id, centroids_changed,
     extend_centroids_with_learning_vectors, learning_id, load_centroids, upsert_centroids,
 };
-pub use constants::{DEFAULT_K, TRUTH_CENTROID_COLLECTION};
+pub use constants::{DEFAULT_K, TRUTH_CENTROID_COLLECTION, TRUTH_NODE_SET, truth_session_node_set};
 pub use models::TruthCentroidPayload;

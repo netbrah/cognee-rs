@@ -110,6 +110,7 @@ pub fn run(args: ImproveArgs, cm: Arc<ComponentManager>) -> Result<(), CliError>
             enrichment_tasks: None,
             data: None,
             build_global_context_index: false,
+            build_truth_subspace: false,
             run_in_background: false,
             llm,
             storage,

@@ -12,8 +12,8 @@
 use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::post};
 use cognee_cognify::memify::sync_graph_session::DEFAULT_MAX_LINES;
 use cognee_cognify::{
-    ChunkStrategy, CognifyConfig, MemifyConfig, apply_feedback_weights_pipeline,
-    persist_sessions_in_knowledge_graph, run_memify, sync_graph_to_session,
+    ChunkStrategy, CognifyConfig, DEFAULT_K, MemifyConfig, apply_feedback_weights_pipeline,
+    build_truth_subspace, persist_sessions_in_knowledge_graph, run_memify, sync_graph_to_session,
 };
 use cognee_database::{IngestDb, NoopPipelineRunRepository};
 use cognee_ingestion::AddPipeline;
@@ -325,6 +325,34 @@ async fn run_real_improve(
                 );
             }
         }
+    }
+
+    // ---- Stage 2d: Build Truth Subspace (opt-in) ----
+    //
+    // Phase-2 join point, mirroring `improve()`'s Stage 2d. Gated on
+    // `has_sessions && buildTruthSubspace`; fully inert (zero I/O) when off. The
+    // `dataset_id` is already resolved in scope, so — unlike the SDK path — no
+    // `get_dataset_by_name` lookup is needed. Log-only; never aborts (the call
+    // is infallible). `vector_db`/`embedding_engine` are moved into Stage 3
+    // below, so clone them here.
+    if payload.build_truth_subspace.unwrap_or(false)
+        && let Some(sids) = session_ids.as_ref()
+    {
+        let ts = build_truth_subspace(
+            dataset_id,
+            sids,
+            graph_db.clone(),
+            vector_db.clone(),
+            embedding_engine.clone(),
+            DEFAULT_K,
+        )
+        .await;
+        tracing::info!(
+            anchors = ts.anchors,
+            nodes_scored = ts.nodes_scored,
+            truth_epoch = ts.truth_epoch,
+            "improve stage 2d (build_truth_subspace) complete"
+        );
     }
 
     // ---- Stage 3: Default Enrichment (always) ----
