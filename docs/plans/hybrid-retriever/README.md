@@ -119,7 +119,7 @@ what can run in parallel.
 | P2-02 | 2 | Truth-subspace: centroid slot logic | [./phase-2/P2-02.md](./phase-2/P2-02.md) | completed |
 | P2-03 | 2 | Truth-subspace: vector persistence | [./phase-2/P2-03.md](./phase-2/P2-03.md) | completed |
 | P2-04 | 2 | Truth-subspace: graph truth-state methods | [./phase-2/P2-04.md](./phase-2/P2-04.md) | completed |
-| P2-05 | 2 | Session-learnings distillation gate | [./phase-2/P2-05.md](./phase-2/P2-05.md) | pending |
+| P2-05 | 2 | Session-learnings distillation gate | [./phase-2/P2-05.md](./phase-2/P2-05.md) | completed |
 | P2-06 | 2 | build_truth_subspace orchestration | [./phase-2/P2-06.md](./phase-2/P2-06.md) | pending |
 | P2-07 | 2 | Hybrid retriever truth-weight glue | [./phase-2/P2-07.md](./phase-2/P2-07.md) | pending |
 

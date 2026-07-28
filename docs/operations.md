@@ -46,6 +46,9 @@ returned to the caller (printed to stdout by the CLI).
 
 Enriches memory and bridges sessions: runs the feedback/enrichment improvement
 stages over the graph (memify-style triplet enrichment plus feedback weighting).
+When session IDs are supplied it also distills each session's Q&A into curated,
+entity-anchored "session-learnings" lesson documents (tagged with the
+`session_learnings` node-set) and cognifies them into the permanent graph.
 Can target specific sessions or graph nodes and tune the feedback weight.
 rustdoc: `api::improve`.
 

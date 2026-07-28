@@ -17,6 +17,7 @@
 //! ```
 
 pub mod config;
+pub mod distill_sessions;
 pub mod error;
 pub mod extract_triplets;
 pub mod feedback_weights;
@@ -26,6 +27,11 @@ pub mod pipeline;
 pub mod sync_graph_session;
 
 pub use config::{MemifyConfig, MemifyTask};
+pub use distill_sessions::{
+    CuratorBatchOutput, DistillError, DistillSessionsResult, DistillationResult,
+    DistillationStatus, ProposedLesson, RejectionReason, WrittenLesson, distill_session,
+    distill_sessions_in_knowledge_graph, render_lesson_document,
+};
 pub use error::MemifyError;
 pub use feedback_weights::{
     FEEDBACK_WEIGHTS_APPLIED_KEY, FeedbackApplyResult, FeedbackError,

@@ -173,3 +173,56 @@ async fn improve_skips_stage1_when_session_backends_missing() {
         "with sessions, persist_trace_steps is always recorded even when backends are missing"
     );
 }
+
+/// Stage 2c is default-off in the "no lesson" sense: a session with no Q&A
+/// gates at `NoQaEntries`, so `distill_sessions` is NOT pushed onto
+/// `stages_run` (Python parity: pushed only when a lesson is published). This
+/// proves the zero-change guarantee — providing a session that yields nothing
+/// does not add the stage.
+#[tokio::test]
+async fn improve_omits_distill_sessions_when_no_qa() {
+    let h = make_harness().await;
+    let owner = Uuid::new_v4();
+    let llm: Arc<dyn cognee_llm::Llm> = Arc::new(MockLlm::empty());
+    let config = CognifyConfig::default();
+
+    // Session id with no Q&A entries → persist skips, distill gates NoQaEntries.
+    let r = improve(ImproveParams {
+        dataset_name: "ds_noqa".to_string(),
+        session_ids: Some(vec!["empty_session".to_string()]),
+        node_name: None,
+        owner_id: owner,
+        tenant_id: None,
+        feedback_alpha: 0.1,
+        llm,
+        storage: Arc::clone(&h.storage),
+        graph_db: h.graph_db.clone() as Arc<_>,
+        vector_db: h.vector_db.clone() as Arc<_>,
+        embedding_engine: h.embedding_engine.clone() as Arc<_>,
+        ontology_resolver: Arc::clone(&h.ontology),
+        db: Some(Arc::clone(&h.db)),
+        session_store: Some(Arc::clone(&h.session_store)),
+        session_manager: Some(Arc::clone(&h.session_manager)),
+        add_pipeline: Some(&h.add_pipeline),
+        checkpoint_store: Some(h.checkpoint_store.clone() as Arc<_>),
+        cognify_config: &config,
+        extraction_tasks: None,
+        enrichment_tasks: None,
+        data: None,
+        build_global_context_index: false,
+        run_in_background: false,
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        !r.stages_run.contains(&"distill_sessions".to_string()),
+        "distill_sessions must be absent when the session has no Q&A; got {:?}",
+        r.stages_run
+    );
+    assert_eq!(r.sessions_distilled, 0);
+    assert_eq!(r.lessons_published, 0);
+    // The always-run stages are still present (proving the pipeline itself ran).
+    assert!(r.stages_run.contains(&"persist_trace_steps".to_string()));
+    assert!(r.stages_run.contains(&"memify".to_string()));
+}

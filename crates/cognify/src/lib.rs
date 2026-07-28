@@ -39,10 +39,13 @@ pub use graph_integration::{
     expand_with_nodes_and_edges,
 };
 pub use memify::{
-    FeedbackApplyResult, FeedbackError, MemifyConfig, MemifyError, MemifyResult, MemifyTask,
-    PersistSessionsError, PersistSessionsResult, SyncError, SyncResult,
-    apply_feedback_weights_pipeline, build_memify_index_only_pipeline, memify as run_memify,
-    persist_sessions_in_knowledge_graph, sync_graph_to_session,
+    CuratorBatchOutput, DistillError, DistillSessionsResult, DistillationResult,
+    DistillationStatus, FeedbackApplyResult, FeedbackError, MemifyConfig, MemifyError,
+    MemifyResult, MemifyTask, PersistSessionsError, PersistSessionsResult, ProposedLesson,
+    RejectionReason, SyncError, SyncResult, WrittenLesson, apply_feedback_weights_pipeline,
+    build_memify_index_only_pipeline, distill_session, distill_sessions_in_knowledge_graph,
+    memify as run_memify, persist_sessions_in_knowledge_graph, render_lesson_document,
+    sync_graph_to_session,
 };
 pub use pipeline::{CognifyResult, IndexedFieldsStats};
 pub use qualification::{Qualification, check_pipeline_run_qualification};
