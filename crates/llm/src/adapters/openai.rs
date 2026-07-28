@@ -460,9 +460,13 @@ impl OpenAIAdapter {
     /// The api-version is then added through `Url::query_pairs_mut`, so the query
     /// separator is chosen correctly even if `base_url` already carries a query
     /// (no malformed double-`?`) and the value is percent-encoded rather than
-    /// interpolated raw. If `base_url` does not parse as a URL we fall back to a
-    /// manual append that still picks `?` vs `&` from the existing query, so the
-    /// api-version is never silently dropped (Azure 400s without it).
+    /// interpolated raw. Any `api-version` already present on `base_url` (e.g. a
+    /// copied Azure portal "Target URI") is dropped first so the request never
+    /// carries duplicate/conflicting `api-version` params — the configured
+    /// `LLM_API_VERSION` wins, and other query params are preserved. If `base_url`
+    /// does not parse as a URL we fall back to a manual append that still picks
+    /// `?` vs `&` from the existing query, so the api-version is never silently
+    /// dropped (Azure 400s without it).
     fn endpoint_url(&self, path: &str) -> String {
         if let Ok(mut url) = reqwest::Url::parse(&self.base_url) {
             if let Ok(mut segments) = url.path_segments_mut() {
@@ -477,7 +481,19 @@ impl OpenAIAdapter {
             // A cannot-be-a-base URL (e.g. `mailto:`) has no path segments; that
             // never happens for the http(s) endpoints we accept, so leave it.
             if let Some(v) = &self.api_version {
-                url.query_pairs_mut().append_pair("api-version", v);
+                // Preserve every existing query pair EXCEPT a stray `api-version`,
+                // then append the configured one, so a base_url that already
+                // carries `api-version=...` yields exactly one (the configured
+                // value wins) rather than a duplicate Azure may reject.
+                let preserved: Vec<(String, String)> = url
+                    .query_pairs()
+                    .filter(|(k, _)| k != "api-version")
+                    .map(|(k, val)| (k.into_owned(), val.into_owned()))
+                    .collect();
+                url.query_pairs_mut()
+                    .clear()
+                    .extend_pairs(preserved)
+                    .append_pair("api-version", v);
             }
             return url.into();
         }
@@ -1844,6 +1860,32 @@ mod tests {
                 .ends_with("/openai/deployments/gpt-4o-mini/chat/completions"),
             "route stays in the path when base_url carries a query: {}",
             parsed.path()
+        );
+
+        // A base_url that already carries `api-version=...` (e.g. a copied Azure
+        // portal Target URI) must NOT yield a duplicate: the configured version
+        // wins and appears exactly once.
+        let dup = OpenAIAdapter::new(
+            "gpt-4o-mini",
+            "sk-test",
+            Some(
+                "https://res.openai.azure.com/openai/deployments/gpt-4o-mini?api-version=2023-05-15"
+                    .to_string(),
+            ),
+        )
+        .unwrap()
+        .with_api_version("2024-12-01-preview");
+        let url = dup.endpoint_url("chat/completions");
+        let parsed = reqwest::Url::parse(&url).expect("valid URL");
+        let versions: Vec<_> = parsed
+            .query_pairs()
+            .filter(|(k, _)| k == "api-version")
+            .map(|(_, v)| v.into_owned())
+            .collect();
+        assert_eq!(
+            versions,
+            vec!["2024-12-01-preview".to_string()],
+            "exactly one api-version, configured value wins: {url}"
         );
 
         // A value with a reserved character is percent-encoded, not interpolated raw.
