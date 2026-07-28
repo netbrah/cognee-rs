@@ -249,6 +249,7 @@ impl HybridRetriever {
     async fn build_truth_context(
         &self,
         use_truth_weight: bool,
+        chunks_top_k: usize,
         query_vector: &[f32],
         dataset_id: Option<Uuid>,
         node_name: Option<&[String]>,
@@ -267,6 +268,7 @@ impl HybridRetriever {
 
         match self
             .try_build_truth_context(
+                chunks_top_k,
                 query_vector,
                 dataset_id,
                 node_name,
@@ -294,6 +296,7 @@ impl HybridRetriever {
     /// `From<GraphDBError>` impls.
     async fn try_build_truth_context(
         &self,
+        chunks_top_k: usize,
         query_vector: &[f32],
         dataset_id: Uuid,
         node_name: Option<&[String]>,
@@ -324,7 +327,12 @@ impl HybridRetriever {
             .expect("centroids is non-empty, checked above");
 
         let candidate_ids = self
-            .candidate_chunk_ids(query_vector, node_name, node_name_filter_operator)
+            .candidate_chunk_ids(
+                chunks_top_k,
+                query_vector,
+                node_name,
+                node_name_filter_operator,
+            )
             .await?;
         if candidate_ids.is_empty() {
             return Ok(Some((q_coords, HashMap::new(), current_truth_epoch)));
@@ -339,15 +347,21 @@ impl HybridRetriever {
     ///
     /// Reuses the same [`search_collection`] entry point and candidate window
     /// (`chunks_top_k * 2`, `required = false`) as the chunk lane so the truth
-    /// coords map covers exactly the chunks ranking can surface. Ids are derived
-    /// via [`result_id`] and the `None`s dropped (Python's `if chunk_id:`).
+    /// coords map covers exactly the chunks ranking can surface. `chunks_top_k`
+    /// is the request-resolved value threaded down from `get_context`, not the
+    /// constructor default, so a per-request `chunks_top_k`/`top_k` override
+    /// widens or narrows the truth window in lockstep with the chunk lane
+    /// (Python constructs the retriever per request, so its `self.chunks_top_k`
+    /// is already request-resolved). Ids are derived via [`result_id`] and the
+    /// `None`s dropped (Python's `if chunk_id:`).
     async fn candidate_chunk_ids(
         &self,
+        chunks_top_k: usize,
         query_vector: &[f32],
         node_name: Option<&[String]>,
         node_name_filter_operator: &str,
     ) -> Result<Vec<String>, SearchError> {
-        let candidate_limit = self.chunks_top_k.saturating_mul(2);
+        let candidate_limit = chunks_top_k.saturating_mul(2);
         if candidate_limit == 0 {
             return Ok(vec![]);
         }
@@ -538,6 +552,7 @@ impl SearchRetriever for HybridRetriever {
         let (q_coords, truth_state_by_id, current_truth_epoch) = self
             .build_truth_context(
                 use_truth_weight,
+                chunks_top_k,
                 &query_vector,
                 params.dataset_id,
                 node_name,
@@ -1303,6 +1318,27 @@ mod truth_context_tests {
         .unwrap();
     }
 
+    /// Seed `n` DocumentChunk_text rows aligned with the query direction. The
+    /// collection is created once; every row shares the query vector so all are
+    /// equally rankable and only the candidate-window limit truncates them.
+    async fn seed_chunks(db: &MockVectorDB, n: usize) {
+        db.create_collection("DocumentChunk", "text", 2)
+            .await
+            .unwrap();
+        for i in 0..n {
+            let chunk_id = Uuid::new_v4();
+            db.index_points(
+                "DocumentChunk",
+                "text",
+                &[VectorPoint::new(chunk_id, vec![1.0, 0.0])
+                    .with_metadata("id", json!(chunk_id.to_string()))
+                    .with_metadata("text", json!(format!("chunk text {i}")))],
+            )
+            .await
+            .unwrap();
+        }
+    }
+
     const QUERY_VECTOR: [f32; 2] = [1.0, 0.0];
 
     #[tokio::test]
@@ -1328,7 +1364,14 @@ mod truth_context_tests {
 
         let retriever = truth_retriever(vector_db, graph_db, true);
         let (q_coords, truth_state_by_id, current_truth_epoch) = retriever
-            .build_truth_context(true, &QUERY_VECTOR, Some(dataset_id), None, "OR")
+            .build_truth_context(
+                true,
+                super::DEFAULT_TOP_K,
+                &QUERY_VECTOR,
+                Some(dataset_id),
+                None,
+                "OR",
+            )
             .await;
 
         // 1-centroid basis, DEFAULT_K = 8: cosine([1,0],[1,0]) = 1.0, padded.
@@ -1354,7 +1397,14 @@ mod truth_context_tests {
 
         let retriever = truth_retriever(vector_db, graph_db, false);
         let result = retriever
-            .build_truth_context(false, &QUERY_VECTOR, Some(dataset_id), None, "OR")
+            .build_truth_context(
+                false,
+                super::DEFAULT_TOP_K,
+                &QUERY_VECTOR,
+                Some(dataset_id),
+                None,
+                "OR",
+            )
             .await;
         assert_eq!(result, (None, None, None));
         // Short-circuits before touching the graph at all.
@@ -1374,7 +1424,7 @@ mod truth_context_tests {
 
         let retriever = truth_retriever(vector_db, graph_db, true);
         let result = retriever
-            .build_truth_context(true, &QUERY_VECTOR, None, None, "OR")
+            .build_truth_context(true, super::DEFAULT_TOP_K, &QUERY_VECTOR, None, None, "OR")
             .await;
         assert_eq!(result, (None, None, None));
     }
@@ -1388,7 +1438,14 @@ mod truth_context_tests {
 
         let retriever = truth_retriever(vector_db, graph_db, true);
         let result = retriever
-            .build_truth_context(true, &QUERY_VECTOR, Some(dataset_id), None, "OR")
+            .build_truth_context(
+                true,
+                super::DEFAULT_TOP_K,
+                &QUERY_VECTOR,
+                Some(dataset_id),
+                None,
+                "OR",
+            )
             .await;
         assert_eq!(result, (None, None, None));
     }
@@ -1404,7 +1461,14 @@ mod truth_context_tests {
 
         let retriever = truth_retriever(vector_db, graph_db, true);
         let result = retriever
-            .build_truth_context(true, &QUERY_VECTOR, Some(dataset_id), None, "OR")
+            .build_truth_context(
+                true,
+                super::DEFAULT_TOP_K,
+                &QUERY_VECTOR,
+                Some(dataset_id),
+                None,
+                "OR",
+            )
             .await;
         assert_eq!(result, (None, None, None));
     }
@@ -1432,7 +1496,14 @@ mod truth_context_tests {
 
         let retriever = truth_retriever(vector_db, graph_db, true);
         let result = retriever
-            .build_truth_context(true, &QUERY_VECTOR, Some(dataset_id), None, "OR")
+            .build_truth_context(
+                true,
+                super::DEFAULT_TOP_K,
+                &QUERY_VECTOR,
+                Some(dataset_id),
+                None,
+                "OR",
+            )
             .await;
         assert_eq!(result, (None, None, None));
     }
@@ -1449,12 +1520,59 @@ mod truth_context_tests {
 
         let retriever = truth_retriever(vector_db, graph_db, true);
         let (q_coords, truth_state_by_id, current_truth_epoch) = retriever
-            .build_truth_context(true, &QUERY_VECTOR, Some(dataset_id), None, "OR")
+            .build_truth_context(
+                true,
+                super::DEFAULT_TOP_K,
+                &QUERY_VECTOR,
+                Some(dataset_id),
+                None,
+                "OR",
+            )
             .await;
 
         assert_eq!(q_coords, Some(vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]));
         assert_eq!(current_truth_epoch, Some(3));
         let states = truth_state_by_id.expect("empty-but-present state map");
         assert!(states.is_empty());
+    }
+
+    /// The truth candidate window must be sized from the request-resolved
+    /// `chunks_top_k` threaded down from `get_context`, not the constructor
+    /// default. With 5 equally-ranked chunks seeded, a resolved `chunks_top_k`
+    /// of 1 caps the window at `1 * 2 = 2` candidates, while the constructor
+    /// default (15) would surface all 5 — proving the request override drives
+    /// the window in lockstep with the chunk lane.
+    #[tokio::test]
+    async fn candidate_window_follows_request_resolved_chunks_top_k() {
+        let vdb = MockVectorDB::new();
+        seed_chunks(&vdb, 5).await;
+        let vector_db: Arc<dyn VectorDB> = Arc::new(vdb);
+        let graph_db: Arc<dyn GraphDBTrait> = Arc::new(MockGraphDB::new());
+
+        // Constructor default is DEFAULT_TOP_K (15); the request-resolved value
+        // passed in is what the window must follow.
+        let retriever = truth_retriever(vector_db, graph_db, true);
+
+        // Resolved chunks_top_k = 1 -> window = 2 -> at most 2 candidate ids.
+        let narrow = retriever
+            .candidate_chunk_ids(1, &QUERY_VECTOR, None, "OR")
+            .await
+            .unwrap();
+        assert_eq!(
+            narrow.len(),
+            2,
+            "window must follow the resolved chunks_top_k (1 * 2), not self.chunks_top_k"
+        );
+
+        // A wide resolved value surfaces every seeded chunk (window 30 >= 5).
+        let wide = retriever
+            .candidate_chunk_ids(super::DEFAULT_TOP_K, &QUERY_VECTOR, None, "OR")
+            .await
+            .unwrap();
+        assert_eq!(
+            wide.len(),
+            5,
+            "wide window should surface all seeded chunks"
+        );
     }
 }
