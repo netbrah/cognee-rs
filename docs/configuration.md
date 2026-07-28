@@ -36,6 +36,7 @@ for retries and the `cognee-llm` rustdoc for the adapter.
 | `LLM_API_KEY` / `OPENAI_TOKEN` | `llm_api_key` | _(empty)_ |
 | `LLM_ENDPOINT` / `OPENAI_URL` | `llm_endpoint` | _(empty)_ |
 | `LLM_API_VERSION` | `llm_api_version` | _(empty)_ |
+| `LLM_REASONING` | `llm_reasoning` | `auto` |
 | `LLM_TEMPERATURE` | `llm_temperature` | `0.0` |
 | `LLM_STREAMING` | `llm_streaming` | `false` |
 | `LLM_MAX_COMPLETION_TOKENS` / `LLM_MAX_TOKENS` | `llm_max_completion_tokens` | `16384` |
@@ -89,7 +90,26 @@ authenticates with the `api-key` header and appends an `?api-version=<v>` query.
 Set `LLM_PROVIDER=azure`, `LLM_API_KEY`, `LLM_API_VERSION` (e.g.
 `2024-12-01-preview`), and `LLM_ENDPOINT` to the **deployment** URL
 (`https://<resource>.openai.azure.com/openai/deployments/<deployment>`); the model
-in the request body is ignored by Azure since the deployment is in the URL.
+in the request body is ignored by Azure for **routing** since the deployment is in
+the URL. It is *not* inert for reasoning-model detection (below): `LLM_MODEL` still
+selects the parameter shape, so for an o-series/`gpt-5` deployment set `LLM_MODEL`
+to the underlying model name (the adapter also treats a `.../deployments/o3` style
+deployment segment as reasoning), or pin it explicitly with `LLM_REASONING`.
+
+### Reasoning-model parameters (`LLM_REASONING`)
+
+OpenAI reasoning families (`o1*`, `o3*`, `o4*`, `gpt-5*`) require a different
+request shape — `max_completion_tokens` instead of `max_tokens`, and no
+`temperature`/`top_p`/penalties. The adapter auto-detects this from the model
+name for any non-local endpoint (loopback and Ollama's port keep the legacy
+shape). `LLM_REASONING` overrides that detection:
+
+- `auto` (default) — name/host auto-detection as above.
+- `always` — force the reasoning shape (e.g. a proxy that hides a reasoning model
+  behind an opaque alias).
+- `never` — force the legacy `max_tokens`+`temperature` shape (e.g. a remote
+  OpenAI-compatible gateway serving a reasoning-*named* model that only accepts
+  the legacy parameters).
 
 Native Bedrock adapters are tracked separately in issue #17.
 

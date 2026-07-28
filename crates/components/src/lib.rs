@@ -34,7 +34,10 @@ mod registry;
 mod traits;
 
 pub use builtins::{build_database, build_embedding_config, build_storage};
-pub use context::{BackendBuildContext, EmbeddingInputs, LlmInputs, anthropic_base_url_from_env};
+pub use context::{
+    BackendBuildContext, EmbeddingInputs, LlmInputs, anthropic_base_url_from_env,
+    parse_reasoning_override,
+};
 pub use error::ComponentError;
 pub use registry::ComponentRegistry;
 pub use traits::{EmbeddingFactory, GraphDbFactory, LlmFactory, VectorDbFactory};

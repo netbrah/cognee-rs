@@ -124,6 +124,13 @@ pub struct LlmInputs {
     /// Azure `api-version` (empty = unset). Only consumed by the azure provider,
     /// which requires it alongside a deployment `endpoint`.
     pub api_version: String,
+    /// Explicit override for OpenAI reasoning-model detection, from `LLM_REASONING`
+    /// (`auto` | `always` | `never`). `None` keeps the adapter's name/host
+    /// auto-detection; `Some(true)`/`Some(false)` force the reasoning / legacy
+    /// parameter shape. Lets an operator correct an endpoint whose reasoning
+    /// nature the model name mis-signals. Applied via
+    /// `OpenAIAdapter::with_reasoning_override`.
+    pub reasoning_override: Option<bool>,
     /// Replaces the provider adapter with a cassette replay mock.
     pub mock: bool,
     /// Cassette path for the replay mock (consumed only under `mock-llm`).
@@ -145,4 +152,39 @@ pub fn anthropic_base_url_from_env() -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// Parse the `LLM_REASONING` knob into a reasoning-detection override for
+/// [`LlmInputs::reasoning_override`]. `always`/`true`/`on`/`1` force reasoning
+/// mode on, `never`/`false`/`off`/`0` force it off, and everything else —
+/// including the default `auto`, an empty value, or an unrecognised token —
+/// leaves auto-detection in place (`None`). Case- and whitespace-insensitive.
+///
+/// Lives here — the shared config→[`LlmInputs`] boundary — so the SDK `Settings`
+/// and the standalone HTTP server resolve the knob identically.
+pub fn parse_reasoning_override(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "always" | "true" | "on" | "1" => Some(true),
+        "never" | "false" | "off" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_reasoning_override;
+
+    #[test]
+    fn parse_reasoning_override_maps_known_tokens() {
+        for on in ["always", "true", "on", "1", "  ALWAYS  ", "True"] {
+            assert_eq!(parse_reasoning_override(on), Some(true), "{on:?}");
+        }
+        for off in ["never", "false", "off", "0", "Never"] {
+            assert_eq!(parse_reasoning_override(off), Some(false), "{off:?}");
+        }
+        // Default, empty, and unrecognised tokens fall through to auto (None).
+        for auto in ["auto", "", "   ", "maybe", "yes"] {
+            assert_eq!(parse_reasoning_override(auto), None, "{auto:?}");
+        }
+    }
 }

@@ -50,7 +50,8 @@ impl LlmFactory for OpenAiCompatibleLlmFactory {
         )
         .map_err(|e| ComponentError::Llm(e.to_string()))?
         .with_extra_args(ctx.llm.llm_args.clone())
-        .with_default_max_tokens(Some(ctx.llm.max_completion_tokens));
+        .with_default_max_tokens(Some(ctx.llm.max_completion_tokens))
+        .with_reasoning_override(ctx.llm.reasoning_override);
         Ok(Arc::new(adapter))
     }
 
@@ -175,7 +176,13 @@ impl LlmFactory for AzureLlmFactory {
         )
         .map_err(|e| ComponentError::Llm(e.to_string()))?
         .with_api_version(api_version)
-        .with_extra_args(ctx.llm.llm_args.clone());
+        .with_extra_args(ctx.llm.llm_args.clone())
+        // Honour the operator's completion ceiling on Azure too, matching the
+        // OpenAI-compatible factory: without this, option-less generate() calls
+        // (search/recall/feedback) fall back to the adapter's hardcoded 16384 and
+        // Azure deployments with a smaller output cap 400 on every such call.
+        .with_default_max_tokens(Some(ctx.llm.max_completion_tokens))
+        .with_reasoning_override(ctx.llm.reasoning_override);
         Ok(Arc::new(adapter))
     }
 
