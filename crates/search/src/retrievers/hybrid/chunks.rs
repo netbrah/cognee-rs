@@ -312,7 +312,7 @@ pub(crate) async fn retrieve_hybrid_chunks(
     truth_state_by_id: Option<&HashMap<String, NodeTruthState>>,
     current_truth_epoch: Option<i64>,
 ) -> Result<HybridChunksResult, SearchError> {
-    let candidate_limit = chunks_top_k * 2;
+    let candidate_limit = chunks_top_k.saturating_mul(2);
     let summary_limit = summary_candidate_limit(chunks_top_k, text_summaries_top_k);
 
     let bm25_future = search_bm25_chunks(

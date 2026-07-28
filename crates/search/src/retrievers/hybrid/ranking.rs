@@ -23,7 +23,10 @@ use crate::retrievers::hybrid::results::{payload, result_id};
 /// Python's `max(30, min(60, ...))` and Rust's `.clamp(30, 60)` are equivalent
 /// for non-negative inputs.
 pub(crate) fn rrf_k(chunks_top_k: usize) -> usize {
-    (20 + 2 * chunks_top_k).clamp(30, 60)
+    2usize
+        .saturating_mul(chunks_top_k)
+        .saturating_add(20)
+        .clamp(30, 60)
 }
 
 /// Multiplicative importance boost read from a chunk payload.
