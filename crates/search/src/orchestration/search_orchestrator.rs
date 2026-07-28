@@ -544,6 +544,31 @@ impl SearchOrchestrator {
             // If no feedback, or feedback with follow-up, proceed normally.
         }
 
+        // P1-10 parity: an unscoped hybrid completion still needs its retrieved
+        // context so the session cache can record `used_graph_element_ids`.
+        // On the default path `include_context`
+        // (`only_context || use_combined_context || use_dataset_scope`) is false,
+        // so `context` is `None` and the hybrid retriever would fetch its context
+        // privately inside `get_completion` — leaving the orchestrator blind to the
+        // graph elements that produced the answer, making the P1-10 feature inert.
+        // Python's `HybridRetriever.get_completion` computes
+        // `extract_context_object_ids(retrieved_objects)` on EVERY completion path
+        // (`hybrid_retriever.py:242-296`). We fetch the context here once and hand
+        // it to `get_completion`, so the retriever does not fetch twice and the
+        // answer is unchanged. This is deliberately scoped to the hybrid retriever
+        // (so other search types are untouched) and only when a session will
+        // actually be saved. Access tracking stays gated on `include_context`
+        // above and is intentionally not re-run here.
+        let context = if context.is_none()
+            && request.session_id.is_some()
+            && self.session_manager.is_some()
+            && retriever.search_type() == crate::types::SearchType::HybridCompletion
+        {
+            Some(retriever.get_context(&request.query_text, &params).await?)
+        } else {
+            context
+        };
+
         let output = retriever
             .get_completion(
                 &request.query_text,
