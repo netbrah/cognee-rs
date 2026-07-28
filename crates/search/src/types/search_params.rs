@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::types::SearchRequest;
 
@@ -32,6 +33,12 @@ pub struct SearchParams {
 
     /// "OR" (default) or "AND" for multi-name filtering.
     pub node_name_filter_operator: Option<String>,
+
+    /// The single dataset in scope for this request, or `None` if zero or more
+    /// than one dataset is in scope. Populated only when `SearchRequest.dataset_ids`
+    /// resolves to exactly one id; consumed by the hybrid truth-weight lane, which
+    /// requires a single well-defined truth-subspace (per-dataset centroids).
+    pub dataset_id: Option<Uuid>,
 
     /// Influence weight for feedback-based re-ranking.
     pub feedback_influence: Option<f32>,
@@ -119,6 +126,12 @@ impl From<&SearchRequest> for SearchParams {
             node_type: req.node_type.clone(),
             node_name: req.node_name.clone(),
             node_name_filter_operator: req.node_name_filter_operator.clone(),
+            // The truth lane activates only when exactly one dataset is in scope;
+            // zero ids (no scope) and 2+ ids (multi-dataset search) both yield None.
+            dataset_id: match &req.dataset_ids {
+                Some(ids) if ids.len() == 1 => Some(ids[0]),
+                _ => None,
+            },
             feedback_influence: req.feedback_influence,
             max_iter: req
                 .retriever_specific_config
@@ -197,8 +210,41 @@ impl From<&SearchRequest> for SearchParams {
     reason = "test code — panics are acceptable failures"
 )]
 mod tests {
+    use uuid::Uuid;
+
     use super::SearchParams;
     use crate::types::SearchRequest;
+
+    #[test]
+    fn dataset_id_none_when_dataset_ids_absent() {
+        let req: SearchRequest = serde_json::from_str(r#"{ "query_text": "q" }"#).unwrap();
+        assert!(req.dataset_ids.is_none());
+        assert_eq!(SearchParams::from(&req).dataset_id, None);
+    }
+
+    #[test]
+    fn dataset_id_none_when_zero_datasets_in_scope() {
+        let req: SearchRequest =
+            serde_json::from_str(r#"{ "query_text": "q", "dataset_ids": [] }"#).unwrap();
+        assert_eq!(SearchParams::from(&req).dataset_id, None);
+    }
+
+    #[test]
+    fn dataset_id_some_when_exactly_one_dataset_in_scope() {
+        let id = Uuid::new_v4();
+        let json = format!(r#"{{ "query_text": "q", "dataset_ids": ["{id}"] }}"#);
+        let req: SearchRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(SearchParams::from(&req).dataset_id, Some(id));
+    }
+
+    #[test]
+    fn dataset_id_none_when_multiple_datasets_in_scope() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let json = format!(r#"{{ "query_text": "q", "dataset_ids": ["{a}", "{b}"] }}"#);
+        let req: SearchRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(SearchParams::from(&req).dataset_id, None);
+    }
 
     #[test]
     fn hybrid_knobs_extracted_from_retriever_specific_config() {

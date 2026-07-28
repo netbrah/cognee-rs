@@ -26,6 +26,7 @@ cognee-llm = { path = "../llm", version = "0.1.3" }
 cognee-models = { path = "../models", version = "0.1.3" }
 cognee-session = { path = "../session", version = "0.1.3", features = ["sea-orm-store"] }
 cognee-telemetry = { path = "../telemetry", version = "0.1.3" }
+cognee-truth-subspace = { path = "../truth-subspace", version = "0.1.3" }
 cognee-utils = { path = "../utils", version = "0.1.3" }
 cognee-vector = { path = "../vector", version = "0.1.3" }
 

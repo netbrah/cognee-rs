@@ -31,6 +31,8 @@ pub struct MockVectorDB {
     index_points_calls: Arc<Mutex<Vec<String>>>,
     /// Optional injected error returned from the next `index_points` call.
     index_error: Arc<Mutex<Option<String>>>,
+    /// Optional injected error returned from `retrieve` calls.
+    retrieve_error: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Clone)]
@@ -47,6 +49,7 @@ impl MockVectorDB {
             create_collection_calls: Arc::new(Mutex::new(Vec::new())),
             index_points_calls: Arc::new(Mutex::new(Vec::new())),
             index_error: Arc::new(Mutex::new(None)),
+            retrieve_error: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -78,6 +81,13 @@ impl MockVectorDB {
     /// as `VectorDBError::StorageError`.
     pub fn set_index_error(&self, msg: impl Into<String>) {
         let mut slot = self.index_error.lock().unwrap(); // lock poison is unrecoverable
+        *slot = Some(msg.into());
+    }
+
+    /// Inject an error that will be returned from subsequent `retrieve` calls
+    /// as `VectorDBError::StorageError`.
+    pub fn set_retrieve_error(&self, msg: impl Into<String>) {
+        let mut slot = self.retrieve_error.lock().unwrap(); // lock poison is unrecoverable
         *slot = Some(msg.into());
     }
 
@@ -306,6 +316,13 @@ impl VectorDB for MockVectorDB {
         field_name: &str,
         ids: &[Uuid],
     ) -> VectorDBResult<Vec<SearchResult>> {
+        // Error-injection hook for tests: fail before any read.
+        {
+            let slot = self.retrieve_error.lock().unwrap(); // lock poison is unrecoverable
+            if let Some(msg) = slot.as_ref() {
+                return Err(VectorDBError::StorageError(msg.clone()));
+            }
+        }
         if ids.is_empty() {
             return Ok(vec![]);
         }

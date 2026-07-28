@@ -26,6 +26,8 @@ pub struct MockGraphDB {
     nodes: Arc<Mutex<HashMap<String, NodeData>>>,
     edges: Arc<Mutex<Vec<EdgeData>>>,
     call_log: Arc<Mutex<Vec<String>>>,
+    /// Optional injected error returned from `get_node_truth_state` calls.
+    truth_state_error: Arc<Mutex<Option<String>>>,
 }
 
 impl MockGraphDB {
@@ -35,7 +37,15 @@ impl MockGraphDB {
             nodes: Arc::new(Mutex::new(HashMap::new())),
             edges: Arc::new(Mutex::new(Vec::new())),
             call_log: Arc::new(Mutex::new(Vec::new())),
+            truth_state_error: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Inject an error that will be returned from subsequent
+    /// `get_node_truth_state` calls as `GraphDBError::QueryError`.
+    pub fn set_truth_state_error(&self, msg: impl Into<String>) {
+        let mut slot = self.truth_state_error.lock().unwrap(); // lock poison is unrecoverable
+        *slot = Some(msg.into());
     }
 
     /// Get the current node count (for testing).
@@ -574,6 +584,14 @@ impl GraphDBTrait for MockGraphDB {
             .lock()
             .unwrap() // lock poison is unrecoverable
             .push("get_node_truth_state".to_string());
+
+        // Error-injection hook for tests: fail before any read.
+        {
+            let slot = self.truth_state_error.lock().unwrap(); // lock poison is unrecoverable
+            if let Some(msg) = slot.as_ref() {
+                return Err(GraphDBError::QueryError(msg.clone()));
+            }
+        }
 
         let nodes = self.nodes.lock().unwrap(); // lock poison is unrecoverable
         let mut out = HashMap::with_capacity(node_ids.len());

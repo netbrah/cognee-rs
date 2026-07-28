@@ -7,7 +7,12 @@
 //! absent here and will be added by the Phase-2 task without touching this
 //! code path.
 
+use std::collections::HashMap;
+
 use serde_json::Value;
+
+use cognee_graph::NodeTruthState;
+use cognee_truth_subspace::align::truth_factor;
 
 use crate::retrievers::hybrid::pairs::ChunkSummaryPair;
 use crate::retrievers::hybrid::results::{payload, result_id};
@@ -40,16 +45,31 @@ pub(crate) fn importance_factor(chunk_payload: &Value) -> f64 {
 /// Rank chunk↔summary pairs by RRF (optionally importance-weighted) and
 /// truncate to `limit`.
 ///
-/// Port of `rank_chunk_summary_pairs` (`ranking.py:7-48`, Phase-1 subset). For
-/// each pair carrying a `chunk`, collect the present ranks from
+/// Port of `rank_chunk_summary_pairs` (`ranking.py:7-48`). For each pair
+/// carrying a `chunk`, collect the present ranks from
 /// `(bm25_rank, vector_rank, summary_rank)` (skip if none), compute
 /// `rrf_score = Σ 1/(k + rank + 1)`, multiply by `importance_factor` when
-/// `use_importance_weight`, and sort by `(-final, -rrf, min_rank, chunk_id)`
-/// (float legs via `f64::total_cmp`, per the locked total-ordering decision).
+/// `use_importance_weight`, then multiply by `truth_factor` when the truth-weight
+/// gate holds, and sort by `(-final, -rrf, min_rank, chunk_id)` (float legs via
+/// `f64::total_cmp`, per the locked total-ordering decision).
+///
+/// The truth-subspace boost (`ranking.py:39-44`) is applied strictly AFTER the
+/// importance factor and only when `use_truth_weight`, `q_coords` is non-empty,
+/// an epoch is known, and the chunk's stored `truth_epoch` matches that current
+/// epoch. `NodeTruthState.truth_epoch` is a bare `i64` (with `-1` as the
+/// "never scored" sentinel), so a stale/sentinel epoch or a chunk id missing
+/// from the map both fall through to no multiplier — identical to Python's
+/// `None`-vs-int comparison. When the gate is false the `final_score` is exactly
+/// the Phase-1 value, so default-off (`use_truth_weight == false`) ranking is
+/// byte-identical to a call with no truth context.
 pub(crate) fn rank_chunk_summary_pairs(
     pairs: Vec<ChunkSummaryPair>,
     limit: usize,
     use_importance_weight: bool,
+    use_truth_weight: bool,
+    q_coords: Option<&[f64]>,
+    truth_state_by_id: Option<&HashMap<String, NodeTruthState>>,
+    current_truth_epoch: Option<i64>,
 ) -> Vec<ChunkSummaryPair> {
     if limit == 0 {
         return vec![];
@@ -72,7 +92,7 @@ pub(crate) fn rank_chunk_summary_pairs(
         }
 
         let rrf_score: f64 = ranks.iter().map(|rank| 1.0 / (k + rank + 1) as f64).sum();
-        let final_score = if use_importance_weight {
+        let mut final_score = if use_importance_weight {
             rrf_score * importance_factor(payload(chunk))
         } else {
             rrf_score
@@ -83,6 +103,20 @@ pub(crate) fn rank_chunk_summary_pairs(
             .clone()
             .or_else(|| result_id(chunk))
             .unwrap_or_default();
+
+        // Truth-subspace boost, applied MULTIPLICATIVELY after the importance
+        // factor (`ranking.py:39-44`). `q_coords` is `Copy` (`Option<&[f64]>`), so
+        // the `let Some(coords)` bind does not move it. A stale/sentinel epoch or
+        // a chunk id absent from the map both leave `final_score` unchanged.
+        if use_truth_weight
+            && let Some(coords) = q_coords
+            && !coords.is_empty()
+            && let Some(current_epoch) = current_truth_epoch
+            && let Some(truth_state) = truth_state_by_id.and_then(|map| map.get(&chunk_id))
+            && truth_state.truth_epoch == current_epoch
+        {
+            final_score *= truth_factor(&truth_state.truth_alignment, coords);
+        }
 
         ranked.push((final_score, rrf_score, min_rank, chunk_id, pair));
     }
@@ -168,16 +202,27 @@ mod tests {
         assert_eq!(importance_factor(&json!({"importance_weight": -1.0})), 0.75);
     }
 
+    /// Phase-1 baseline ranking call: truth weighting fully off, no truth
+    /// context. Keeps the existing tests reading exactly as they did before
+    /// P2-07 while pinning the "default-off" argument shape in one place.
+    fn baseline(
+        pairs: Vec<ChunkSummaryPair>,
+        limit: usize,
+        use_importance_weight: bool,
+    ) -> Vec<ChunkSummaryPair> {
+        rank_chunk_summary_pairs(pairs, limit, use_importance_weight, false, None, None, None)
+    }
+
     #[test]
     fn limit_zero_returns_empty() {
         let pairs = vec![pair("a", Some(0), Some(0), Some(0), None)];
-        assert!(rank_chunk_summary_pairs(pairs, 0, false).is_empty());
+        assert!(baseline(pairs, 0, false).is_empty());
     }
 
     #[test]
     fn pair_without_ranks_is_skipped() {
         let pairs = vec![pair("a", None, None, None, None)];
-        assert!(rank_chunk_summary_pairs(pairs, 5, false).is_empty());
+        assert!(baseline(pairs, 5, false).is_empty());
     }
 
     #[test]
@@ -185,7 +230,7 @@ mod tests {
         // Same rank slot value but different lane counts.
         let three = pair("three", Some(1), Some(1), Some(1), None);
         let one = pair("one", Some(0), None, None, None);
-        let ranked = rank_chunk_summary_pairs(vec![one, three], 5, false);
+        let ranked = baseline(vec![one, three], 5, false);
         assert_eq!(ranked.len(), 2);
         assert_eq!(ranked[0].chunk_id.as_deref(), Some("three"));
     }
@@ -195,13 +240,13 @@ mod tests {
         // Identical ranks; the higher importance weight wins when enabled.
         let low = pair("low", Some(0), None, None, Some(0.0));
         let high = pair("high", Some(0), None, None, Some(1.0));
-        let ranked = rank_chunk_summary_pairs(vec![low, high], 5, true);
+        let ranked = baseline(vec![low, high], 5, true);
         assert_eq!(ranked[0].chunk_id.as_deref(), Some("high"));
 
         // With importance off, tie-break falls to chunk_id string order.
         let low = pair("low", Some(0), None, None, Some(0.0));
         let high = pair("high", Some(0), None, None, Some(1.0));
-        let ranked = rank_chunk_summary_pairs(vec![low, high], 5, false);
+        let ranked = baseline(vec![low, high], 5, false);
         assert_eq!(ranked[0].chunk_id.as_deref(), Some("high")); // "high" < "low"
     }
 
@@ -210,7 +255,7 @@ mod tests {
         // Identical scores/ranks -> ascending chunk_id string.
         let b = pair("bbb", Some(0), None, None, None);
         let a = pair("aaa", Some(0), None, None, None);
-        let ranked = rank_chunk_summary_pairs(vec![b, a], 5, false);
+        let ranked = baseline(vec![b, a], 5, false);
         assert_eq!(ranked[0].chunk_id.as_deref(), Some("aaa"));
         assert_eq!(ranked[1].chunk_id.as_deref(), Some("bbb"));
     }
@@ -222,7 +267,7 @@ mod tests {
         // Y has a higher rrf sum, so ranks first.
         let x = pair("x", Some(0), None, None, None);
         let y = pair("y", None, Some(0), Some(2), None);
-        let ranked = rank_chunk_summary_pairs(vec![x, y], 5, false);
+        let ranked = baseline(vec![x, y], 5, false);
         assert_eq!(ranked[0].chunk_id.as_deref(), Some("y"));
     }
 
@@ -233,7 +278,336 @@ mod tests {
             pair("b", Some(1), None, None, None),
             pair("c", Some(2), None, None, None),
         ];
-        let ranked = rank_chunk_summary_pairs(pairs, 2, false);
+        let ranked = baseline(pairs, 2, false);
         assert_eq!(ranked.len(), 2);
+    }
+
+    // ---- Truth-subspace multiplier (P2-07) ----
+
+    /// Chunk ids for the order-flip fixture below. `HI_ID` sorts AFTER
+    /// `BOOST_ID` on purpose, so a correct (score-driven) baseline places `hi`
+    /// first *despite* the id order — proving the ordering is not accidentally
+    /// decided by the chunk_id tie-break.
+    const HI_ID: &str = "bbb-hi";
+    const BOOST_ID: &str = "aaa-boost";
+
+    /// Ordered chunk ids of a ranking result, for full-order comparisons.
+    fn ids(ranked: &[ChunkSummaryPair]) -> Vec<Option<String>> {
+        ranked.iter().map(|p| p.chunk_id.clone()).collect()
+    }
+
+    /// Two chunks engineered so the truth multiplier — if it were (wrongly)
+    /// applied to the aligned `boost` chunk — would FLIP the baseline order.
+    ///
+    /// Both carry importance 0.5 (factor 1.0), so the only Phase-1 differentiator
+    /// is the RRF rank: `hi` sits at rank 0 (rrf `1/31 = 0.032258`) and `boost`
+    /// at rank 1 (rrf `1/32 = 0.031250`), so the no-multiplier order is
+    /// `[hi, boost]`. If the 1.25 factor leaked onto `boost`, its score becomes
+    /// `0.031250 * 1.25 = 0.039063 > 0.032258`, flipping the order to
+    /// `[boost, hi]`. Any spurious factor above ~1.032 flips it.
+    fn flip_pairs() -> Vec<ChunkSummaryPair> {
+        vec![
+            pair(HI_ID, Some(0), None, None, Some(0.5)),
+            pair(BOOST_ID, Some(1), None, None, Some(0.5)),
+        ]
+    }
+
+    /// Truth state that boosts only `BOOST_ID` (aligned with the `[1.0, 0.0]`
+    /// query direction -> factor 1.25) at the given epoch.
+    fn boost_state(epoch: i64) -> HashMap<String, NodeTruthState> {
+        let mut states = HashMap::new();
+        states.insert(
+            BOOST_ID.to_string(),
+            NodeTruthState {
+                truth_alignment: vec![1.0, 0.0],
+                truth_epoch: epoch,
+            },
+        );
+        states
+    }
+
+    #[test]
+    fn truth_weight_off_is_byte_identical_to_no_truth_context() {
+        // Multi-chunk set where the LAST chunk ("lo") carries an aligned truth
+        // state. If the off-switch leaked, "lo"'s 1.25 boost would reorder the
+        // result, so an identical full ordering across the two calls genuinely
+        // proves byte-identity rather than accidental single-chunk agreement.
+        let q_coords = vec![1.0, 0.0];
+        let epoch = 3;
+        let mut states = HashMap::new();
+        states.insert(
+            "lo".to_string(),
+            NodeTruthState {
+                truth_alignment: vec![1.0, 0.0], // aligned -> would boost 1.25
+                truth_epoch: epoch,
+            },
+        );
+        // rrf: hi 1/31 = 0.032258, mid 1/32 = 0.031250, lo 1/33 = 0.030303.
+        let mk = || {
+            vec![
+                pair("hi", Some(0), None, None, Some(0.5)),
+                pair("mid", Some(1), None, None, Some(0.5)),
+                pair("lo", Some(2), None, None, Some(0.5)),
+            ]
+        };
+
+        // Truth OFF but full context supplied.
+        let with_ctx_off = rank_chunk_summary_pairs(
+            mk(),
+            5,
+            true,
+            false, // use_truth_weight OFF
+            Some(&q_coords),
+            Some(&states),
+            Some(epoch),
+        );
+        // No truth context at all.
+        let no_ctx = rank_chunk_summary_pairs(mk(), 5, true, false, None, None, None);
+
+        // Full ordering identical, and equal to the pure rrf x importance
+        // baseline [hi, mid, lo].
+        let expected = vec![
+            Some("hi".to_string()),
+            Some("mid".to_string()),
+            Some("lo".to_string()),
+        ];
+        assert_eq!(ids(&with_ctx_off), expected);
+        assert_eq!(ids(&no_ctx), expected);
+        assert_eq!(ids(&with_ctx_off), ids(&no_ctx));
+
+        // Positive control: the SAME fixture with truth ON reorders ("lo"'s
+        // 1/33 * 1.25 = 0.037879 beats "hi"'s 1/31 = 0.032258), proving the
+        // off-assertions above are non-vacuous — a leaked multiplier is
+        // observable here.
+        let with_ctx_on = rank_chunk_summary_pairs(
+            mk(),
+            5,
+            true,
+            true,
+            Some(&q_coords),
+            Some(&states),
+            Some(epoch),
+        );
+        assert_eq!(with_ctx_on[0].chunk_id.as_deref(), Some("lo"));
+        assert_ne!(ids(&with_ctx_on), expected);
+    }
+
+    /// Each gate condition, negated in turn, must leave ranking equal to the
+    /// no-truth baseline. Uses the [`flip_pairs`] order-flip fixture: the
+    /// aligned `boost` chunk sits one RRF rank behind `hi`, so any spuriously
+    /// applied 1.25 factor would flip the order to `[boost, hi]`. A positive
+    /// control below shows the fixture DOES flip when every gate is satisfied,
+    /// which makes the negative-case assertions non-vacuous.
+    #[test]
+    fn truth_gate_negative_cases_match_baseline() {
+        let q_coords = vec![1.0, 0.0];
+        let states = boost_state(3);
+        let epoch = 3;
+
+        // Reference: truth weighting off, no context. Score-driven order is
+        // [hi, boost] (hi's id sorts AFTER boost's, so this also confirms the
+        // order comes from the score, not the chunk_id tie-break).
+        let base = baseline(flip_pairs(), 5, true);
+        assert_eq!(
+            ids(&base),
+            vec![Some(HI_ID.to_string()), Some(BOOST_ID.to_string())]
+        );
+
+        // Positive control: with EVERY gate satisfied the same fixture flips to
+        // [boost, hi]. This proves an errantly-applied multiplier is observable,
+        // so the negative assertions genuinely guard the gate.
+        let applied = rank_chunk_summary_pairs(
+            flip_pairs(),
+            5,
+            true,
+            true,
+            Some(&q_coords),
+            Some(&states),
+            Some(epoch),
+        );
+        assert_eq!(
+            ids(&applied),
+            vec![Some(BOOST_ID.to_string()), Some(HI_ID.to_string())]
+        );
+
+        // 1. use_truth_weight = false, but full context present. A gate that
+        //    ignored the flag would boost `boost` and flip the order.
+        let c1 = rank_chunk_summary_pairs(
+            flip_pairs(),
+            5,
+            true,
+            false,
+            Some(&q_coords),
+            Some(&states),
+            Some(epoch),
+        );
+        // 2. q_coords empty. (truth_factor is the neutral 1.0 for empty query
+        //    coords, so this alone cannot flip the order; the assertion still
+        //    pins the baseline and guards against a mutant that fabricated
+        //    coords.)
+        let empty: Vec<f64> = vec![];
+        let c2 = rank_chunk_summary_pairs(
+            flip_pairs(),
+            5,
+            true,
+            true,
+            Some(&empty),
+            Some(&states),
+            Some(epoch),
+        );
+        // 3. q_coords None — structurally impossible to apply (no coords to
+        //    pass through).
+        let c3 = rank_chunk_summary_pairs(
+            flip_pairs(),
+            5,
+            true,
+            true,
+            None,
+            Some(&states),
+            Some(epoch),
+        );
+        // 4. current_truth_epoch None. A gate treating an unknown epoch as
+        //    "matches" would boost and flip.
+        let c4 = rank_chunk_summary_pairs(
+            flip_pairs(),
+            5,
+            true,
+            true,
+            Some(&q_coords),
+            Some(&states),
+            None,
+        );
+        // 5. chunk id missing from the truth-state map (empty map). A gate that
+        //    defaulted a missing chunk to aligned would boost and flip.
+        let other: HashMap<String, NodeTruthState> = HashMap::new();
+        let c5 = rank_chunk_summary_pairs(
+            flip_pairs(),
+            5,
+            true,
+            true,
+            Some(&q_coords),
+            Some(&other),
+            Some(epoch),
+        );
+
+        for c in [c1, c2, c3, c4, c5] {
+            assert_eq!(ids(&c), ids(&base));
+        }
+    }
+
+    #[test]
+    fn truth_multiplier_applies_and_matches_truth_factor() {
+        // Two chunks with identical RRF and identical importance (0.5 -> factor
+        // 1.0). Chunk "a" is strongly aligned (truth_factor 1.25); chunk "b" is
+        // orthogonal to the query direction (truth_factor 1.0). With the boost
+        // applied, "a" must outrank "b"; the ratio of their final scores equals
+        // the ratio of their truth factors.
+        let q_coords = vec![1.0, 0.0];
+        let mut states = HashMap::new();
+        states.insert(
+            "a".to_string(),
+            NodeTruthState {
+                truth_alignment: vec![1.0, 0.0], // aligned -> factor 1.25
+                truth_epoch: 3,
+            },
+        );
+        states.insert(
+            "b".to_string(),
+            NodeTruthState {
+                truth_alignment: vec![0.0, 1.0], // orthogonal -> factor 1.0
+                truth_epoch: 3,
+            },
+        );
+
+        // Identical importance (0.5) and identical single-lane rank 0 so the only
+        // differentiator is the truth factor.
+        let a = pair("a", Some(0), None, None, Some(0.5));
+        let b = pair("b", Some(0), None, None, Some(0.5));
+
+        // Baseline (truth off): tie resolves to chunk_id order -> "a" first, "b"
+        // second (they carry equal scores).
+        let base =
+            rank_chunk_summary_pairs(vec![b.clone(), a.clone()], 5, true, false, None, None, None);
+        assert_eq!(base[0].chunk_id.as_deref(), Some("a"));
+        assert_eq!(base[1].chunk_id.as_deref(), Some("b"));
+
+        // With truth on, "a"'s 1.25 factor beats "b"'s 1.0 factor.
+        let ranked = rank_chunk_summary_pairs(
+            vec![b, a],
+            5,
+            true,
+            true,
+            Some(&q_coords),
+            Some(&states),
+            Some(3),
+        );
+        assert_eq!(ranked[0].chunk_id.as_deref(), Some("a"));
+        assert_eq!(ranked[1].chunk_id.as_deref(), Some("b"));
+
+        // The factor "a" would have received is the independently-computed
+        // truth_factor over its alignment and the query coords (proves we call
+        // the real function, not a hand-copied literal).
+        let expected_factor = truth_factor(&[1.0, 0.0], &q_coords);
+        assert!((expected_factor - 1.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn truth_stale_epoch_and_missing_id_get_no_multiplier() {
+        let q_coords = vec![1.0, 0.0];
+
+        // No-truth baseline on the order-flip fixture: [hi, boost].
+        let base = baseline(flip_pairs(), 5, true);
+        let base_ids = ids(&base);
+        assert_eq!(
+            base_ids,
+            vec![Some(HI_ID.to_string()), Some(BOOST_ID.to_string())]
+        );
+
+        // Positive control: at the CURRENT epoch (3) the fixture flips to
+        // [boost, hi], so a wrongly-applied multiplier below would be observable.
+        let fresh = boost_state(3);
+        let applied = rank_chunk_summary_pairs(
+            flip_pairs(),
+            5,
+            true,
+            true,
+            Some(&q_coords),
+            Some(&fresh),
+            Some(3),
+        );
+        assert_eq!(
+            ids(&applied),
+            vec![Some(BOOST_ID.to_string()), Some(HI_ID.to_string())]
+        );
+
+        // Stale-epoch case (epoch - 1): `boost` is present and aligned but at
+        // epoch 2 while the current epoch is 3, so the multiplier must be
+        // skipped and the order stays the baseline [hi, boost]. Were it applied
+        // the order would flip.
+        let stale = boost_state(2);
+        let stale_ranked = rank_chunk_summary_pairs(
+            flip_pairs(),
+            5,
+            true,
+            true,
+            Some(&q_coords),
+            Some(&stale),
+            Some(3),
+        );
+        assert_eq!(ids(&stale_ranked), base_ids);
+
+        // Missing-from-map case, handled separately: an empty map means `boost`
+        // is absent, so no multiplier applies and the order stays the baseline.
+        let missing: HashMap<String, NodeTruthState> = HashMap::new();
+        let missing_ranked = rank_chunk_summary_pairs(
+            flip_pairs(),
+            5,
+            true,
+            true,
+            Some(&q_coords),
+            Some(&missing),
+            Some(3),
+        );
+        assert_eq!(ids(&missing_ranked), base_ids);
     }
 }

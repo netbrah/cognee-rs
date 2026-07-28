@@ -35,9 +35,11 @@ use tracing::debug;
 use uuid::Uuid;
 
 use cognee_embedding::EmbeddingEngine;
-use cognee_graph::GraphDBTrait;
+use cognee_graph::{GraphDBTrait, NodeTruthState};
 use cognee_llm::{GenerationOptions, Llm};
 use cognee_session::SessionContext;
+use cognee_truth_subspace::align::query_coords;
+use cognee_truth_subspace::{DEFAULT_K, load_centroids, pad_coords};
 use cognee_vector::VectorDB;
 
 use self::context::{format_hybrid_context, format_passages};
@@ -81,10 +83,12 @@ const EDGE_TYPE_FIELD: &str = "relationship_name";
 /// lane's output with a `"kind"` payload discriminator, and renders the
 /// sectioned prompt context Python feeds the LLM.
 ///
-/// **Phase-1 scope:** the truth-subspace (`use_truth_weight`) and global-context
-/// (`include_global_context_index` / `global_context_index_top_k`) knobs are
-/// accepted on the wire but inert — no truth-subspace alignment or global-context
-/// section is produced (locked deferral).
+/// **Truth-subspace (`use_truth_weight`):** live as of Phase 2 (P2-07) — when
+/// set and exactly one dataset is in scope, the chunk lane is re-ranked by
+/// truth-subspace alignment; it fails open to baseline ranking on any error and
+/// stays default-off. **Global-context (`include_global_context_index` /
+/// `global_context_index_top_k`):** still accepted on the wire but inert — no
+/// global-context section is produced (locked deferral).
 pub struct HybridRetriever {
     vector_db: Arc<dyn VectorDB>,
     embedding_engine: Arc<dyn EmbeddingEngine>,
@@ -96,8 +100,9 @@ pub struct HybridRetriever {
     max_edges_per_entity: usize,
     text_summaries_top_k: Option<usize>,
     use_importance_weight: bool,
-    // Accepted on the wire but inert in Phase 1 (locked deferral).
+    // Live as of Phase 2 (P2-07); default-off, fails open to baseline ranking.
     use_truth_weight: bool,
+    // Accepted on the wire but inert (locked deferral).
     include_global_context_index: bool,
     #[allow(
         dead_code,
@@ -228,6 +233,136 @@ impl HybridRetriever {
         };
 
         Ok((entities, facts))
+    }
+
+    /// Truth-subspace alignment context for the chunk lane (Python
+    /// `_build_truth_context`, `hybrid_retriever.py:110-143`).
+    ///
+    /// Returns `(q_coords, truth_state_by_id, current_truth_epoch)`. All three
+    /// are `None` when the truth weight is off, no single dataset is in scope,
+    /// or the dataset has no centroid slots — so ranking stays at exact
+    /// baseline. This is the SINGLE fail-open boundary: any error inside
+    /// [`Self::try_build_truth_context`] (a partial failure such as centroids
+    /// loading fine but the graph batch call erroring) discards the
+    /// already-computed `q_coords` and returns `(None, None, None)`, mirroring
+    /// Python's one `try/except` around the whole computation.
+    async fn build_truth_context(
+        &self,
+        use_truth_weight: bool,
+        query_vector: &[f32],
+        dataset_id: Option<Uuid>,
+        node_name: Option<&[String]>,
+        node_name_filter_operator: &str,
+    ) -> (
+        Option<Vec<f64>>,
+        Option<HashMap<String, NodeTruthState>>,
+        Option<i64>,
+    ) {
+        if !use_truth_weight {
+            return (None, None, None);
+        }
+        let Some(dataset_id) = dataset_id else {
+            return (None, None, None);
+        };
+
+        match self
+            .try_build_truth_context(
+                query_vector,
+                dataset_id,
+                node_name,
+                node_name_filter_operator,
+            )
+            .await
+        {
+            Ok(Some((q_coords, truth_state_by_id, current_truth_epoch))) => (
+                Some(q_coords),
+                Some(truth_state_by_id),
+                Some(current_truth_epoch),
+            ),
+            Ok(None) => (None, None, None),
+            Err(error) => {
+                debug!(%error, "truth-subspace lookup failed; using baseline ranking");
+                (None, None, None)
+            }
+        }
+    }
+
+    /// Fallible inner body of [`Self::build_truth_context`]. The `Option` layer
+    /// distinguishes "no centroids → no truth context" (`Ok(None)`) from a hard
+    /// error (`Err`); both collapse to `(None, None, None)` at the caller. Every
+    /// `.await?` propagates via `SearchError`'s `From<VectorDBError>` /
+    /// `From<GraphDBError>` impls.
+    async fn try_build_truth_context(
+        &self,
+        query_vector: &[f32],
+        dataset_id: Uuid,
+        node_name: Option<&[String]>,
+        node_name_filter_operator: &str,
+    ) -> Result<Option<(Vec<f64>, HashMap<String, NodeTruthState>, i64)>, SearchError> {
+        let centroids =
+            load_centroids(self.vector_db.as_ref(), &dataset_id.to_string(), DEFAULT_K).await?;
+        if centroids.is_empty() {
+            return Ok(None);
+        }
+
+        let centroid_vectors: Vec<Vec<f64>> =
+            centroids.iter().map(|c| c.centroid.clone()).collect();
+        let query_vector_f64: Vec<f64> = query_vector.iter().map(|&v| v as f64).collect();
+        let q_coords = pad_coords(
+            &query_coords(&query_vector_f64, &centroid_vectors),
+            DEFAULT_K,
+        );
+        // `centroids` is non-empty (checked above), so `max()` is always `Some`.
+        #[allow(
+            clippy::expect_used,
+            reason = "centroids is non-empty (early-returned above), so max() cannot be None"
+        )]
+        let current_truth_epoch = centroids
+            .iter()
+            .map(|c| c.truth_epoch)
+            .max()
+            .expect("centroids is non-empty, checked above");
+
+        let candidate_ids = self
+            .candidate_chunk_ids(query_vector, node_name, node_name_filter_operator)
+            .await?;
+        if candidate_ids.is_empty() {
+            return Ok(Some((q_coords, HashMap::new(), current_truth_epoch)));
+        }
+
+        let truth_state_by_id = self.graph_db.get_node_truth_state(&candidate_ids).await?;
+        Ok(Some((q_coords, truth_state_by_id, current_truth_epoch)))
+    }
+
+    /// Candidate `DocumentChunk` ids whose truth alignments the truth lane
+    /// batch-fetches (Python `_candidate_chunk_ids`, `hybrid_retriever.py:145-165`).
+    ///
+    /// Reuses the same [`search_collection`] entry point and candidate window
+    /// (`chunks_top_k * 2`, `required = false`) as the chunk lane so the truth
+    /// coords map covers exactly the chunks ranking can surface. Ids are derived
+    /// via [`result_id`] and the `None`s dropped (Python's `if chunk_id:`).
+    async fn candidate_chunk_ids(
+        &self,
+        query_vector: &[f32],
+        node_name: Option<&[String]>,
+        node_name_filter_operator: &str,
+    ) -> Result<Vec<String>, SearchError> {
+        let candidate_limit = self.chunks_top_k.saturating_mul(2);
+        if candidate_limit == 0 {
+            return Ok(vec![]);
+        }
+        let hits = search_collection(
+            &self.vector_db,
+            "DocumentChunk",
+            "text",
+            query_vector,
+            candidate_limit,
+            node_name,
+            node_name_filter_operator,
+            false,
+        )
+        .await?;
+        Ok(hits.iter().filter_map(result_id).collect())
     }
 }
 
@@ -392,18 +527,23 @@ impl SearchRetriever for HybridRetriever {
                  Phase 1; no global-context section will be produced"
             );
         }
-        if params.use_truth_weight.unwrap_or(self.use_truth_weight) {
-            debug!(
-                "HYBRID_COMPLETION: use_truth_weight is set but inert in Phase 1; baseline \
-                 ranking is used"
-            );
-        }
-
         // Embed the query once and share the vector across both lanes.
         let embeddings = self.embedding_engine.embed(&[query]).await?;
         let query_vector = embeddings.into_iter().next().ok_or_else(|| {
             SearchError::InvalidInput("embedding engine returned no vectors".to_string())
         })?;
+
+        // Build the truth-subspace context (default-off; fails open to baseline).
+        let use_truth_weight = params.use_truth_weight.unwrap_or(self.use_truth_weight);
+        let (q_coords, truth_state_by_id, current_truth_epoch) = self
+            .build_truth_context(
+                use_truth_weight,
+                &query_vector,
+                params.dataset_id,
+                node_name,
+                node_name_filter_operator,
+            )
+            .await;
 
         let (chunk_result, (entities, facts)) = tokio::try_join!(
             retrieve_hybrid_chunks(
@@ -416,6 +556,10 @@ impl SearchRetriever for HybridRetriever {
                 node_name_filter_operator,
                 use_importance_weight,
                 &query_vector,
+                use_truth_weight,
+                q_coords.as_deref(),
+                truth_state_by_id.as_ref(),
+                current_truth_epoch,
             ),
             self.retrieve_entities_and_facts(
                 &query_vector,
@@ -1016,5 +1160,301 @@ mod retriever_tests {
             }
             other => panic!("expected InvalidInput, got {other:?}"),
         }
+    }
+}
+
+/// Truth-subspace context tests (P2-07).
+///
+/// Curated port of Python's `test_hybrid_truth_context.py`. These exercise the
+/// private `build_truth_context` glue directly, so they live inline rather than
+/// in `crates/search/tests/` — Rust integration tests are a separate crate and
+/// cannot reach private methods. All mock-based (seeded `MockVectorDB` via
+/// `upsert_centroids`, `MockGraphDB::get_node_truth_state`); no credentials.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test code — panics are acceptable failures"
+)]
+mod truth_context_tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use cognee_embedding::EmbeddingResult;
+    use cognee_embedding::engine::EmbeddingEngine;
+    use cognee_graph::{GraphDBTrait, MockGraphDB};
+    use cognee_llm::{GenerationOptions, GenerationResponse, Llm, LlmResult, Message, TokenUsage};
+    use cognee_truth_subspace::{TruthCentroidPayload, upsert_centroids};
+    use cognee_vector::{MockVectorDB, VectorDB, VectorPoint};
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use super::HybridRetriever;
+
+    struct AlignedEmbedding;
+
+    #[async_trait]
+    impl EmbeddingEngine for AlignedEmbedding {
+        async fn embed(&self, texts: &[&str]) -> EmbeddingResult<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
+        }
+        fn dimension(&self) -> usize {
+            2
+        }
+        fn batch_size(&self) -> usize {
+            8
+        }
+        fn max_sequence_length(&self) -> usize {
+            128
+        }
+    }
+
+    struct NoopLlm;
+
+    #[async_trait]
+    impl Llm for NoopLlm {
+        async fn generate(
+            &self,
+            _messages: Vec<Message>,
+            _options: Option<GenerationOptions>,
+        ) -> LlmResult<GenerationResponse> {
+            Ok(GenerationResponse {
+                content: String::new(),
+                model: "test-model".to_string(),
+                usage: Some(TokenUsage {
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    total_tokens: 0,
+                }),
+                finish_reason: Some("stop".to_string()),
+            })
+        }
+
+        async fn create_structured_output_with_messages_raw(
+            &self,
+            _messages: Vec<Message>,
+            _json_schema: &serde_json::Value,
+            _options: Option<GenerationOptions>,
+        ) -> LlmResult<serde_json::Value> {
+            Ok(json!({}))
+        }
+
+        fn model(&self) -> &str {
+            "test-model"
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn truth_retriever(
+        vector_db: Arc<dyn VectorDB>,
+        graph_db: Arc<dyn GraphDBTrait>,
+        use_truth_weight: bool,
+    ) -> HybridRetriever {
+        HybridRetriever::new(
+            vector_db,
+            Arc::new(AlignedEmbedding),
+            graph_db,
+            Arc::new(NoopLlm),
+            None,                   // chunks_top_k
+            None,                   // entities_top_k
+            None,                   // facts_top_k
+            None,                   // max_edges_per_entity
+            None,                   // text_summaries_top_k
+            None,                   // use_importance_weight
+            Some(use_truth_weight), // use_truth_weight
+            None,                   // include_global_context_index
+            None,                   // global_context_index_top_k
+            None,                   // node_name
+            None,                   // node_name_filter_operator
+            None,                   // system_prompt
+            None,                   // system_prompt_path
+            None,                   // user_prompt_template
+            None,                   // generation_options
+        )
+    }
+
+    /// Seed a single centroid slot for `dataset_id` (dim-2 centroid).
+    async fn seed_centroid(db: &MockVectorDB, dataset_id: Uuid, centroid: Vec<f64>, epoch: i64) {
+        let payload = TruthCentroidPayload {
+            dataset_id: dataset_id.to_string(),
+            slot: 0,
+            count: 1,
+            truth_epoch: epoch,
+            updated_at: 0,
+            centroid,
+            learning_ids: vec![],
+        };
+        upsert_centroids(db, &[payload]).await.unwrap();
+    }
+
+    /// Seed a DocumentChunk_text vector row aligned with the query direction.
+    async fn seed_chunk(db: &MockVectorDB, chunk_id: Uuid) {
+        db.create_collection("DocumentChunk", "text", 2)
+            .await
+            .unwrap();
+        db.index_points(
+            "DocumentChunk",
+            "text",
+            &[VectorPoint::new(chunk_id, vec![1.0, 0.0])
+                .with_metadata("id", json!(chunk_id.to_string()))
+                .with_metadata("text", json!("chunk text"))],
+        )
+        .await
+        .unwrap();
+    }
+
+    const QUERY_VECTOR: [f32; 2] = [1.0, 0.0];
+
+    #[tokio::test]
+    async fn happy_path_loads_centroid_slot_and_truth_state() {
+        let dataset_id = Uuid::new_v4();
+        let chunk_id = Uuid::new_v4();
+
+        let vdb = MockVectorDB::new();
+        seed_centroid(&vdb, dataset_id, vec![1.0, 0.0], 3).await;
+        seed_chunk(&vdb, chunk_id).await;
+        let vector_db: Arc<dyn VectorDB> = Arc::new(vdb);
+
+        let graph = MockGraphDB::new();
+        graph
+            .add_node_raw(json!({
+                "id": chunk_id.to_string(),
+                "truth_alignment": [1.0],
+                "truth_epoch": 3,
+            }))
+            .await
+            .unwrap();
+        let graph_db: Arc<dyn GraphDBTrait> = Arc::new(graph);
+
+        let retriever = truth_retriever(vector_db, graph_db, true);
+        let (q_coords, truth_state_by_id, current_truth_epoch) = retriever
+            .build_truth_context(true, &QUERY_VECTOR, Some(dataset_id), None, "OR")
+            .await;
+
+        // 1-centroid basis, DEFAULT_K = 8: cosine([1,0],[1,0]) = 1.0, padded.
+        assert_eq!(q_coords, Some(vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]));
+        assert_eq!(current_truth_epoch, Some(3));
+        let states = truth_state_by_id.expect("truth state present");
+        let state = states.get(&chunk_id.to_string()).expect("chunk state");
+        assert_eq!(state.truth_epoch, 3);
+        assert_eq!(state.truth_alignment, vec![1.0]);
+    }
+
+    #[tokio::test]
+    async fn fail_open_when_use_truth_weight_off() {
+        let dataset_id = Uuid::new_v4();
+        let vdb = MockVectorDB::new();
+        seed_centroid(&vdb, dataset_id, vec![1.0, 0.0], 3).await;
+        let vector_db: Arc<dyn VectorDB> = Arc::new(vdb);
+
+        // Concrete clone shares the call log (Arc-backed) with the dyn handle.
+        let graph = MockGraphDB::new();
+        let graph_probe = graph.clone();
+        let graph_db: Arc<dyn GraphDBTrait> = Arc::new(graph);
+
+        let retriever = truth_retriever(vector_db, graph_db, false);
+        let result = retriever
+            .build_truth_context(false, &QUERY_VECTOR, Some(dataset_id), None, "OR")
+            .await;
+        assert_eq!(result, (None, None, None));
+        // Short-circuits before touching the graph at all.
+        assert!(
+            !graph_probe
+                .get_call_log()
+                .contains(&"get_node_truth_state".to_string()),
+            "graph must not be queried when the knob is off"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_open_when_no_single_dataset() {
+        let vdb = MockVectorDB::new();
+        let vector_db: Arc<dyn VectorDB> = Arc::new(vdb);
+        let graph_db: Arc<dyn GraphDBTrait> = Arc::new(MockGraphDB::new());
+
+        let retriever = truth_retriever(vector_db, graph_db, true);
+        let result = retriever
+            .build_truth_context(true, &QUERY_VECTOR, None, None, "OR")
+            .await;
+        assert_eq!(result, (None, None, None));
+    }
+
+    #[tokio::test]
+    async fn fail_open_when_no_centroids() {
+        let dataset_id = Uuid::new_v4();
+        // No centroids seeded -> load_centroids returns empty -> Ok(None).
+        let vector_db: Arc<dyn VectorDB> = Arc::new(MockVectorDB::new());
+        let graph_db: Arc<dyn GraphDBTrait> = Arc::new(MockGraphDB::new());
+
+        let retriever = truth_retriever(vector_db, graph_db, true);
+        let result = retriever
+            .build_truth_context(true, &QUERY_VECTOR, Some(dataset_id), None, "OR")
+            .await;
+        assert_eq!(result, (None, None, None));
+    }
+
+    #[tokio::test]
+    async fn fail_open_on_vector_store_error() {
+        let dataset_id = Uuid::new_v4();
+        let vdb = MockVectorDB::new();
+        // Centroid load goes through `retrieve`, which we make error.
+        vdb.set_retrieve_error("boom");
+        let vector_db: Arc<dyn VectorDB> = Arc::new(vdb);
+        let graph_db: Arc<dyn GraphDBTrait> = Arc::new(MockGraphDB::new());
+
+        let retriever = truth_retriever(vector_db, graph_db, true);
+        let result = retriever
+            .build_truth_context(true, &QUERY_VECTOR, Some(dataset_id), None, "OR")
+            .await;
+        assert_eq!(result, (None, None, None));
+    }
+
+    #[tokio::test]
+    async fn fail_open_on_graph_error_discards_computed_q_coords() {
+        // Centroids + candidate chunk load fine, so q_coords/epoch are already
+        // computed; the graph batch call errors. The whole chain must still
+        // fail open to (None, None, None) — the single-fail-open-boundary.
+        let dataset_id = Uuid::new_v4();
+        let chunk_id = Uuid::new_v4();
+
+        let vdb = MockVectorDB::new();
+        seed_centroid(&vdb, dataset_id, vec![1.0, 0.0], 3).await;
+        seed_chunk(&vdb, chunk_id).await;
+        let vector_db: Arc<dyn VectorDB> = Arc::new(vdb);
+
+        let graph = MockGraphDB::new();
+        graph
+            .add_node_raw(json!({ "id": chunk_id.to_string(), "truth_epoch": 3 }))
+            .await
+            .unwrap();
+        graph.set_truth_state_error("graph down");
+        let graph_db: Arc<dyn GraphDBTrait> = Arc::new(graph);
+
+        let retriever = truth_retriever(vector_db, graph_db, true);
+        let result = retriever
+            .build_truth_context(true, &QUERY_VECTOR, Some(dataset_id), None, "OR")
+            .await;
+        assert_eq!(result, (None, None, None));
+    }
+
+    #[tokio::test]
+    async fn candidate_empty_yields_populated_coords_and_empty_states() {
+        // Centroids present, but no DocumentChunk collection -> no candidates.
+        // q_coords/epoch stay Some; the state map is Some but empty.
+        let dataset_id = Uuid::new_v4();
+        let vdb = MockVectorDB::new();
+        seed_centroid(&vdb, dataset_id, vec![1.0, 0.0], 3).await;
+        let vector_db: Arc<dyn VectorDB> = Arc::new(vdb);
+        let graph_db: Arc<dyn GraphDBTrait> = Arc::new(MockGraphDB::new());
+
+        let retriever = truth_retriever(vector_db, graph_db, true);
+        let (q_coords, truth_state_by_id, current_truth_epoch) = retriever
+            .build_truth_context(true, &QUERY_VECTOR, Some(dataset_id), None, "OR")
+            .await;
+
+        assert_eq!(q_coords, Some(vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]));
+        assert_eq!(current_truth_epoch, Some(3));
+        let states = truth_state_by_id.expect("empty-but-present state map");
+        assert!(states.is_empty());
     }
 }
