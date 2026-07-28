@@ -154,8 +154,18 @@ fn is_reasoning_model_name(model: &str) -> bool {
 /// path segment immediately following a `deployments` segment. Returns `None`
 /// for any URL without that shape, so it is a no-op for standard OpenAI /
 /// OpenAI-compatible endpoints.
+///
+/// Gated on the Azure host (`*.openai.azure.com`): only Azure encodes the model
+/// in a `deployments/<name>` segment, so a non-Azure gateway whose path happens
+/// to contain a `deployments` route segment (e.g.
+/// `https://gw.example.com/deployments/o3-router/v1`) is NOT misclassified as a
+/// reasoning model.
 fn azure_deployment_name(base_url: &str) -> Option<String> {
     let url = reqwest::Url::parse(base_url).ok()?;
+    let host = url.host_str()?;
+    if !host.to_ascii_lowercase().ends_with(".openai.azure.com") {
+        return None;
+    }
     let mut segments = url.path_segments()?;
     while let Some(seg) = segments.next() {
         if seg.eq_ignore_ascii_case("deployments") {
@@ -356,20 +366,34 @@ impl OpenAIAdapter {
         if self.extra_args.is_empty() {
             return;
         }
-        // Reasoning models (`gpt-5*`/`o1*`/`o3*`/`o4*` on api.openai.com) reject
-        // `max_tokens` and require `max_completion_tokens`. The request body's
-        // output cap is written by `write_max_tokens` as `max_completion_tokens`,
-        // so a bare `max_tokens` coming from `LLM_ARGS` here would land alongside
-        // it and OpenAI rejects a request carrying *both* keys with a 400. Fold a
-        // `LLM_ARGS` `max_tokens` into `max_completion_tokens` (only filling the
-        // gap) so exactly one of the two keys is ever emitted.
+        // Reasoning models (`gpt-5*`/`o1*`/`o3*`/`o4*`, detected by name/host —
+        // NOT gated on api.openai.com, so this covers Azure o-series deployments
+        // and remote gateways too) constrain the request body two ways:
+        //   1. they require `max_completion_tokens` and reject `max_tokens`, and
+        //   2. they reject `temperature`/`top_p`/`frequency_penalty`/
+        //      `presence_penalty`.
+        // The request builder already honours both (writes `max_completion_tokens`
+        // via `write_max_tokens` and omits the sampling params for reasoning
+        // models), so an `LLM_ARGS` value must not re-introduce a rejected key
+        // here: fold a bare `max_tokens` into `max_completion_tokens`, drop the
+        // suppressed sampling params, and only fill gaps for everything else
+        // (matching Python's `{**self.llm_args, **kwargs}`).
         let reasoning = self.is_reasoning_model();
         if let Some(obj) = body.as_object_mut() {
             for (key, value) in &self.extra_args {
-                if reasoning && key == "max_tokens" {
-                    obj.entry("max_completion_tokens")
-                        .or_insert_with(|| value.clone());
-                    continue;
+                if reasoning {
+                    if key == "max_tokens" {
+                        obj.entry("max_completion_tokens")
+                            .or_insert_with(|| value.clone());
+                        continue;
+                    }
+                    if matches!(
+                        key.as_str(),
+                        "temperature" | "top_p" | "frequency_penalty" | "presence_penalty"
+                    ) {
+                        // Suppressed for reasoning models; re-adding 400s the call.
+                        continue;
+                    }
                 }
                 obj.entry(key.clone()).or_insert_with(|| value.clone());
             }
@@ -1995,6 +2019,17 @@ mod tests {
         .unwrap()
         .with_api_version("2024-12-01-preview");
         assert!(!non_reasoning.is_reasoning_model());
+
+        // The deployment fallback is gated on the Azure host: a NON-Azure gateway
+        // whose path merely contains a `deployments/<reasoning-name>` route
+        // segment must NOT be misclassified (it may only accept legacy params).
+        let non_azure_deployments_path = OpenAIAdapter::new(
+            "my-alias", // non-reasoning model name
+            "sk-test",
+            Some("https://gw.example.com/deployments/o3-router/v1".to_string()),
+        )
+        .unwrap();
+        assert!(!non_azure_deployments_path.is_reasoning_model());
     }
 
     #[test]
@@ -2141,6 +2176,54 @@ mod tests {
         classic.apply_extra_args(&mut body);
         assert_eq!(body["max_tokens"], 16384);
         assert!(body.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn test_apply_extra_args_drops_suppressed_sampling_params_for_reasoning() {
+        // Reasoning models reject temperature/top_p/frequency_penalty/
+        // presence_penalty, and the request builder omits them. An LLM_ARGS value
+        // for any of these must NOT be re-added by apply_extra_args, else the call
+        // 400s ("Unsupported value: temperature").
+        let args = json!({
+            "temperature": 0.3,
+            "top_p": 0.9,
+            "frequency_penalty": 0.1,
+            "presence_penalty": 0.2,
+            "logit_bias": {"50256": -100}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let reasoning = OpenAIAdapter::new("gpt-5-mini", "test-key", None)
+            .unwrap()
+            .with_extra_args(args.clone());
+        let mut body = json!({"model": "gpt-5-mini"});
+        reasoning.apply_extra_args(&mut body);
+        for suppressed in [
+            "temperature",
+            "top_p",
+            "frequency_penalty",
+            "presence_penalty",
+        ] {
+            assert!(
+                body.get(suppressed).is_none(),
+                "reasoning model must not carry {suppressed}"
+            );
+        }
+        // Non-sampling extra args (e.g. logit_bias) are still applied.
+        assert_eq!(body["logit_bias"]["50256"], -100);
+
+        // A classic model keeps all of them (they are valid there).
+        let classic = OpenAIAdapter::new("gpt-4o-mini", "test-key", None)
+            .unwrap()
+            .with_extra_args(args);
+        let mut body = json!({"model": "gpt-4o-mini"});
+        classic.apply_extra_args(&mut body);
+        assert_eq!(body["temperature"], 0.3);
+        assert_eq!(body["top_p"], 0.9);
+        assert_eq!(body["frequency_penalty"], 0.1);
+        assert_eq!(body["presence_penalty"], 0.2);
     }
 
     #[test]
