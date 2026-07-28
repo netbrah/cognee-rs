@@ -72,6 +72,13 @@ pub(crate) fn pre_stamp_extraction(
 ///   paired with the UUID of the chunk it was extracted from, so entities
 ///   are tagged with the correct source chunk.
 /// * `dataset_id` - UUID of the dataset
+/// * `chunk_node_sets` - Map from source chunk UUID to that chunk's
+///   `belongs_to_set` NodeSet entries. Each created Entity inherits the NodeSet
+///   entries of the chunk it was extracted from, mirroring Python's
+///   `Entity(belongs_to_set=data_chunk.belongs_to_set)` in
+///   `expand_with_nodes_and_edges.py:227`. This is what keeps a node_name-scoped
+///   (NodeSet-filtered) search from dropping every extracted entity. Chunks with
+///   no NodeSet metadata are simply absent from the map.
 /// * `existing_edges_set` - Set of edges that already exist in the database
 /// * `ontology_resolver` - Ontology resolver for entity validation and enrichment.
 ///   When loaded, validates entity types against "classes" and entities against
@@ -82,6 +89,7 @@ pub(crate) fn pre_stamp_extraction(
 pub async fn expand_with_nodes_and_edges(
     graphs: Vec<(Uuid, KnowledgeGraph)>,
     dataset_id: Uuid,
+    chunk_node_sets: &HashMap<Uuid, Vec<serde_json::Value>>,
     existing_edges_set: &HashSet<String>,
     ontology_resolver: &dyn OntologyResolver,
     user_label: Option<&str>,
@@ -218,6 +226,7 @@ pub async fn expand_with_nodes_and_edges(
                     entity_type.clone(), // Pass the shared entity_type
                     dataset_id,
                     chunk_id,
+                    chunk_node_sets.get(&chunk_id),
                 );
                 pre_stamp_extraction(&mut entity_pair.entity, user_label, &mut local_visited);
 
@@ -386,11 +395,20 @@ pub async fn expand_with_nodes_and_edges(
 /// Helper: Create Entity from Node.
 ///
 /// Mirrors Python's `_create_entity_node()` function.
+///
+/// `chunk_belongs_to_set` carries the source chunk's `belongs_to_set` NodeSet
+/// entries (or `None` when the chunk has no NodeSet metadata). Python assigns
+/// them wholesale (`Entity(belongs_to_set=data_chunk.belongs_to_set)`,
+/// expand_with_nodes_and_edges.py:227); Rust instead seeds `belongs_to_set` with
+/// the dataset-id entry in `Entity::new`, so we UNION the chunk's NodeSet entries
+/// in rather than overwriting — preserving dataset scoping while making the
+/// entity discoverable by a node_name-scoped (NodeSet-filtered) search.
 fn create_entity_node(
     node: &Node,
     entity_type: EntityType,
     dataset_id: Uuid,
     chunk_id: Uuid,
+    chunk_belongs_to_set: Option<&Vec<serde_json::Value>>,
 ) -> GraphNodePair {
     let entity = Entity::from_node(
         &node.id,
@@ -405,6 +423,19 @@ fn create_entity_node(
     entity_with_chunk
         .base
         .set_metadata("chunk_id", serde_json::json!(chunk_id.to_string()));
+
+    // Inherit the source chunk's NodeSet membership (union, not replace).
+    if let Some(chunk_sets) = chunk_belongs_to_set {
+        let belongs_to_set = entity_with_chunk
+            .base
+            .belongs_to_set
+            .get_or_insert_with(Vec::new);
+        for node_set in chunk_sets {
+            if !belongs_to_set.contains(node_set) {
+                belongs_to_set.push(node_set.clone());
+            }
+        }
+    }
 
     GraphNodePair {
         entity: entity_with_chunk,
@@ -590,6 +621,7 @@ mod tests {
         let (nodes, edges) = expand_with_nodes_and_edges(
             vec![(chunk_id, graph)],
             dataset_id,
+            &HashMap::new(),
             &HashSet::new(),
             &noop(),
             None,
@@ -620,6 +652,7 @@ mod tests {
         let (nodes, edges) = expand_with_nodes_and_edges(
             vec![(chunk_id, graph1), (chunk_id, graph2)],
             dataset_id,
+            &HashMap::new(),
             &HashSet::new(),
             &noop(),
             None,
@@ -642,6 +675,7 @@ mod tests {
         let (nodes, _) = expand_with_nodes_and_edges(
             vec![(chunk_id, graph)],
             dataset_id,
+            &HashMap::new(),
             &HashSet::new(),
             &noop(),
             None,
@@ -669,6 +703,7 @@ mod tests {
         let (nodes, _) = expand_with_nodes_and_edges(
             vec![(chunk_id, graph)],
             dataset_id,
+            &HashMap::new(),
             &HashSet::new(),
             &noop(),
             None,
@@ -690,6 +725,7 @@ mod tests {
         let (nodes, _) = expand_with_nodes_and_edges(
             vec![(chunk_id, graph)],
             dataset_id,
+            &HashMap::new(),
             &HashSet::new(),
             &noop(),
             None,
@@ -700,6 +736,63 @@ mod tests {
         for node_pair in &nodes {
             let chunk_ref = node_pair.entity.base.get_metadata("chunk_id");
             assert!(chunk_ref.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_expand_entity_inherits_source_chunk_node_set() {
+        // Parity with Python `Entity(belongs_to_set=data_chunk.belongs_to_set)`
+        // (expand_with_nodes_and_edges.py:227): an extracted entity must carry
+        // the NodeSet entries of its source chunk so a node_name-scoped
+        // (NodeSet-filtered) HYBRID_COMPLETION search keeps it.
+        let graph = create_test_graph();
+        let chunk_id = Uuid::new_v4();
+        let dataset_id = Uuid::new_v4();
+
+        // Build a chunk->NodeSet map mirroring how DocumentChunk carries
+        // NodeSet objects in `belongs_to_set` (models/document.rs).
+        let node_set = serde_json::json!({
+            "id": Uuid::new_v4().to_string(),
+            "name": "my_node_set",
+            "type": "NodeSet"
+        });
+        let mut chunk_node_sets: HashMap<Uuid, Vec<serde_json::Value>> = HashMap::new();
+        chunk_node_sets.insert(chunk_id, vec![node_set.clone()]);
+
+        let (nodes, _edges) = expand_with_nodes_and_edges(
+            vec![(chunk_id, graph)],
+            dataset_id,
+            &chunk_node_sets,
+            &HashSet::new(),
+            &noop(),
+            None,
+        )
+        .await;
+
+        assert!(!nodes.is_empty(), "expected at least one node");
+        for pair in &nodes {
+            let belongs_to_set = pair
+                .entity
+                .base
+                .belongs_to_set
+                .as_ref()
+                .expect("entity should have a belongs_to_set");
+
+            // The source chunk's NodeSet entry is present (search discoverability).
+            assert!(
+                belongs_to_set.contains(&node_set),
+                "entity '{}' should inherit its chunk's NodeSet entry",
+                pair.entity.name
+            );
+
+            // The dataset-id entry from Entity::new is preserved (union, not replace).
+            assert!(
+                belongs_to_set
+                    .iter()
+                    .any(|v| v == &serde_json::json!(dataset_id.to_string())),
+                "entity '{}' should still carry the dataset-id entry",
+                pair.entity.name
+            );
         }
     }
 
@@ -726,6 +819,7 @@ mod tests {
         let (nodes, edges) = expand_with_nodes_and_edges(
             vec![(chunk_id, graph)],
             dataset_id,
+            &HashMap::new(),
             &HashSet::new(),
             &noop(),
             None,
@@ -741,8 +835,15 @@ mod tests {
     async fn test_expand_empty_graphs() {
         let dataset_id = Uuid::new_v4();
 
-        let (nodes, edges) =
-            expand_with_nodes_and_edges(vec![], dataset_id, &HashSet::new(), &noop(), None).await;
+        let (nodes, edges) = expand_with_nodes_and_edges(
+            vec![],
+            dataset_id,
+            &HashMap::new(),
+            &HashSet::new(),
+            &noop(),
+            None,
+        )
+        .await;
 
         assert_eq!(nodes.len(), 0);
         assert_eq!(edges.len(), 0);
@@ -787,6 +888,7 @@ mod tests {
         let (nodes, edges) = expand_with_nodes_and_edges(
             vec![(chunk_id, graph)],
             dataset_id,
+            &HashMap::new(),
             &HashSet::new(),
             &noop(),
             None,
@@ -834,6 +936,7 @@ mod tests {
         let (nodes, _edges) = expand_with_nodes_and_edges(
             vec![(chunk_id_a, graph_a), (chunk_id_b, graph_b)],
             dataset_id,
+            &HashMap::new(),
             &HashSet::new(),
             &noop(),
             None,
@@ -957,6 +1060,7 @@ mod tests {
         let (nodes, _edges) = expand_with_nodes_and_edges(
             vec![(chunk_id, graph)],
             dataset_id,
+            &HashMap::new(),
             &HashSet::new(),
             &resolver,
             None,
@@ -1020,6 +1124,7 @@ mod tests {
         let (nodes, _edges) = expand_with_nodes_and_edges(
             vec![(chunk_id, graph)],
             dataset_id,
+            &HashMap::new(),
             &HashSet::new(),
             &noop(),
             None,
@@ -1307,6 +1412,7 @@ mod tests {
         let (nodes, _edges) = expand_with_nodes_and_edges(
             vec![(chunk_id, graph)],
             dataset_id,
+            &HashMap::new(),
             &HashSet::new(),
             &resolver,
             None,
@@ -1355,6 +1461,7 @@ mod tests {
         let (_nodes, edges) = expand_with_nodes_and_edges(
             vec![(chunk_id, graph)],
             dataset_id,
+            &HashMap::new(),
             &HashSet::new(),
             &resolver,
             None,
@@ -1401,6 +1508,7 @@ mod tests {
         let (nodes, edges) = expand_with_nodes_and_edges(
             vec![(chunk_id, graph)],
             dataset_id,
+            &HashMap::new(),
             &HashSet::new(),
             &resolver,
             None,
@@ -1464,6 +1572,7 @@ mod tests {
         let (nodes, edges) = expand_with_nodes_and_edges(
             vec![(chunk_id, graph)],
             dataset_id,
+            &HashMap::new(),
             &HashSet::new(),
             &resolver,
             None,
@@ -1525,6 +1634,7 @@ mod tests {
         let (nodes, _edges) = expand_with_nodes_and_edges(
             vec![(chunk_id, graph)],
             dataset_id,
+            &HashMap::new(),
             &HashSet::new(),
             &resolver,
             None,
@@ -1560,6 +1670,7 @@ mod tests {
         let (nodes, _edges) = expand_with_nodes_and_edges(
             vec![(chunk_id, graph)],
             dataset_id,
+            &HashMap::new(),
             &HashSet::new(),
             &noop(),
             Some("alice@example.com"),

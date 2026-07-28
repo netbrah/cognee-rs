@@ -448,9 +448,28 @@ pub async fn extract_graph_from_data(
     let user_label_owned = user_label_override
         .map(|s| s.to_string())
         .or_else(|| input.user_id.as_ref().map(|id| id.to_string()));
+
+    // Map each source chunk to its NodeSet `belongs_to_set` so extracted
+    // entities inherit their chunk's NodeSet membership (parity with Python
+    // `Entity(belongs_to_set=data_chunk.belongs_to_set)` in
+    // expand_with_nodes_and_edges.py:227). Without this, a node_name-scoped
+    // HYBRID_COMPLETION search drops every extracted entity. Chunks with no
+    // NodeSet metadata are simply omitted.
+    let chunk_node_sets: HashMap<Uuid, Vec<serde_json::Value>> = chunks_for_extraction
+        .iter()
+        .filter_map(|chunk| {
+            chunk
+                .base
+                .belongs_to_set
+                .as_ref()
+                .map(|sets| (chunk.base.id, sets.clone()))
+        })
+        .collect();
+
     let (nodes, edges) = expand_with_nodes_and_edges(
         all_graphs,
         input.dataset_id,
+        &chunk_node_sets,
         &existing_edges_set,
         ontology_resolver.as_ref(),
         user_label_owned.as_deref(),
@@ -4502,6 +4521,7 @@ mod tests {
         let (_nodes, edges) = expand_with_nodes_and_edges(
             vec![(chunk_id, graph)],
             dataset_id,
+            &HashMap::new(),
             &HashSet::new(),
             &resolver,
             None,
