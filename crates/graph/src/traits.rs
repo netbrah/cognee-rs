@@ -43,14 +43,21 @@ pub(crate) fn extract_truth_alignment(value: Option<&Value>) -> Vec<f64> {
 
 /// Extract a `truth_epoch` version stamp from a stored JSON property.
 ///
-/// Accepts a JSON number or a numeric JSON string (e.g. `"3"`), matching
-/// Python's tolerance for stringly-typed epoch values. Anything missing or
-/// unparseable yields the `-1` "never scored" sentinel.
+/// Accepts a JSON integer, a float-encoded number (e.g. `3.0`, truncated toward
+/// zero to match Python's `int(epoch)` in the ladybug adapter), or a numeric
+/// JSON string (e.g. `"3"`), matching Python's tolerance for stringly-typed
+/// epoch values. Anything missing, non-numeric, or non-finite (`NaN`/`inf`)
+/// yields the `-1` "never scored" sentinel.
 pub(crate) fn extract_truth_epoch(value: Option<&Value>) -> i64 {
     match value {
         Some(v) => v
             .as_i64()
             .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+            // Float-encoded epochs (e.g. `3.0`) are rejected by `as_i64()`;
+            // truncate toward zero like Python's `int()`. Guard against
+            // `NaN`/`inf` so they fall through to the -1 sentinel instead of
+            // producing a bogus value.
+            .or_else(|| v.as_f64().filter(|f| f.is_finite()).map(|f| f as i64))
             .unwrap_or(-1),
         None => -1,
     }
@@ -917,5 +924,31 @@ mod tests {
             .await
             .unwrap();
         assert!(!missing.contains_key("ghost"));
+    }
+
+    #[test]
+    fn extract_truth_epoch_accepts_int_float_and_sentinels() {
+        use serde_json::json;
+
+        // Plain JSON integer is unchanged.
+        assert_eq!(extract_truth_epoch(Some(&json!(3))), 3);
+        // Numeric JSON string parses.
+        assert_eq!(extract_truth_epoch(Some(&json!("3"))), 3);
+        // Float-encoded epoch is accepted (matches Python `int(3.0)`).
+        assert_eq!(extract_truth_epoch(Some(&json!(3.0))), 3);
+        // Fractional float truncates toward zero (matches Python `int(3.9)`).
+        assert_eq!(extract_truth_epoch(Some(&json!(3.9))), 3);
+        assert_eq!(extract_truth_epoch(Some(&json!(-2.9))), -2);
+
+        // Non-numeric / missing values fall back to the -1 sentinel.
+        assert_eq!(extract_truth_epoch(Some(&json!("bad"))), -1);
+        assert_eq!(extract_truth_epoch(Some(&json!(null))), -1);
+        assert_eq!(extract_truth_epoch(None), -1);
+
+        // NaN/inf cannot be represented as a serde_json number
+        // (`Number::from_f64` returns None for them), so the `is_finite`
+        // guard is defensive: any `Value` that reaches `as_f64()` is finite.
+        assert!(serde_json::Number::from_f64(f64::NAN).is_none());
+        assert!(serde_json::Number::from_f64(f64::INFINITY).is_none());
     }
 }
