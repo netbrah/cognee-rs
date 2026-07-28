@@ -40,6 +40,15 @@ pub struct SearchParams {
     /// requires a single well-defined truth-subspace (per-dataset centroids).
     pub dataset_id: Option<Uuid>,
 
+    /// The full resolved dataset scope for this request (every requested id),
+    /// or `None` when the request is unscoped. Mirrors
+    /// `SearchRequest.dataset_ids` verbatim. Retrievers whose context items do
+    /// not otherwise carry per-item dataset membership (e.g. graph-derived
+    /// entities/facts in the hybrid lane) stamp this array onto their payloads
+    /// so downstream dataset-scope bucketing (`scope_context_by_datasets`)
+    /// retains them under scope instead of discarding them.
+    pub dataset_ids: Option<Vec<Uuid>>,
+
     /// Influence weight for feedback-based re-ranking.
     pub feedback_influence: Option<f32>,
 
@@ -132,6 +141,7 @@ impl From<&SearchRequest> for SearchParams {
                 Some(ids) if ids.len() == 1 => Some(ids[0]),
                 _ => None,
             },
+            dataset_ids: req.dataset_ids.clone(),
             feedback_influence: req.feedback_influence,
             max_iter: req
                 .retriever_specific_config
