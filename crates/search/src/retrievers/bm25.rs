@@ -575,6 +575,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tf_ordering_ranks_repeated_term_first() {
+        // Three chunks; A and B are equal length (4 tokens) so length
+        // normalization is identical and the ordering is driven purely by tf of
+        // "project": B has tf=3, A has tf=1. C never mentions "project".
+        let mock = Arc::new(MockGraphDB::new());
+        let a_id = add_chunk(&mock, "alpha alpha alpha project").await;
+        let b_id = add_chunk(&mock, "alpha project project project").await;
+        let c_id = add_chunk(&mock, "beta gamma delta").await;
+        let graph_db: Arc<dyn GraphDBTrait> = mock;
+
+        let results = bm25_scored_chunks(&graph_db, "project", 3).await;
+
+        // C scores 0 for "project" and is dropped by the post-sort filter.
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].0.get("id").and_then(Value::as_str),
+            Some(b_id.as_str()),
+            "higher tf chunk (B, tf=3) must rank first"
+        );
+        assert_eq!(
+            results[1].0.get("id").and_then(Value::as_str),
+            Some(a_id.as_str()),
+            "lower tf chunk (A, tf=1) must rank second"
+        );
+        let ids: Vec<Option<&str>> = results
+            .iter()
+            .map(|(payload, _)| payload.get("id").and_then(Value::as_str))
+            .collect();
+        assert!(
+            !ids.contains(&Some(c_id.as_str())),
+            "non-matching chunk C must be absent"
+        );
+    }
+
+    #[tokio::test]
+    async fn limit_truncates_to_top_scored() {
+        // Four equal-length (4-token) chunks with strictly increasing tf of
+        // "project" => strictly increasing, distinct positive BM25 scores.
+        let mock = Arc::new(MockGraphDB::new());
+        let low1_id = add_chunk(&mock, "project alpha beta gamma").await; // tf=1
+        let low2_id = add_chunk(&mock, "project project alpha beta").await; // tf=2
+        let hi2_id = add_chunk(&mock, "project project project alpha").await; // tf=3
+        let hi1_id = add_chunk(&mock, "project project project project").await; // tf=4
+        let graph_db: Arc<dyn GraphDBTrait> = mock;
+
+        let results = bm25_scored_chunks(&graph_db, "project", 2).await;
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].0.get("id").and_then(Value::as_str),
+            Some(hi1_id.as_str()),
+            "highest tf chunk (tf=4) must rank first"
+        );
+        assert_eq!(
+            results[1].0.get("id").and_then(Value::as_str),
+            Some(hi2_id.as_str()),
+            "second-highest tf chunk (tf=3) must rank second"
+        );
+        let ids: Vec<Option<&str>> = results
+            .iter()
+            .map(|(payload, _)| payload.get("id").and_then(Value::as_str))
+            .collect();
+        assert!(
+            !ids.contains(&Some(low1_id.as_str())) && !ids.contains(&Some(low2_id.as_str())),
+            "the two lower-scoring chunks must be truncated away"
+        );
+    }
+
+    #[tokio::test]
+    async fn nonmatching_query_returns_empty() {
+        // The query term is non-empty (not a stop word) so the empty-query
+        // early return does not fire; every chunk scores 0 for "kubernetes",
+        // so the result is emptied by the post-sort score > 0 filter instead.
+        let mock = Arc::new(MockGraphDB::new());
+        add_chunk(&mock, "rust memory safety").await;
+        add_chunk(&mock, "python asyncio").await;
+        let graph_db: Arc<dyn GraphDBTrait> = mock;
+
+        let results = bm25_scored_chunks(&graph_db, "kubernetes", 10).await;
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
     async fn corpus_is_rebuilt_fresh_each_call() {
         // Regression guard for decision 5: no cross-call cache. A second call
         // after new data lands must see it.
