@@ -1000,4 +1000,128 @@ mod tests {
         assert_eq!(wl.reason, Some(RejectionReason::AlreadyKnown));
         assert_eq!(wl.statement, "");
     }
+
+    // -----------------------------------------------------------------------
+    // `search_payload_texts` is module-private (not `pub(crate)`), so it is
+    // exercised here in the source-file unit test module — the smallest
+    // reachable path — rather than from the `tests/` integration file.
+    // -----------------------------------------------------------------------
+
+    use cognee_embedding::MockEmbeddingEngine;
+    use cognee_vector::{MockVectorDB, VectorPoint};
+
+    /// Sixteen-element vector matching `MockEmbeddingEngine::new(16)`. The engine
+    /// defaults to zero vectors, so every stored point scores identically and
+    /// `search_similar`'s stable sort returns them in insertion order — making
+    /// dedup/limit assertions deterministic.
+    fn v16() -> Vec<f32> {
+        vec![0.25_f32; 16]
+    }
+
+    fn session_learnings_tag() -> serde_json::Value {
+        serde_json::json!([{"id": "1", "name": DISTILLATE_NODE_SET, "type": "NodeSet"}])
+    }
+
+    fn other_tag() -> serde_json::Value {
+        serde_json::json!([{"id": "9", "name": "some_other_set", "type": "NodeSet"}])
+    }
+
+    /// `search_payload_texts` de-dups by casefold, honours the node-set filter,
+    /// respects `limit`, skips blank/absent text, and fails open to `[]` on a
+    /// failing embed or a missing collection.
+    #[tokio::test]
+    async fn search_payload_texts_dedups_limits_filters_and_fails_open() {
+        let db = MockVectorDB::new();
+        let engine = MockEmbeddingEngine::new(16);
+        db.create_collection("DocumentChunk", "text", 16)
+            .await
+            .unwrap();
+
+        // Insertion order defines result order (all points score equally):
+        // 1 tagged "Lesson One", two tagged case-variants of it, one tagged blank,
+        // one tagged "Lesson Two", and one NON-tagged "Untagged Lesson".
+        let points = vec![
+            VectorPoint::new(Uuid::new_v4(), v16())
+                .with_metadata("text", serde_json::json!("Lesson One"))
+                .with_metadata("belongs_to_set", session_learnings_tag()),
+            VectorPoint::new(Uuid::new_v4(), v16())
+                .with_metadata("text", serde_json::json!("lesson one"))
+                .with_metadata("belongs_to_set", session_learnings_tag()),
+            VectorPoint::new(Uuid::new_v4(), v16())
+                .with_metadata("text", serde_json::json!("Untagged Lesson"))
+                .with_metadata("belongs_to_set", other_tag()),
+            VectorPoint::new(Uuid::new_v4(), v16())
+                .with_metadata("text", serde_json::json!("   "))
+                .with_metadata("belongs_to_set", session_learnings_tag()),
+            VectorPoint::new(Uuid::new_v4(), v16())
+                .with_metadata("text", serde_json::json!("Lesson Two"))
+                .with_metadata("belongs_to_set", session_learnings_tag()),
+            VectorPoint::new(Uuid::new_v4(), v16())
+                .with_metadata("text", serde_json::json!("LESSON ONE"))
+                .with_metadata("belongs_to_set", session_learnings_tag()),
+        ];
+        db.index_points("DocumentChunk", "text", &points)
+            .await
+            .unwrap();
+
+        // filter = true (novelty search): only `session_learnings`-tagged rows,
+        // case-variants collapsed to one, blank skipped, untagged excluded.
+        let filtered =
+            search_payload_texts(&db, &engine, "DocumentChunk", "text", "q", 10, true).await;
+        assert_eq!(
+            filtered,
+            vec!["Lesson One".to_string(), "Lesson Two".to_string()],
+            "filter=true keeps only tagged, deduped, non-blank texts"
+        );
+
+        // `limit` truncates after dedup/filter: limit=1 yields just the first.
+        let limited =
+            search_payload_texts(&db, &engine, "DocumentChunk", "text", "q", 1, true).await;
+        assert_eq!(
+            limited,
+            vec!["Lesson One".to_string()],
+            "limit=1 returns exactly one text"
+        );
+
+        // filter = false (glossary search): tags ignored, so the untagged row is
+        // included; still deduped by casefold and blank still skipped.
+        let unfiltered =
+            search_payload_texts(&db, &engine, "DocumentChunk", "text", "q", 10, false).await;
+        assert_eq!(
+            unfiltered,
+            vec![
+                "Lesson One".to_string(),
+                "Untagged Lesson".to_string(),
+                "Lesson Two".to_string()
+            ],
+            "filter=false returns all deduped texts including the untagged one"
+        );
+
+        // Missing collection → fail open to [].
+        let missing =
+            search_payload_texts(&db, &engine, "NoSuchType", "name", "q", 10, false).await;
+        assert!(
+            missing.is_empty(),
+            "a missing collection fails open to an empty result"
+        );
+
+        // Failing embed → fail open to [] (a fresh engine so we don't poison the
+        // shared one, though it is unused hereafter).
+        let failing_engine = MockEmbeddingEngine::new(16);
+        failing_engine.set_failure_after(0);
+        let embed_failed = search_payload_texts(
+            &db,
+            &failing_engine,
+            "DocumentChunk",
+            "text",
+            "q",
+            10,
+            false,
+        )
+        .await;
+        assert!(
+            embed_failed.is_empty(),
+            "a failing embed fails open to an empty result (no search attempted)"
+        );
+    }
 }

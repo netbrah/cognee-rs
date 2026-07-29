@@ -32,6 +32,74 @@ use cognee_vector::MockVectorDB;
 use tempfile::TempDir;
 use uuid::Uuid;
 
+use async_trait::async_trait;
+use cognee_llm::{GenerationOptions, GenerationResponse, LlmError, Message};
+use serde_json::Value;
+
+/// In-test LLM double that dispatches on the request's JSON schema instead of a
+/// FIFO queue, so the full distill → publish → **cognify** path completes
+/// deterministically under the mock backends: the curator proposes one lesson,
+/// the writer accepts it, the summarizer returns a summary, and graph extraction
+/// returns an empty graph. Order-independence is the point — the queue-based
+/// [`MockLlm`] cannot satisfy cognify's summary call in a fixed position, so it
+/// can only be used where cognify is *expected* to fail open.
+#[derive(Clone)]
+struct SchemaDispatchLlm {
+    /// Statement the writer emits when it accepts (must be non-empty to publish).
+    accepted_statement: String,
+}
+
+#[async_trait]
+impl cognee_llm::Llm for SchemaDispatchLlm {
+    async fn generate(
+        &self,
+        _messages: Vec<Message>,
+        _options: Option<GenerationOptions>,
+    ) -> Result<GenerationResponse, LlmError> {
+        Ok(GenerationResponse {
+            content: "ok".to_string(),
+            model: "schema-dispatch".to_string(),
+            usage: None,
+            finish_reason: Some("stop".to_string()),
+        })
+    }
+
+    async fn create_structured_output_with_messages_raw(
+        &self,
+        _messages: Vec<Message>,
+        json_schema: &Value,
+        _options: Option<GenerationOptions>,
+    ) -> Result<Value, LlmError> {
+        let schema = json_schema.to_string();
+        if schema.contains("why_learned") {
+            // Writer/rejecter (`WrittenLesson`) → accept + write.
+            Ok(serde_json::json!({
+                "accept": true,
+                "statement": self.accepted_statement,
+                "entities": ["TerraScout"],
+                "why_learned": "learned while asking how indexing works",
+            }))
+        } else if schema.contains("working_statement") {
+            // Curator (`CuratorBatchOutput`) → one proposed lesson.
+            Ok(serde_json::json!({
+                "lessons": [{"working_statement": "TerraScout indexes nightly.", "member_entry_ids": []}]
+            }))
+        } else if schema.contains("summary") {
+            // Cognify summarization (`SummarizedContent`).
+            Ok(
+                serde_json::json!({"summary": "A test summary.", "description": "A test description."}),
+            )
+        } else {
+            // Cognify graph extraction → empty graph.
+            Ok(serde_json::json!({"nodes": [], "edges": []}))
+        }
+    }
+
+    fn model(&self) -> &str {
+        "schema-dispatch"
+    }
+}
+
 struct Harness {
     _temp: TempDir,
     _sess_dir: TempDir,
@@ -232,6 +300,167 @@ async fn distill_writer_rejects_yields_no_accepted_lessons() {
         .await
         .unwrap();
     assert!(ds.is_none(), "rejected lessons must not create a dataset");
+}
+
+/// Writer LLM returns non-JSON → `write_or_reject` fails **open** to `None`
+/// (the `Err → None` branch, distinct from a valid `accept:false` decision). No
+/// lesson is accepted, so the run gates at `NoAcceptedLessons` with no dataset —
+/// a failed writer call must never abort `distill_session` (it returns `Ok`, not
+/// `Err`) nor be treated as an acceptance.
+#[tokio::test]
+async fn distill_writer_failopen_yields_no_accepted_lessons() {
+    let h = make_harness().await;
+    let owner = Uuid::new_v4();
+    let user_id = owner.to_string();
+    let session_id = "sess_writer_failopen";
+
+    h.session_store
+        .create_qa_entry(
+            session_id,
+            Some(&user_id),
+            "Who is Alice?",
+            "Alice is an engineer.",
+            None,
+        )
+        .await
+        .unwrap();
+
+    // 1) curator proposes exactly one lesson (valid structured output);
+    // 2) writer response is NOT valid JSON → the writer call fails open to None.
+    let llm: Arc<dyn Llm> = Arc::new(MockLlm::new(vec![
+        r#"{"lessons":[{"working_statement":"Alice is an engineer.","member_entry_ids":[]}]}"#
+            .to_string(),
+        "this is not valid json for the writer schema".to_string(),
+    ]));
+    let config = CognifyConfig::default();
+
+    let res = distill_session(
+        session_id,
+        "ds_writer_failopen",
+        owner,
+        None,
+        Arc::clone(&h.session_store),
+        &h.add_pipeline,
+        llm,
+        Arc::clone(&h.storage),
+        h.graph_db.clone() as Arc<_>,
+        h.vector_db.clone() as Arc<_>,
+        h.embedding_engine.clone() as Arc<_>,
+        Arc::clone(&h.db),
+        noop_repo(),
+        thread_pool(),
+        Arc::clone(&h.ontology),
+        &config,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(res.status, DistillationStatus::NoAcceptedLessons);
+    assert!(res.documents.is_empty());
+    assert!(res.dataset_id.is_none());
+    // No dataset created — the fail-open writer produced no accepted lesson, so
+    // add/cognify never ran.
+    let ds = ds_ops::get_dataset_by_name(h.db.as_ref(), "ds_writer_failopen", owner, None)
+        .await
+        .unwrap();
+    assert!(
+        ds.is_none(),
+        "a fail-open (Err→None) writer call must not create a dataset"
+    );
+}
+
+/// Multi-session fail-open isolation: session A has Q&A + an accepted lesson
+/// (publishes exactly one document); session B has no Q&A (gates at
+/// `NoQaEntries` and contributes nothing). The aggregate reflects only A, and
+/// A's dataset carries BOTH node-set tags — B's empty gate never disturbs A.
+#[tokio::test]
+async fn distill_sessions_failopen_isolates_sessions() {
+    let h = make_harness().await;
+    let owner = Uuid::new_v4();
+    let user_id = owner.to_string();
+    let session_a = "sess_iso_a";
+    let session_b = "sess_iso_b";
+
+    // Session A gets one Q&A turn; session B gets none.
+    h.session_store
+        .create_qa_entry(
+            session_a,
+            Some(&user_id),
+            "How does TerraScout index data?",
+            "TerraScout indexes nightly.",
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Schema-dispatch LLM so A's publish (add + cognify) fully completes: curator
+    // proposes one lesson, writer accepts, cognify's summary + graph-extraction
+    // calls are satisfied. B makes no LLM call (it gates at NoQaEntries first).
+    let llm: Arc<dyn Llm> = Arc::new(SchemaDispatchLlm {
+        accepted_statement: "TerraScout indexes data nightly.".to_string(),
+    });
+    let config = CognifyConfig::default();
+
+    let r = distill_sessions_in_knowledge_graph(
+        &[session_a.to_string(), session_b.to_string()],
+        "ds_iso",
+        owner,
+        None,
+        Arc::clone(&h.session_store),
+        &h.add_pipeline,
+        llm,
+        Arc::clone(&h.storage),
+        h.graph_db.clone() as Arc<_>,
+        h.vector_db.clone() as Arc<_>,
+        h.embedding_engine.clone() as Arc<_>,
+        Arc::clone(&h.db),
+        noop_repo(),
+        thread_pool(),
+        Arc::clone(&h.ontology),
+        &config,
+    )
+    .await;
+
+    // Only session A produced documents; B's NoQaEntries gate is invisible to
+    // the aggregate.
+    assert_eq!(
+        r.sessions_distilled, 1,
+        "only session A (with Q&A + accepted lesson) distilled"
+    );
+    assert_eq!(
+        r.lessons_published, 1,
+        "session A published exactly one lesson; B published none"
+    );
+
+    // A's dataset holds the single rendered lesson Data row, tagged with BOTH the
+    // generic and the per-session node-set.
+    let ds = ds_ops::get_dataset_by_name(h.db.as_ref(), "ds_iso", owner, None)
+        .await
+        .unwrap()
+        .expect("dataset exists after session A publishes");
+    let data_items = ds_ops::get_dataset_data(h.db.as_ref(), ds.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        data_items.len(),
+        1,
+        "exactly one distilled-lesson Data row from session A"
+    );
+    let per_session_tag = format!("{DISTILLATE_NODE_SET}:{session_a}");
+    let has_both = data_items.iter().any(|d| {
+        d.node_set
+            .as_deref()
+            .map(|s| s.contains(DISTILLATE_NODE_SET) && s.contains(&per_session_tag))
+            .unwrap_or(false)
+    });
+    assert!(
+        has_both,
+        "expected A's Data row tagged with both '{DISTILLATE_NODE_SET}' and '{per_session_tag}'; got {:?}",
+        data_items
+            .iter()
+            .map(|d| d.node_set.clone())
+            .collect::<Vec<_>>()
+    );
 }
 
 /// Full curate → propose → accept → publish happy path: the accepted lesson is
