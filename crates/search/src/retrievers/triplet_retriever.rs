@@ -241,6 +241,15 @@ mod tests {
 
     #[async_trait]
     impl VectorDB for TestVectorDb {
+        async fn retrieve(
+            &self,
+            _data_type: &str,
+            _field_name: &str,
+            _ids: &[Uuid],
+        ) -> VectorDBResult<Vec<SearchResult>> {
+            Ok(vec![])
+        }
+
         async fn create_collection(
             &self,
             _data_type: &str,

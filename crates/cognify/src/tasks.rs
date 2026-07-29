@@ -218,6 +218,8 @@ pub async fn extract_chunks_from_documents(
                 if document.base.belongs_to_set.is_some() {
                     chunk.base.belongs_to_set = document.base.belongs_to_set.clone();
                 }
+                // Propagate importance_weight (always Some after classify) — unconditional.
+                chunk.base.importance_weight = document.base.importance_weight;
                 // Token count write-back
                 if let Some(db) = db
                     && let Err(e) = cognee_database::ops::data::update_data_token_count(
@@ -273,6 +275,12 @@ pub async fn extract_chunks_from_documents(
             for chunk in &mut chunks {
                 chunk.base.belongs_to_set = document.base.belongs_to_set.clone();
             }
+        }
+
+        // Propagate importance_weight from Document to each DocumentChunk
+        // (always Some after classify) — unconditional, unlike belongs_to_set.
+        for chunk in &mut chunks {
+            chunk.base.importance_weight = document.base.importance_weight;
         }
 
         // Accumulate token count and write back to the Data record.
@@ -440,9 +448,39 @@ pub async fn extract_graph_from_data(
     let user_label_owned = user_label_override
         .map(|s| s.to_string())
         .or_else(|| input.user_id.as_ref().map(|id| id.to_string()));
+
+    // Map each source chunk to its NodeSet `belongs_to_set` so extracted
+    // entities inherit their chunk's NodeSet membership (parity with Python
+    // `Entity(belongs_to_set=data_chunk.belongs_to_set)` in
+    // expand_with_nodes_and_edges.py:227). Without this, a node_name-scoped
+    // HYBRID_COMPLETION search drops every extracted entity. Chunks with no
+    // NodeSet metadata are simply omitted.
+    let chunk_node_sets: HashMap<Uuid, Vec<serde_json::Value>> = chunks_for_extraction
+        .iter()
+        .filter_map(|chunk| {
+            chunk
+                .base
+                .belongs_to_set
+                .as_ref()
+                .map(|sets| (chunk.base.id, sets.clone()))
+        })
+        .collect();
+
+    // Map each source chunk to its `importance_weight` so every extracted
+    // EntityType / Entity / ontology node inherits it (parity with Python
+    // `importance_weight=data_chunk.importance_weight` in
+    // expand_with_nodes_and_edges.py:66,79,163,229). Default 0.5 when None,
+    // matching Python's `DataPoint.importance_weight` default.
+    let chunk_importance_weights: HashMap<Uuid, f64> = chunks_for_extraction
+        .iter()
+        .map(|chunk| (chunk.base.id, chunk.base.importance_weight.unwrap_or(0.5)))
+        .collect();
+
     let (nodes, edges) = expand_with_nodes_and_edges(
         all_graphs,
         input.dataset_id,
+        &chunk_node_sets,
+        &chunk_importance_weights,
         &existing_edges_set,
         ontology_resolver.as_ref(),
         user_label_owned.as_deref(),
@@ -1559,18 +1597,10 @@ pub async fn add_temporal_data_points(
 /// prefer the nonblank `edge_text` property, fall back to the nonblank
 /// `relationship_name`, else return an empty string (caller drops empties).
 fn edge_retrieval_text(edge_pair: &GraphEdgePair) -> String {
-    let from_edge_text = edge_pair
-        .properties
-        .get("edge_text")
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty());
-
-    if let Some(text) = from_edge_text {
-        return text.to_string();
-    }
-
-    let rel = edge_pair.relationship_name.trim();
-    rel.to_string()
+    EdgeType::retrieval_text(
+        edge_pair.properties.get("edge_text").map(String::as_str),
+        &edge_pair.relationship_name,
+    )
 }
 
 /// Build minimal edge properties for graph storage.
@@ -2924,6 +2954,10 @@ async fn index_data_points(
                 if let Some(made_from) = summary.made_from {
                     point = point.with_metadata("chunk_id", json!(made_from.to_string()));
                 }
+                if let Some(source_chunk_id) = summary.source_chunk_id {
+                    point =
+                        point.with_metadata("source_chunk_id", json!(source_chunk_id.to_string()));
+                }
                 if let Some(uid) = user_id {
                     point = point.with_metadata("user_id", json!(uid.to_string()));
                 }
@@ -3750,6 +3784,7 @@ mod tests {
         let doc_id = Uuid::new_v4();
         let mut base = DataPoint::new("TextDocument", None);
         base.id = doc_id;
+        base.importance_weight = Some(0.9);
         base.set_metadata("index_fields", serde_json::json!(["name"]));
         let doc = Document {
             base,
@@ -3781,6 +3816,14 @@ mod tests {
         .await
         .unwrap();
         assert!(!result.chunks.is_empty());
+        // importance_weight propagates from Document to every chunk (regular path).
+        assert!(
+            result
+                .chunks
+                .iter()
+                .all(|c| c.base.importance_weight == Some(0.9)),
+            "every chunk must inherit the document's importance_weight"
+        );
     }
 
     /// Drives the cognify-level provenance wrapper (`upsert_provenance`) and its
@@ -3884,6 +3927,7 @@ mod tests {
         let doc_id = Uuid::new_v4();
         let mut base = DataPoint::new("DltRowDocument", None);
         base.id = doc_id;
+        base.importance_weight = Some(0.7);
         base.set_metadata("index_fields", serde_json::json!(["text"]));
         let doc = Document {
             base,
@@ -3921,6 +3965,8 @@ mod tests {
         assert_eq!(chunk.cut_type, "dlt_row");
         assert_eq!(chunk.chunk_index, 0);
         assert_eq!(chunk.document_id, doc_id);
+        // importance_weight propagates on the DLT short-circuit path too.
+        assert_eq!(chunk.base.importance_weight, Some(0.7));
     }
 
     #[tokio::test]
@@ -4222,6 +4268,66 @@ mod tests {
         assert_eq!(engine.embedded_text_count(), 6);
     }
 
+    // The TextSummary vector payload must carry both `chunk_id` (back-compat)
+    // and the new `source_chunk_id` key with identical string values, so the
+    // hybrid pairing algorithm can join a summary hit to its source chunk.
+    #[tokio::test]
+    async fn summary_payload_carries_chunk_id_and_source_chunk_id() {
+        use cognee_embedding::MockEmbeddingEngine;
+        use cognee_vector::MockVectorDB;
+
+        let engine = Arc::new(MockEmbeddingEngine::new(8));
+        let engine_dyn: Arc<dyn EmbeddingEngine> = engine.clone();
+        let mock = Arc::new(MockVectorDB::new());
+        let vector: Arc<dyn VectorDB> = mock.clone();
+
+        let doc_id = Uuid::new_v4();
+        let chunks = vec![test_chunk(Uuid::new_v4(), doc_id, "chunk text")];
+
+        let chunk_id = chunks[0].base.id;
+        let summaries = vec![TextSummary::new(
+            chunk_id,
+            "a summary".to_string(),
+            None,
+            "mock-model".to_string(),
+        )];
+        let summary_id = summaries[0].base.id;
+
+        let dataset_id = Uuid::new_v4();
+        let config = CognifyConfig::default();
+
+        let embeddings = generate_embeddings(&chunks, &[], &summaries, engine_dyn.clone())
+            .await
+            .unwrap();
+
+        index_data_points(
+            &chunks,
+            &[],
+            &summaries,
+            &[],
+            &[],
+            &[],
+            dataset_id,
+            None,
+            None,
+            engine_dyn,
+            vector,
+            &config,
+            &embeddings,
+        )
+        .await
+        .unwrap();
+
+        let payload = mock
+            .get_payload("TextSummary", "text", summary_id)
+            .expect("summary point must be indexed");
+
+        let expected = json!(chunk_id.to_string());
+        assert_eq!(payload.get("chunk_id"), Some(&expected));
+        assert_eq!(payload.get("source_chunk_id"), Some(&expected));
+        assert_eq!(payload.get("chunk_id"), payload.get("source_chunk_id"));
+    }
+
     // Prints a before/after embedding-work comparison for a realistic fixture.
     // The "before" run passes an empty precomputed slice, which reproduces the
     // pre-fix double pass (index_data_points re-embeds everything); the "after"
@@ -4426,6 +4532,8 @@ mod tests {
         let (_nodes, edges) = expand_with_nodes_and_edges(
             vec![(chunk_id, graph)],
             dataset_id,
+            &HashMap::new(),
+            &HashMap::new(),
             &HashSet::new(),
             &resolver,
             None,

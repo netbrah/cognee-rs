@@ -26,6 +26,8 @@ pub struct MockGraphDB {
     nodes: Arc<Mutex<HashMap<String, NodeData>>>,
     edges: Arc<Mutex<Vec<EdgeData>>>,
     call_log: Arc<Mutex<Vec<String>>>,
+    /// Optional injected error returned from `get_node_truth_state` calls.
+    truth_state_error: Arc<Mutex<Option<String>>>,
 }
 
 impl MockGraphDB {
@@ -35,7 +37,15 @@ impl MockGraphDB {
             nodes: Arc::new(Mutex::new(HashMap::new())),
             edges: Arc::new(Mutex::new(Vec::new())),
             call_log: Arc::new(Mutex::new(Vec::new())),
+            truth_state_error: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Inject an error that will be returned from subsequent
+    /// `get_node_truth_state` calls as `GraphDBError::QueryError`.
+    pub fn set_truth_state_error(&self, msg: impl Into<String>) {
+        let mut slot = self.truth_state_error.lock().unwrap(); // lock poison is unrecoverable
+        *slot = Some(msg.into());
     }
 
     /// Get the current node count (for testing).
@@ -58,7 +68,9 @@ impl MockGraphDB {
     /// Get a snapshot of the call log — the names of methods invoked on
     /// this mock in invocation order.
     ///
-    /// Currently records `"get_graph_data"` and `"get_nodeset_subgraph"`.
+    /// Currently records `"get_graph_data"`, `"get_nodeset_subgraph"`,
+    /// `"get_neighborhood"`, `"get_node_truth_state"`, and
+    /// `"set_node_truth_state"`.
     pub fn get_call_log(&self) -> Vec<String> {
         self.call_log.lock().unwrap().clone() // lock poison is unrecoverable
     }
@@ -484,6 +496,149 @@ impl GraphDBTrait for MockGraphDB {
 
         Ok((node_vec, edge_vec))
     }
+
+    async fn get_neighborhood(
+        &self,
+        node_ids: &[String],
+        depth: usize,
+    ) -> GraphDBResult<(Vec<(String, NodeData)>, Vec<EdgeData>)> {
+        self.call_log
+            .lock()
+            .unwrap() // lock poison is unrecoverable
+            .push("get_neighborhood".to_string());
+
+        if node_ids.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        let nodes_guard = self.nodes.lock().unwrap(); // lock poison is unrecoverable
+        let edges_guard = self.edges.lock().unwrap(); // lock poison is unrecoverable
+
+        // Hand-rolled BFS directly against the internal edge store. We must NOT
+        // delegate to `get_connections`, which drops `relationship_name`. Edges
+        // are pushed as their unmodified `(src, tgt, rel, props)` tuples, so the
+        // true stored direction is preserved by construction.
+        let mut nodes_by_id: HashMap<String, NodeData> = HashMap::new();
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut frontier: Vec<String> = Vec::new();
+
+        for id in node_ids {
+            if visited.insert(id.clone()) {
+                frontier.push(id.clone());
+                // Seed lookup so isolated seeds still appear in the output.
+                if let Some(data) = nodes_guard.get(id) {
+                    nodes_by_id.insert(id.clone(), data.clone());
+                }
+            }
+        }
+
+        let mut edges: Vec<EdgeData> = Vec::new();
+        let mut edge_keys: HashSet<(String, String, String)> = HashSet::new();
+
+        for _ in 0..depth {
+            let frontier_set: HashSet<&String> = frontier.iter().collect();
+            let mut next_frontier: Vec<String> = Vec::new();
+
+            for (src, tgt, rel, props) in edges_guard.iter() {
+                let src_in = frontier_set.contains(src);
+                let tgt_in = frontier_set.contains(tgt);
+                if !src_in && !tgt_in {
+                    continue;
+                }
+
+                let key = (src.clone(), tgt.clone(), rel.clone());
+                if edge_keys.insert(key) {
+                    edges.push((src.clone(), tgt.clone(), rel.clone(), props.clone()));
+                }
+
+                if let Some(data) = nodes_guard.get(src) {
+                    nodes_by_id.insert(src.clone(), data.clone());
+                }
+                if let Some(data) = nodes_guard.get(tgt) {
+                    nodes_by_id.insert(tgt.clone(), data.clone());
+                }
+
+                // Enqueue the endpoint that isn't in the current frontier.
+                if src_in && visited.insert(tgt.clone()) {
+                    next_frontier.push(tgt.clone());
+                }
+                if tgt_in && visited.insert(src.clone()) {
+                    next_frontier.push(src.clone());
+                }
+            }
+
+            if next_frontier.is_empty() {
+                break;
+            }
+            frontier = next_frontier;
+        }
+
+        Ok((nodes_by_id.into_iter().collect(), edges))
+    }
+
+    async fn get_node_truth_state(
+        &self,
+        node_ids: &[String],
+    ) -> GraphDBResult<HashMap<String, crate::NodeTruthState>> {
+        self.call_log
+            .lock()
+            .unwrap() // lock poison is unrecoverable
+            .push("get_node_truth_state".to_string());
+
+        // Error-injection hook for tests: fail before any read.
+        {
+            let slot = self.truth_state_error.lock().unwrap(); // lock poison is unrecoverable
+            if let Some(msg) = slot.as_ref() {
+                return Err(GraphDBError::QueryError(msg.clone()));
+            }
+        }
+
+        let nodes = self.nodes.lock().unwrap(); // lock poison is unrecoverable
+        let mut out = HashMap::with_capacity(node_ids.len());
+        for id in node_ids {
+            if let Some(node) = nodes.get(id) {
+                out.insert(
+                    id.clone(),
+                    crate::NodeTruthState {
+                        truth_alignment: crate::traits::extract_truth_alignment(
+                            node.get("truth_alignment"),
+                        ),
+                        truth_epoch: crate::traits::extract_truth_epoch(node.get("truth_epoch")),
+                    },
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    async fn set_node_truth_state(
+        &self,
+        updates: &HashMap<String, crate::NodeTruthState>,
+    ) -> GraphDBResult<HashMap<String, bool>> {
+        self.call_log
+            .lock()
+            .unwrap() // lock poison is unrecoverable
+            .push("set_node_truth_state".to_string());
+
+        let mut nodes = self.nodes.lock().unwrap(); // lock poison is unrecoverable
+        let mut out = HashMap::with_capacity(updates.len());
+        for (id, state) in updates {
+            if let Some(node) = nodes.get_mut(id) {
+                node.insert(
+                    Cow::Borrowed("truth_alignment"),
+                    serde_json::json!(state.truth_alignment),
+                );
+                node.insert(
+                    Cow::Borrowed("truth_epoch"),
+                    serde_json::json!(state.truth_epoch),
+                );
+                out.insert(id.clone(), true);
+            } else {
+                out.insert(id.clone(), false);
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -729,6 +884,96 @@ mod tests {
         let db = MockGraphDB::new();
         let orphans = db.get_zero_degree_edge_type_nodes().await.unwrap();
         assert!(orphans.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_neighborhood_preserves_edge_direction() {
+        let db = MockGraphDB::new();
+        db.add_node_raw(serde_json::json!({"id": "seed", "type": "T"}))
+            .await
+            .unwrap();
+        db.add_node_raw(serde_json::json!({"id": "target", "type": "T"}))
+            .await
+            .unwrap();
+        db.add_node_raw(serde_json::json!({"id": "source", "type": "T"}))
+            .await
+            .unwrap();
+
+        // seed is the stored TARGET of source->seed and the stored SOURCE of
+        // seed->target — the exact shape that would flip under a source-as-
+        // queried-node bug.
+        db.add_edge("seed", "target", "out", None).await.unwrap();
+        db.add_edge("source", "seed", "in", None).await.unwrap();
+
+        let (nodes, edges) = db.get_neighborhood(&["seed".to_string()], 1).await.unwrap();
+
+        let node_ids: HashSet<&str> = nodes.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(node_ids.len(), 3);
+        assert!(node_ids.contains("seed"));
+        assert!(node_ids.contains("target"));
+        assert!(node_ids.contains("source"));
+
+        let edge_set: HashSet<(&str, &str, &str)> = edges
+            .iter()
+            .map(|(s, t, r, _)| (s.as_str(), t.as_str(), r.as_str()))
+            .collect();
+        assert!(edge_set.contains(&("source", "seed", "in")));
+        assert!(edge_set.contains(&("seed", "target", "out")));
+        // Flipped forms must be absent (locked-decision-6 anti-flip guard).
+        assert!(!edge_set.contains(&("seed", "source", "in")));
+        assert!(!edge_set.contains(&("target", "seed", "out")));
+
+        assert!(db.get_call_log().contains(&"get_neighborhood".to_string()));
+    }
+
+    #[tokio::test]
+    async fn get_neighborhood_includes_relationship_name() {
+        let db = MockGraphDB::new();
+        db.add_node_raw(serde_json::json!({"id": "a", "type": "T"}))
+            .await
+            .unwrap();
+        db.add_node_raw(serde_json::json!({"id": "b", "type": "T"}))
+            .await
+            .unwrap();
+        db.add_edge("a", "b", "connects_to", None).await.unwrap();
+
+        let (_nodes, edges) = db.get_neighborhood(&["a".to_string()], 1).await.unwrap();
+        assert_eq!(edges.len(), 1);
+        // Guards against the get_connections relationship-name-drop gap: the
+        // mock override must carry the stored rel name through.
+        assert!(!edges[0].2.is_empty());
+        assert_eq!(edges[0].2, "connects_to");
+    }
+
+    #[tokio::test]
+    async fn node_truth_state_round_trip_and_logs_calls() {
+        let db = MockGraphDB::new();
+        db.add_node_raw(serde_json::json!({"id": "n1", "type": "T"}))
+            .await
+            .unwrap();
+
+        let mut updates = HashMap::new();
+        updates.insert(
+            "n1".to_string(),
+            crate::NodeTruthState {
+                truth_alignment: vec![0.5, 1.5],
+                truth_epoch: 7,
+            },
+        );
+        // Missing node reports false; present node reports true.
+        updates.insert("ghost".to_string(), crate::NodeTruthState::default());
+        let set_res = db.set_node_truth_state(&updates).await.unwrap();
+        assert_eq!(set_res.get("n1"), Some(&true));
+        assert_eq!(set_res.get("ghost"), Some(&false));
+
+        let got = db.get_node_truth_state(&["n1".to_string()]).await.unwrap();
+        let state = got.get("n1").expect("n1 present");
+        assert_eq!(state.truth_alignment, vec![0.5, 1.5]);
+        assert_eq!(state.truth_epoch, 7);
+
+        let log = db.get_call_log();
+        assert!(log.contains(&"set_node_truth_state".to_string()));
+        assert!(log.contains(&"get_node_truth_state".to_string()));
     }
 
     #[tokio::test]

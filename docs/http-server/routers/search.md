@@ -1,6 +1,6 @@
 # Router: search
 
-The `/api/v1/search` router is the primary read-path entry point. `POST /` runs a semantic search across the user's knowledge graph using one of fifteen `SearchType` strategies and persists the question/answer pair to the search history. `GET /` returns the last 50 history rows. Compared to `/api/v1/recall`, this router does **not** auto-route the query type (the caller picks one explicitly via `search_type`) and does **not** perform session-first lookup; recall layers both on top of the same underlying `SearchOrchestrator`.
+The `/api/v1/search` router is the primary read-path entry point. `POST /` runs a semantic search across the user's knowledge graph using one of sixteen `SearchType` strategies and persists the question/answer pair to the search history. `GET /` returns the last 50 history rows. Compared to `/api/v1/recall`, this router does **not** auto-route the query type (the caller picks one explicitly via `search_type`) and does **not** perform session-first lookup; recall layers both on top of the same underlying `SearchOrchestrator`.
 
 Companion docs: [../architecture.md](../architecture.md), [../auth.md](../auth.md), [../tenants.md](../tenants.md), [../observability.md](../observability.md).
 
@@ -73,7 +73,7 @@ Companion docs: [../architecture.md](../architecture.md), [../auth.md](../auth.m
 - **Validation rules**:
   - `top_k`: when supplied, must be a positive integer (`> 0`). Python's underlying `search()` accepts any int but yields an empty list for `top_k <= 0`; Rust returns `400 BadRequest` with `detail="top_k must be positive"`. Cross-SDK note: this is a Rust strictness add — flag in §6.
   - `dataset_ids`: when supplied alongside `datasets`, the Python search function logs a warning and prefers `dataset_ids`. Rust matches: if both are non-empty, `dataset_ids` wins and `datasets` is silently ignored ([orchestrator §141-160](../../../crates/search/src/orchestration/search_orchestrator.rs)).
-  - `search_type`: must be one of the 14 wire variants below. Unknown values (including `"FEEDBACK"`) produce `422 ValidationError` from the custom `Json` extractor (matches Python's `RequestValidationError` handler).
+  - `search_type`: must be one of the 15 wire variants below. Unknown values (including `"FEEDBACK"`) produce `422 ValidationError` from the custom `Json` extractor (matches Python's `RequestValidationError` handler).
   - `query`: max length 100,000 chars (Rust safety cap — Python has no explicit limit). If exceeded, return `400`. Document in §6.
 - **Rate / size limits**: default body limit 100 MiB (architecture default). Per-handler request rate not enforced — see §6.
 - **Permission gate**: `state.lib.permissions().visible_datasets(user.id, "read")` is computed inside the orchestrator's `dataset_resolver` when `datasets` / `dataset_ids` are supplied. Datasets the user cannot read are silently dropped (Python: `get_authorized_existing_datasets("read", user)`). When the resulting set is empty, the orchestrator returns `Err(PermissionDenied)` which the handler maps to `403`.
@@ -200,9 +200,21 @@ pub struct ErrorResponseDTO {
 }
 ```
 
+> **`HYBRID_COMPLETION` tuning knobs are not wire fields.** The hybrid
+> retriever's per-request knobs (`chunks_top_k`, `entities_top_k`, `facts_top_k`,
+> `max_edges_per_entity`, `text_summaries_top_k`, `use_importance_weight`,
+> plus the reserved `use_truth_weight` / `include_global_context_index` /
+> `global_context_index_top_k`) are **not** added to `SearchPayloadDTO`. They are
+> typed fields on the library-side `SearchParams`, populated from the snake_case
+> keys inside `SearchRequest.retriever_specific_config` — which every HTTP / CLI /
+> binding adapter currently hardcodes to `None`. So in Phase 1 they are reachable
+> only by a direct Rust library caller — the same class as the library-only
+> `response_schema` field (see §6 Q4) and the orchestrator-only `neighborhood_depth`
+> (see [configuration.md §Search — hybrid retriever knobs](../../configuration.md#search--hybrid-retriever-knobs)).
+
 ### `SearchType` wire shapes
 
-The wire-facing `WireSearchType` enum is defined locally in [`crates/http-server/src/dto/search.rs`](../../../crates/http-server/src/dto/search.rs) with `#[serde(rename_all = "SCREAMING_SNAKE_CASE")]` and converts into the core [`cognee_search::types::SearchType`](../../../crates/search/src/types/search_type.rs) via `From`. Wire values match Python's [`SearchType`](https://github.com/topoteretes/cognee/blob/main/cognee/modules/search/types/SearchType.py) byte-for-byte. The wire DTO exposes **14** variants — the core Rust enum's extra `Feedback` variant is intentionally dropped from the wire (see the `FEEDBACK` row below):
+The wire-facing `WireSearchType` enum is defined locally in [`crates/http-server/src/dto/search.rs`](../../../crates/http-server/src/dto/search.rs) with `#[serde(rename_all = "SCREAMING_SNAKE_CASE")]` and converts into the core [`cognee_search::types::SearchType`](../../../crates/search/src/types/search_type.rs) via `From`. Wire values match Python's [`SearchType`](https://github.com/topoteretes/cognee/blob/main/cognee/modules/search/types/SearchType.py) byte-for-byte. The wire DTO exposes **15** variants — the core Rust enum's extra `Feedback` variant is intentionally dropped from the wire (see the `FEEDBACK` row below):
 
 | Wire value (string) | Rust enum variant | Python `SearchType` | Rust status | Notes |
 |---|---|---|---|---|
@@ -221,8 +233,9 @@ The wire-facing `WireSearchType` enum is defined locally in [`crates/http-server
 | `"FEEDBACK"` | `Feedback` (core enum only) | (no Python equivalent) | Not on the wire | The core `cognee_search::types::SearchType` has a `Feedback` variant, but `WireSearchType` **does not** include it: posting `"FEEDBACK"` deserializes as a validation error (`test_feedback_variant_is_dropped_from_wire`). Library callers reach `SearchType::Feedback` via the core enum directly. **See §6 Q1.** |
 | `"CODING_RULES"` | `CodingRules` | `CODING_RULES` | Implemented | Returns a `Vec<RulePayload>` matching the `Rule {node_set, text}` schema. Used by IDE plugins. |
 | `"CHUNKS_LEXICAL"` | `ChunksLexical` | `CHUNKS_LEXICAL` | Implemented | BM25 / lexical chunk retrieval (no embedding). Returns `Vec<ChunkPayload>`. |
+| `"HYBRID_COMPLETION"` | `HybridCompletion` | `HYBRID_COMPLETION` | Implemented | Per-query BM25 lexical pass over chunks + vector search over chunks/entities/edge-facts + 1-hop graph-neighborhood expansion around matched entities, answered via LLM completion. `search_result` is a `String`. Tuning knobs are `SearchParams` / `retriever_specific_config` keys, **not** wire fields — see the note below and configuration.md §Search. |
 
-Per the project guide, **9 of the 14** wire variants are covered by the E2E search-matrix test. The remaining 5 (`Cypher`, `NaturalLanguage`, `FeelingLucky`, `CodingRules`, `ChunksLexical`) have unit-level coverage but no cross-SDK comparison yet. Cross-SDK parity tests for the missing 5 should land in the same PR as the HTTP server (see §5 task list).
+Per the project guide, **9 of the 15** wire variants are covered by the E2E search-matrix test. The remaining 6 (`Cypher`, `NaturalLanguage`, `FeelingLucky`, `CodingRules`, `ChunksLexical`, and `HybridCompletion`) have unit-level coverage but no cross-SDK comparison yet (`HybridCompletion` is backed by `HybridRetriever` with unit + integration coverage, but no cross-SDK comparison yet — that is Phase 2+ scope). Cross-SDK parity tests for the missing types should land in the same PR as the HTTP server (see §5 task list).
 
 ### Wire shape of `search_result` (per retriever)
 
@@ -232,7 +245,7 @@ The orchestrator returns `SearchResponse { search_type, result: SearchOutput, ..
 #[serde(tag = "kind", content = "data")]
 pub enum SearchOutput {
     Items(Vec<SearchItem>),       // CHUNKS, SUMMARIES, TRIPLET_COMPLETION, CHUNKS_LEXICAL, TEMPORAL, CODING_RULES
-    Text(String),                 // GRAPH_COMPLETION, GRAPH_COMPLETION_COT, GRAPH_SUMMARY_COMPLETION, RAG_COMPLETION, FEELING_LUCKY
+    Text(String),                 // GRAPH_COMPLETION, GRAPH_COMPLETION_COT, GRAPH_SUMMARY_COMPLETION, RAG_COMPLETION, FEELING_LUCKY, HYBRID_COMPLETION
     Texts(Vec<String>),           // not currently emitted by any retriever
     GraphQueryRows(Vec<Vec<Value>>), // CYPHER, NATURAL_LANGUAGE
     Rules(Vec<Rule>),             // CODING_RULES (alternate path)
@@ -278,13 +291,51 @@ This flattening is the responsibility of `crates/http-server/src/dto/search.rs::
 5. **`session_id` on search**: Python's `search()` library function accepts `session_id`, but the HTTP DTO does not expose it. Rust matches: no `session_id` on `SearchPayloadDTO`. Confirmed.
 6. **History `limit` query param**: Python does not paginate the history endpoint. Rust matches — no `?limit=N` query parameter. Frontends needing pagination must implement client-side slicing.
 
-## 7. References
+## 7. Known limitations — `HYBRID_COMPLETION`
+
+Phase 1 ships the hybrid retriever with three documented degradations (no backfill
+migration ships for any of them — Phase 1 locked decision):
+
+1. **Entity `belongs_to_set` backfill deferred.** A node-scoped
+   (`node_name`-filtered) `HYBRID_COMPLETION` entity search returns `[]` for any
+   dataset whose `Entity` vector rows predate this feature, because the node-set
+   filter treats a missing / non-list `belongs_to_set` payload field as "does not
+   match" rather than "unscoped" (Python parity —
+   `cognee/modules/retrieval/hybrid/results.py`). This is a documented degradation
+   on old datasets, not a bug.
+2. **`include_global_context_index` accepted-and-inert.** The
+   `include_global_context_index` (and `global_context_index_top_k`)
+   `retriever_specific_config` keys are parsed and stored but have no effect in
+   Phase 1: the Rust port has no `GlobalContextSummary` node type nor the
+   global-context utilities the Python lane depends on. Setting either to `true`
+   must not error — it silently yields the same context as `false`. (Note: these
+   are `retriever_specific_config` keys, not wire DTO fields — see the DTO note
+   in §4.)
+3. **Existing-dataset degradation on `importance_weight` and `TextSummary.source_chunk_id`.**
+   Datasets cognified before this feature have `importance_weight = None`, which
+   the ranking lane treats as neutral (`0.5`), never as a hard error or a zero.
+   Separately, `TextSummary` rows written before this feature lack
+   `source_chunk_id`, so the summary-**rank** channel drops them; however the
+   chunk the summary was made from can still recover the summary **text** via the
+   `uuid5(chunk_id, "TextSummary")` id-derivation fallback once that chunk ranks
+   by BM25 / vector alone. Old datasets therefore see reduced ranking signal, not
+   missing summaries.
+
+Beyond these degradations, `HYBRID_COMPLETION` also **does not support query
+batching**: `get_context_batch` / `get_completion_batch` reject immediately with
+`SearchError::InvalidInput` (`"HYBRID_COMPLETION does not support query_batch."`)
+rather than falling back to a per-query loop — matching the Python retriever.
+
+## 8. References
 
 - Python router: [`cognee/api/v1/search/routers/get_search_router.py`](https://github.com/topoteretes/cognee/blob/main/cognee/api/v1/search/routers/get_search_router.py).
 - Python search function: [`cognee/api/v1/search/search.py`](https://github.com/topoteretes/cognee/blob/main/cognee/api/v1/search/search.py).
 - Python search-history operations: [`cognee/modules/search/operations/log_query.py`](https://github.com/topoteretes/cognee/blob/main/cognee/modules/search/operations/log_query.py), [`log_result.py`](https://github.com/topoteretes/cognee/blob/main/cognee/modules/search/operations/log_result.py), [`get_history.py`](https://github.com/topoteretes/cognee/blob/main/cognee/modules/search/operations/get_history.py).
 - Python `SearchResult`: [`cognee/modules/search/types/SearchResult.py`](https://github.com/topoteretes/cognee/blob/main/cognee/modules/search/types/SearchResult.py).
 - Python `SearchType`: [`cognee/modules/search/types/SearchType.py`](https://github.com/topoteretes/cognee/blob/main/cognee/modules/search/types/SearchType.py).
+- Python `HybridRetriever`: [`cognee/modules/retrieval/hybrid_retriever.py`](https://github.com/topoteretes/cognee/blob/main/cognee/modules/retrieval/hybrid_retriever.py), plus the hybrid lanes [`hybrid/pairs.py`](https://github.com/topoteretes/cognee/blob/main/cognee/modules/retrieval/hybrid/pairs.py), [`hybrid/chunks.py`](https://github.com/topoteretes/cognee/blob/main/cognee/modules/retrieval/hybrid/chunks.py), [`hybrid/results.py`](https://github.com/topoteretes/cognee/blob/main/cognee/modules/retrieval/hybrid/results.py).
+- Python BM25 lane: [`cognee/modules/retrieval/bm25_retriever.py`](https://github.com/topoteretes/cognee/blob/main/cognee/modules/retrieval/bm25_retriever.py), [`utils/stop_words.py`](https://github.com/topoteretes/cognee/blob/main/cognee/modules/retrieval/utils/stop_words.py).
+- Python global-context util (not yet ported): [`cognee/modules/retrieval/utils/global_context.py`](https://github.com/topoteretes/cognee/blob/main/cognee/modules/retrieval/utils/global_context.py).
 - Python `ErrorResponse`: [`cognee/api/DTO.py`](https://github.com/topoteretes/cognee/blob/main/cognee/api/DTO.py).
 - Rust `SearchType`: [`crates/search/src/types/search_type.rs`](../../../crates/search/src/types/search_type.rs).
 - Rust `SearchResponse` / `SearchOutput`: [`crates/search/src/types/search_result.rs`](../../../crates/search/src/types/search_result.rs).

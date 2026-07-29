@@ -74,7 +74,7 @@ cognee-rs/
 
 **cognee-cognify** — Knowledge-graph extraction pipeline: classify documents, chunk text, extract entities/relationships via LLM, summarize, store to graph and vector DBs. Entry points: `cognify()` / `cognify_datasets()`; main types: `CognifyConfig`, `CognifyInput`, `CognifyResult`, `FactExtractor`, `SummaryExtractor`. Also houses the **memify** sub-module (`MemifyConfig`, `MemifyResult`, `memify()`): reads the existing graph, creates triplet embeddings, indexes them for `SearchType::TripletCompletion`.
 
-**cognee-search** — Unified search orchestration across multiple retrieval strategies. Main types: `SearchBuilder`, `SearchOrchestrator`. `SearchType` enum defines 15 search modes with corresponding retriever implementations.
+**cognee-search** — Unified search orchestration across multiple retrieval strategies. Main types: `SearchBuilder`, `SearchOrchestrator`. `SearchType` enum defines 16 search modes with corresponding retriever implementations; the newest, `HybridCompletion`, blends a per-query BM25 lexical pass, vector search over chunks/entities/edge-facts, and 1-hop graph-neighborhood expansion, then answers via LLM completion.
 
 **cognee-session** — Session management and QA-history storage. Trait: `SessionStore`. Impls: `FsSessionStore`, `RedisSessionStore`, `SeaOrmSessionStore`.
 
@@ -82,7 +82,7 @@ cognee-rs/
 
 **cognee-llm** — Async LLM abstraction with structured JSON output. Trait: `Llm` (+ auto-implemented `LlmExt`). Impls: `OpenAIAdapter` (OpenAI-compatible APIs, works with Ollama/vLLM), `MockLlm` (cassette-backed, `testing` feature). The on-device LiteRT adapter lives in the closed `cognee-llm-litert` crate shipped as part of `cognee-cloud-rs` and is not part of OSS.
 
-**cognee-graph** — Graph database abstraction for knowledge-graph storage and traversal. Trait: `GraphDBTrait` (+ `GraphDBTraitExt`). Impls: `LadybugAdapter` (embedded Ladybug), `PgGraphAdapter` (feature `postgres`), `MockGraphDB`. Concurrency: Rust matches Python's default single-owning-process model for file-backed Ladybug; cross-process locking is intentionally out of scope (see [roadmap/](roadmap/README.md)).
+**cognee-graph** — Graph database abstraction for knowledge-graph storage and traversal. Trait: `GraphDBTrait` (+ `GraphDBTraitExt`), including the batched `get_neighborhood(ids, depth) -> (nodes, edges)` method that expands a set of seed nodes and returns the **true stored edge direction** (unlike `get_connections`, whose Ladybug impl reports the queried node as the source regardless of stored direction — see `crates/graph/src/traits.rs` and the `get_neighborhood_preserves_edge_direction` test in `crates/graph/src/mock.rs`). Impls: `LadybugAdapter` (embedded Ladybug), `PgGraphAdapter` (feature `postgres`), `MockGraphDB`. Concurrency: Rust matches Python's default single-owning-process model for file-backed Ladybug; cross-process locking is intentionally out of scope (see [roadmap/](roadmap/README.md)).
 
 **cognee-vector** — Vector database abstraction for similarity search. Trait: `VectorDB`. Impls: `LanceDbAdapter` (embedded Apache-Arrow / Lance, on-disk; default on non-Android targets), `BruteForceVectorDB` (pure-Rust in-memory; default on Android and via `vector_db_url = ":memory:"`), `PgVectorAdapter` (Postgres + pgvector extension, feature `pgvector`), `MockVectorDB`. The embedded Qdrant adapter lives in the closed `cognee-vector-qdrant` crate shipped as part of `cognee-cloud-rs` and is not part of OSS.
 
@@ -115,6 +115,8 @@ cognee-rs/
 **cognee-cli** — Command-line binary (`cognee-cli`). See [tools/cli.md](tools/cli.md).
 
 **cognee-utils** — Shared utilities: retry logic, deterministic ID generation (`generate_node_id`, `NAMESPACE_OID`, …), secret redaction (`redact`), and tracing attribute keys.
+
+**cognee-truth-subspace** — Pure alignment math (cosine projection, query-relevance-weighted truth scoring, stable id signatures) for the Phase-2 hybrid-retriever truth-subspace re-ranking feature. No I/O; consumed by cognee-search once `use_truth_weight`/`build_truth_subspace` land.
 
 **cognee-test-utils** — Test helpers and mock implementations for integration tests.
 
@@ -173,7 +175,7 @@ from `cognee` (the facade) and follow the re-exports.
 | Ingest | `cognee-ingestion` | `AddPipeline` |
 | Chunking | `cognee-chunking` | `TokenCounter`, `text_chunker` |
 | Cognify / memify | `cognee-cognify` | `cognify`, `memify`, `CognifyConfig` |
-| Search | `cognee-search` | `SearchBuilder`, `SearchType` |
+| Search | `cognee-search` | `SearchBuilder`, `SearchType`, `HybridRetriever` |
 | Embedding | `cognee-embedding` | `EmbeddingEngine`, `EmbeddingConfig` |
 | LLM | `cognee-llm` | `Llm`, `OpenAIAdapter` |
 | Graph | `cognee-graph` | `GraphDBTrait`, `LadybugAdapter` |

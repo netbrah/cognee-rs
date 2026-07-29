@@ -39,7 +39,7 @@ import { native, NativeBox, SearchTypeString } from "../src/native";
 
 // ─── Tier-A setup ─────────────────────────────────────────────────────────
 
-/** All 15 SCREAMING_SNAKE_CASE SearchType wire names. */
+/** All 16 SCREAMING_SNAKE_CASE SearchType wire names. */
 const ALL_SEARCH_TYPES: SearchTypeString[] = [
   "SUMMARIES",
   "CHUNKS",
@@ -56,6 +56,7 @@ const ALL_SEARCH_TYPES: SearchTypeString[] = [
   "TEMPORAL",
   "CODING_RULES",
   "CHUNKS_LEXICAL",
+  "HYBRID_COMPLETION",
 ];
 
 /** All valid RecallScope wire strings (including "all" sentinel). */
@@ -117,8 +118,8 @@ describe("Phase-4 search (Tier-A, no LLM)", () => {
   // failure, empty graph, etc.) is expected with a dummy key and empty DB.
 
   describe("SearchType wire-name parsing", () => {
-    it("has exactly 15 variants", () => {
-      expect(ALL_SEARCH_TYPES).toHaveLength(15);
+    it("has exactly 16 variants", () => {
+      expect(ALL_SEARCH_TYPES).toHaveLength(16);
     });
 
     it.each(ALL_SEARCH_TYPES)(

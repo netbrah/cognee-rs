@@ -38,6 +38,14 @@ pub struct TextSummary {
     /// The chunk this summary was generated from (matches Python's `made_from: DocumentChunk`)
     pub made_from: Option<Uuid>,
 
+    /// Source chunk id, duplicated as a flat field for vector-payload lookup
+    /// (matches Python's `TextSummary.source_chunk_id: Optional[str]`,
+    /// `cognee/tasks/summarization/models.py:35`). Always set equal to
+    /// `made_from` at construction time — kept as a distinct field only
+    /// because Python's hybrid pairing code keys off this exact payload name
+    /// (`hybrid/pairs.py:49`), not off a generic "made_from"/"chunk_id" key.
+    pub source_chunk_id: Option<Uuid>,
+
     /// The summary text
     pub text: String,
 
@@ -72,6 +80,7 @@ impl TextSummary {
         Self {
             base,
             made_from: Some(chunk_id),
+            source_chunk_id: Some(chunk_id),
             text,
             description,
             model,
@@ -165,6 +174,7 @@ mod tests {
         );
 
         assert_eq!(text_summary.made_from, Some(chunk_id));
+        assert_eq!(text_summary.source_chunk_id, Some(chunk_id));
         assert_eq!(text_summary.text, summarized.summary);
         assert_eq!(text_summary.description, Some(summarized.description));
         assert_eq!(text_summary.model, "llama3");
@@ -189,6 +199,8 @@ mod tests {
 
         assert_eq!(summary.base.id, deserialized.base.id);
         assert_eq!(summary.made_from, deserialized.made_from);
+        assert_eq!(summary.source_chunk_id, deserialized.source_chunk_id);
+        assert_eq!(summary.source_chunk_id, Some(chunk_id));
         assert_eq!(summary.text, deserialized.text);
         assert_eq!(summary.description, deserialized.description);
         assert_eq!(summary.model, deserialized.model);

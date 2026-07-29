@@ -14,6 +14,55 @@ use crate::{EdgeData, GraphDBResult, GraphNode, NodeData};
 /// `(source_id, target_id, relationship_name)`.
 pub type EdgeKey = (String, String, String);
 
+/// Per-node truth-subspace alignment state: coordinates against the current
+/// centroid slots plus the epoch they were computed against.
+///
+/// `truth_epoch` uses `-1` as the "never scored" sentinel (NOT `0`, which is a
+/// legitimate first real epoch). [`Default`] yields `truth_epoch = 0`, so the
+/// read path must default a MISSING/invalid epoch to `-1` explicitly rather
+/// than relying on `Default`. Callers must treat `-1` (not `0`) as "no truth
+/// state yet" and fall back to unweighted scoring.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct NodeTruthState {
+    pub truth_alignment: Vec<f64>,
+    pub truth_epoch: i64,
+}
+
+/// Extract a `truth_alignment` coordinate vector from a stored JSON property.
+///
+/// If the value is a JSON array, each element is coerced via `.as_f64()` and
+/// non-numeric elements are dropped (a structural-parity approximation of
+/// Python's dynamically-typed pass-through). Any non-array/missing value
+/// yields an empty vector.
+pub(crate) fn extract_truth_alignment(value: Option<&Value>) -> Vec<f64> {
+    match value.and_then(|v| v.as_array()) {
+        Some(arr) => arr.iter().filter_map(|e| e.as_f64()).collect(),
+        None => Vec::new(),
+    }
+}
+
+/// Extract a `truth_epoch` version stamp from a stored JSON property.
+///
+/// Accepts a JSON integer, a float-encoded number (e.g. `3.0`, truncated toward
+/// zero to match Python's `int(epoch)` in the ladybug adapter), or a numeric
+/// JSON string (e.g. `"3"`), matching Python's tolerance for stringly-typed
+/// epoch values. Anything missing, non-numeric, or non-finite (`NaN`/`inf`)
+/// yields the `-1` "never scored" sentinel.
+pub(crate) fn extract_truth_epoch(value: Option<&Value>) -> i64 {
+    match value {
+        Some(v) => v
+            .as_i64()
+            .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+            // Float-encoded epochs (e.g. `3.0`) are rejected by `as_i64()`;
+            // truncate toward zero like Python's `int()`. Guard against
+            // `NaN`/`inf` so they fall through to the -1 sentinel instead of
+            // producing a bogus value.
+            .or_else(|| v.as_f64().filter(|f| f.is_finite()).map(|f| f as i64))
+            .unwrap_or(-1),
+        None => -1,
+    }
+}
+
 /// Graph database interface trait.
 ///
 /// This trait defines the complete set of operations for graph database interaction,
@@ -50,6 +99,7 @@ pub type EdgeKey = (String, String, String);
 /// - `get_graph_metrics()` - Get graph statistics
 /// - `get_filtered_graph_data()` - Get filtered subgraph
 /// - `get_nodeset_subgraph()` - Get subgraph for specific nodes
+/// - `get_neighborhood()` - Get k-hop subgraph around a set of seed nodes
 #[async_trait]
 pub trait GraphDBTrait: Send + Sync {
     /// Initialize the database schema.
@@ -419,6 +469,77 @@ pub trait GraphDBTrait: Send + Sync {
         Ok(out)
     }
 
+    /// Batch-fetch per-node truth-subspace state for the given node IDs.
+    ///
+    /// Unlike [`get_node_feedback_weights`], which omits nodes lacking the
+    /// property, this method returns an entry for **every node that exists** in
+    /// the graph, defaulting `truth_alignment` to `vec![]` and `truth_epoch` to
+    /// the `-1` "never scored" sentinel when the properties are absent or
+    /// malformed. Nodes not present in the graph are omitted.
+    ///
+    /// `truth_epoch` is read from either a JSON number or a numeric JSON string
+    /// (e.g. `"3"`); anything else falls back to `-1`. `truth_alignment` is
+    /// read from a JSON array (non-numeric elements dropped), else `vec![]`.
+    ///
+    /// Default implementation calls [`get_node`] per id; backends should
+    /// override with a single batch query for efficiency.
+    ///
+    /// [`get_node`]: GraphDBTrait::get_node
+    /// [`get_node_feedback_weights`]: GraphDBTrait::get_node_feedback_weights
+    async fn get_node_truth_state(
+        &self,
+        node_ids: &[String],
+    ) -> GraphDBResult<HashMap<String, NodeTruthState>> {
+        let mut out = HashMap::with_capacity(node_ids.len());
+        for id in node_ids {
+            if let Some(node) = self.get_node(id).await? {
+                out.insert(
+                    id.clone(),
+                    NodeTruthState {
+                        truth_alignment: extract_truth_alignment(node.get("truth_alignment")),
+                        truth_epoch: extract_truth_epoch(node.get("truth_epoch")),
+                    },
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    /// Batch-write per-node truth-subspace state on the given nodes.
+    ///
+    /// Stores `truth_alignment` as a JSON array of numbers and `truth_epoch` as
+    /// a JSON number. Returns a map `node_id -> success`; an entry is `true`
+    /// only if **both** the `truth_alignment` and `truth_epoch` writes succeed.
+    ///
+    /// The base-trait default issues two [`update_node_property`] round-trips
+    /// per id (each of which may itself be a full delete+re-add on backends
+    /// that do not override `update_node_property`), so backends should
+    /// override with a single batch query for efficiency.
+    ///
+    /// [`update_node_property`]: GraphDBTrait::update_node_property
+    async fn set_node_truth_state(
+        &self,
+        updates: &HashMap<String, NodeTruthState>,
+    ) -> GraphDBResult<HashMap<String, bool>> {
+        let mut out = HashMap::with_capacity(updates.len());
+        for (id, state) in updates {
+            let align_ok = self
+                .update_node_property(
+                    id,
+                    "truth_alignment",
+                    serde_json::json!(state.truth_alignment),
+                )
+                .await
+                .is_ok();
+            let epoch_ok = self
+                .update_node_property(id, "truth_epoch", serde_json::json!(state.truth_epoch))
+                .await
+                .is_ok();
+            out.insert(id.clone(), align_ok && epoch_ok);
+        }
+        Ok(out)
+    }
+
     /// Batch-fetch `feedback_weight` values for the given edges.
     ///
     /// Default implementation returns an empty map and logs a warning,
@@ -494,6 +615,107 @@ pub trait GraphDBTrait: Send + Sync {
 
         Ok((filtered_nodes, filtered_edges))
     }
+
+    /// Fetch the raw k-hop neighborhood subgraph around a set of seed node ids.
+    ///
+    /// Returns every node reachable within `depth` hops of any seed, together
+    /// with every edge whose endpoints are both in that resolved set, in the
+    /// same `(nodes, edges)` shape as [`get_graph_data`]. Edges preserve their
+    /// **true stored** `(source_id, target_id)` direction; the caller is
+    /// responsible for any partitioning (e.g. keeping only edges incident to a
+    /// seed).
+    ///
+    /// Default implementation performs a layered BFS over [`get_connections`].
+    /// Backends should override with a single batched query for efficiency and,
+    /// in Ladybug's case, to return direction-correct edges (its
+    /// `get_connections`/`get_edges` report the queried node as the source
+    /// regardless of the stored direction).
+    ///
+    /// Note: at `depth == 0` this default path returns only the seed nodes with
+    /// no edges, whereas the real-backend overrides include seed-to-seed edges.
+    /// Phase 1 only ever calls with `depth == 1`.
+    async fn get_neighborhood(
+        &self,
+        node_ids: &[String],
+        depth: usize,
+    ) -> GraphDBResult<(Vec<GraphNode>, Vec<EdgeData>)> {
+        if node_ids.is_empty() {
+            return Ok((vec![], vec![]));
+        }
+
+        let mut nodes_by_id: HashMap<String, NodeData> = HashMap::new();
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut frontier: Vec<String> = Vec::new();
+
+        for id in node_ids {
+            if visited.insert(id.clone()) {
+                frontier.push(id.clone());
+                // Seed node lookup so isolated seeds still appear in the output.
+                if let Some(node) = self.get_node(id).await? {
+                    nodes_by_id.insert(id.clone(), node);
+                }
+            }
+        }
+
+        let mut edges: Vec<EdgeData> = Vec::new();
+        let mut edge_keys: HashSet<EdgeKey> = HashSet::new();
+
+        for _ in 0..depth {
+            let mut next_frontier: Vec<String> = Vec::new();
+            for id in &frontier {
+                for (source_node, edge_props, target_node) in self.get_connections(id).await? {
+                    let source_id = source_node
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let target_id = target_node
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let relationship_name = edge_props
+                        .get("relationship_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+
+                    let key: EdgeKey = (
+                        source_id.clone(),
+                        target_id.clone(),
+                        relationship_name.clone(),
+                    );
+                    if edge_keys.insert(key) {
+                        edges.push((
+                            source_id.clone(),
+                            target_id.clone(),
+                            relationship_name,
+                            edge_props,
+                        ));
+                    }
+
+                    // The endpoint that isn't the queried node is a candidate
+                    // neighbor for the next layer.
+                    let neighbor_id = if source_id == *id {
+                        target_id.clone()
+                    } else {
+                        source_id.clone()
+                    };
+                    nodes_by_id.insert(source_id, source_node);
+                    nodes_by_id.insert(target_id, target_node);
+                    if visited.insert(neighbor_id.clone()) {
+                        next_frontier.push(neighbor_id);
+                    }
+                }
+            }
+            if next_frontier.is_empty() {
+                break;
+            }
+            frontier = next_frontier;
+        }
+
+        Ok((nodes_by_id.into_iter().collect(), edges))
+    }
 }
 
 /// Extension trait providing generic convenience methods on top of [`GraphDBTrait`].
@@ -522,3 +744,211 @@ pub trait GraphDBTraitExt: GraphDBTrait {
 }
 
 impl<T: GraphDBTrait + ?Sized> GraphDBTraitExt for T {}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test code — panics are acceptable failures"
+)]
+mod tests {
+    use super::*;
+    use crate::mock::MockGraphDB;
+
+    /// Delegating wrapper that forwards every *required* trait method to an
+    /// inner [`MockGraphDB`] but deliberately does NOT override
+    /// `get_node_truth_state`, `set_node_truth_state`, or
+    /// `update_node_property` — so exercising those on this type runs the
+    /// base-trait DEFAULT implementations (the mock overrides them, so it
+    /// cannot cover the default path itself).
+    #[derive(Default)]
+    struct DefaultImplDb(MockGraphDB);
+
+    #[async_trait]
+    impl GraphDBTrait for DefaultImplDb {
+        async fn initialize(&self) -> GraphDBResult<()> {
+            self.0.initialize().await
+        }
+        async fn is_empty(&self) -> GraphDBResult<bool> {
+            self.0.is_empty().await
+        }
+        async fn query(
+            &self,
+            query: &str,
+            params: Option<HashMap<Cow<'static, str>, Value>>,
+        ) -> GraphDBResult<Vec<Vec<Value>>> {
+            self.0.query(query, params).await
+        }
+        async fn delete_graph(&self) -> GraphDBResult<()> {
+            self.0.delete_graph().await
+        }
+        async fn has_node(&self, node_id: &str) -> GraphDBResult<bool> {
+            self.0.has_node(node_id).await
+        }
+        async fn add_node_raw(&self, node: Value) -> GraphDBResult<()> {
+            self.0.add_node_raw(node).await
+        }
+        async fn add_nodes_raw(&self, nodes: Vec<Value>) -> GraphDBResult<()> {
+            self.0.add_nodes_raw(nodes).await
+        }
+        async fn delete_node(&self, node_id: &str) -> GraphDBResult<()> {
+            self.0.delete_node(node_id).await
+        }
+        async fn delete_nodes(&self, node_ids: &[String]) -> GraphDBResult<()> {
+            self.0.delete_nodes(node_ids).await
+        }
+        async fn get_node(&self, node_id: &str) -> GraphDBResult<Option<NodeData>> {
+            self.0.get_node(node_id).await
+        }
+        async fn get_nodes(&self, node_ids: &[String]) -> GraphDBResult<Vec<NodeData>> {
+            self.0.get_nodes(node_ids).await
+        }
+        async fn has_edge(
+            &self,
+            source_id: &str,
+            target_id: &str,
+            relationship_name: &str,
+        ) -> GraphDBResult<bool> {
+            self.0
+                .has_edge(source_id, target_id, relationship_name)
+                .await
+        }
+        async fn has_edges(&self, edges: &[EdgeData]) -> GraphDBResult<Vec<EdgeData>> {
+            self.0.has_edges(edges).await
+        }
+        async fn add_edge(
+            &self,
+            source_id: &str,
+            target_id: &str,
+            relationship_name: &str,
+            properties: Option<HashMap<Cow<'static, str>, Value>>,
+        ) -> GraphDBResult<()> {
+            self.0
+                .add_edge(source_id, target_id, relationship_name, properties)
+                .await
+        }
+        async fn add_edges(&self, edges: &[EdgeData]) -> GraphDBResult<()> {
+            self.0.add_edges(edges).await
+        }
+        async fn get_edges(&self, node_id: &str) -> GraphDBResult<Vec<EdgeData>> {
+            self.0.get_edges(node_id).await
+        }
+        async fn get_neighbors(&self, node_id: &str) -> GraphDBResult<Vec<NodeData>> {
+            self.0.get_neighbors(node_id).await
+        }
+        async fn get_connections(
+            &self,
+            node_id: &str,
+        ) -> GraphDBResult<Vec<(NodeData, HashMap<Cow<'static, str>, Value>, NodeData)>> {
+            self.0.get_connections(node_id).await
+        }
+        async fn get_graph_data(&self) -> GraphDBResult<(Vec<GraphNode>, Vec<EdgeData>)> {
+            self.0.get_graph_data().await
+        }
+        async fn get_graph_metrics(
+            &self,
+            include_optional: bool,
+        ) -> GraphDBResult<HashMap<Cow<'static, str>, Value>> {
+            self.0.get_graph_metrics(include_optional).await
+        }
+        async fn get_filtered_graph_data(
+            &self,
+            attribute_filters: &HashMap<Cow<'static, str>, Vec<Value>>,
+        ) -> GraphDBResult<(Vec<GraphNode>, Vec<EdgeData>)> {
+            self.0.get_filtered_graph_data(attribute_filters).await
+        }
+        async fn get_nodeset_subgraph(
+            &self,
+            node_type: &str,
+            node_names: &[String],
+            node_name_filter_operator: &str,
+        ) -> GraphDBResult<(Vec<GraphNode>, Vec<EdgeData>)> {
+            self.0
+                .get_nodeset_subgraph(node_type, node_names, node_name_filter_operator)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn default_truth_state_round_trip_and_sentinel() {
+        let db = DefaultImplDb::default();
+        db.add_node_raw(serde_json::json!({"id": "d1", "name": "D1", "type": "T"}))
+            .await
+            .unwrap();
+        db.add_node_raw(serde_json::json!({"id": "d2", "name": "D2", "type": "T"}))
+            .await
+            .unwrap();
+
+        // Missing epoch/alignment default to the -1 sentinel and [] via the
+        // default get_node_truth_state.
+        let before = db.get_node_truth_state(&["d1".to_string()]).await.unwrap();
+        let d1 = before.get("d1").expect("d1 present with defaults");
+        assert_eq!(d1.truth_alignment, Vec::<f64>::new());
+        assert_eq!(d1.truth_epoch, -1);
+
+        // Default set writes both properties via the default update_node_property.
+        let mut updates = HashMap::new();
+        updates.insert(
+            "d1".to_string(),
+            NodeTruthState {
+                truth_alignment: vec![0.5, 0.25],
+                truth_epoch: 0,
+            },
+        );
+        updates.insert(
+            "d2".to_string(),
+            NodeTruthState {
+                truth_alignment: vec![1.0],
+                truth_epoch: 9,
+            },
+        );
+        let set_res = db.set_node_truth_state(&updates).await.unwrap();
+        assert_eq!(set_res.get("d1"), Some(&true));
+        assert_eq!(set_res.get("d2"), Some(&true));
+
+        let got = db
+            .get_node_truth_state(&["d1".to_string(), "d2".to_string()])
+            .await
+            .unwrap();
+        let d1 = got.get("d1").expect("d1 present");
+        assert_eq!(d1.truth_alignment, vec![0.5, 0.25]);
+        // Real epoch 0 must survive as 0, not the -1 sentinel.
+        assert_eq!(d1.truth_epoch, 0);
+        let d2 = got.get("d2").expect("d2 present");
+        assert_eq!(d2.truth_alignment, vec![1.0]);
+        assert_eq!(d2.truth_epoch, 9);
+
+        // Absent node omitted from the result map.
+        let missing = db
+            .get_node_truth_state(&["ghost".to_string()])
+            .await
+            .unwrap();
+        assert!(!missing.contains_key("ghost"));
+    }
+
+    #[test]
+    fn extract_truth_epoch_accepts_int_float_and_sentinels() {
+        use serde_json::json;
+
+        // Plain JSON integer is unchanged.
+        assert_eq!(extract_truth_epoch(Some(&json!(3))), 3);
+        // Numeric JSON string parses.
+        assert_eq!(extract_truth_epoch(Some(&json!("3"))), 3);
+        // Float-encoded epoch is accepted (matches Python `int(3.0)`).
+        assert_eq!(extract_truth_epoch(Some(&json!(3.0))), 3);
+        // Fractional float truncates toward zero (matches Python `int(3.9)`).
+        assert_eq!(extract_truth_epoch(Some(&json!(3.9))), 3);
+        assert_eq!(extract_truth_epoch(Some(&json!(-2.9))), -2);
+
+        // Non-numeric / missing values fall back to the -1 sentinel.
+        assert_eq!(extract_truth_epoch(Some(&json!("bad"))), -1);
+        assert_eq!(extract_truth_epoch(Some(&json!(null))), -1);
+        assert_eq!(extract_truth_epoch(None), -1);
+
+        // NaN/inf cannot be represented as a serde_json number
+        // (`Number::from_f64` returns None for them), so the `is_finite`
+        // guard is defensive: any `Value` that reaches `as_f64()` is finite.
+        assert!(serde_json::Number::from_f64(f64::NAN).is_none());
+        assert!(serde_json::Number::from_f64(f64::INFINITY).is_none());
+    }
+}

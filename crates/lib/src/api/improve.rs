@@ -1,8 +1,11 @@
 //! Bidirectional session-graph bridge — `improve()`.
 //!
-//! Four-stage pipeline matching Python `cognee.api.v1.improve.improve()`:
+//! Multi-stage pipeline matching Python `cognee.api.v1.improve.improve()`:
 //! 1. Apply feedback weights from session Q&A entries to graph nodes/edges.
-//! 2. Persist session Q&A text into the permanent knowledge graph.
+//! 2. Persist session Q&A text into the permanent knowledge graph (Stage 2),
+//!    then persist agent trace steps (Stage 2b), then distill each session's
+//!    Q&A into curated, entity-anchored lesson documents tagged with the
+//!    `session_learnings` node-set (Stage 2c).
 //! 3. Default enrichment: reuse `memify()` for triplet embeddings.
 //! 4. Sync recent graph edges into the session's `graph_context`.
 //!
@@ -14,7 +17,8 @@ use std::sync::Arc;
 use cognee_cognify::memify::sync_graph_session::DEFAULT_MAX_LINES;
 use cognee_cognify::{
     CognifyConfig, MemifyConfig, MemifyResult, apply_feedback_weights_pipeline,
-    persist_sessions_in_knowledge_graph, run_memify, sync_graph_to_session,
+    distill_sessions_in_knowledge_graph, persist_sessions_in_knowledge_graph, run_memify,
+    sync_graph_to_session,
 };
 use cognee_database::{
     CheckpointStore, DatabaseConnection, PipelineRunRepository, SeaOrmPipelineRunRepository,
@@ -46,6 +50,10 @@ pub struct ImproveResult {
     pub feedback_entries_applied: usize,
     /// Number of sessions whose Q&A text was persisted to the graph (Stage 2).
     pub sessions_persisted: usize,
+    /// Number of sessions that produced >= 1 distilled lesson (Stage 2c).
+    pub sessions_distilled: usize,
+    /// Total number of distilled lesson documents published (Stage 2c).
+    pub lessons_published: usize,
     /// Total number of edges newly synced into session contexts (Stage 4).
     pub edges_synced: usize,
 }
@@ -97,6 +105,13 @@ pub struct ImproveParams<'a> {
     /// Mirrors Python's `build_global_context_index` parameter.
     /// Default `false` (opt-in) — matches Python parity.
     pub build_global_context_index: bool,
+
+    /// When `true` and sessions are present, build/refresh the truth-subspace
+    /// centroid slots and per-chunk alignment (Stage 2d, Phase-2 join point).
+    ///
+    /// Mirrors Python's `build_truth_subspace` parameter. Default `false`
+    /// (opt-in) — the entire truth-subspace path is inert unless this is set.
+    pub build_truth_subspace: bool,
 
     /// When `true`, treat this as a background run: skips stages that
     /// require the prior stage to have completed synchronously (e.g. the
@@ -161,6 +176,7 @@ pub async fn improve(params: ImproveParams<'_>) -> Result<ImproveResult, ApiErro
         checkpoint_store,
         cognify_config,
         build_global_context_index,
+        build_truth_subspace,
         run_in_background,
         // E-05 v2 power-user fields — currently informational; the orchestrator
         // does not yet branch on them. Accepting them here keeps the struct
@@ -496,6 +512,128 @@ pub async fn improve(params: ImproveParams<'_>) -> Result<ImproveResult, ApiErro
         result.stages_run.push("persist_trace_steps".to_string());
     }
 
+    // ---- Stage 2c: Distill Sessions into Learnings ----
+    //
+    // Mirrors Python's `_distill_sessions` (improve.py:190-201). Each session's
+    // Q&A is curated into durable, entity-anchored lesson documents tagged with
+    // the `session_learnings` node-set and cognified into the graph. Fail-open
+    // per session; a session with no non-empty Q&A yields nothing.
+    //
+    // Scope cut vs. Python (locked): only Q&A is consumed — there is no
+    // `SessionContextEntry` gated-guidance corpus in Rust — and Python's stage
+    // 2b2 (`_extract_agent_context`) is intentionally NOT ported.
+    //
+    // Unlike Stage 2b, the stage name is pushed onto `stages_run` ONLY when a
+    // lesson was actually published (Python improve.py:200-201).
+    if has_sessions {
+        #[allow(clippy::expect_used, reason = "invariant is upheld by construction")]
+        let sids = session_ids
+            .as_ref()
+            .expect("has_sessions guarantees session_ids is Some with non-empty vec");
+        let stage2c_db = db.clone();
+        match (session_store.as_ref(), add_pipeline, stage2c_db) {
+            (Some(store), Some(pipeline), Some(database)) => {
+                match cognee_core::RayonThreadPool::with_default_threads() {
+                    Ok(pool) => {
+                        let thread_pool: Arc<dyn cognee_core::CpuPool> = Arc::new(pool);
+                        let pipeline_run_repo: Arc<dyn PipelineRunRepository> =
+                            Arc::new(SeaOrmPipelineRunRepository::new(Arc::clone(&database)));
+                        let r = distill_sessions_in_knowledge_graph(
+                            sids,
+                            &dataset_name,
+                            owner_id,
+                            tenant_id,
+                            Arc::clone(store),
+                            pipeline,
+                            Arc::clone(&llm),
+                            Arc::clone(&storage),
+                            Arc::clone(&graph_db),
+                            Arc::clone(&vector_db),
+                            Arc::clone(&embedding_engine),
+                            database,
+                            pipeline_run_repo,
+                            thread_pool,
+                            Arc::clone(&ontology_resolver),
+                            cognify_config,
+                        )
+                        .await;
+                        info!(
+                            sessions_distilled = r.sessions_distilled,
+                            lessons_published = r.lessons_published,
+                            "improve stage 2c (distill_sessions) complete"
+                        );
+                        result.sessions_distilled = r.sessions_distilled;
+                        result.lessons_published = r.lessons_published;
+                        // Conditional push: only when a lesson was published.
+                        if r.sessions_distilled > 0 {
+                            result.stages_run.push("distill_sessions".to_string());
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "improve stage 2c: rayon pool init failed (non-fatal): {e}; skipping distill_sessions"
+                        );
+                    }
+                }
+            }
+            _ => {
+                warn!(
+                    "improve stage 2c: session_store, add_pipeline, and DatabaseConnection are required; skipping distill_sessions"
+                );
+            }
+        }
+    }
+
+    // ---- Stage 2d: Build Truth Subspace (opt-in) ----
+    //
+    // Phase-2 join point. Mirrors Python's `build_truth_subspace` stage
+    // (improve.py:207-221). Gated on `has_sessions && build_truth_subspace`, so
+    // it is fully inert (zero graph/vector I/O) unless the caller opts in. Never
+    // aborts improve() — `build_truth_subspace` is infallible and internal
+    // failures merely warn.
+    if has_sessions && build_truth_subspace {
+        #[allow(clippy::expect_used, reason = "invariant is upheld by construction")]
+        let sids = session_ids
+            .as_ref()
+            .expect("has_sessions guarantees session_ids is Some with non-empty vec");
+        if let Some(database) = db.as_ref() {
+            // Resolve the dataset the same way Stage 4 does.
+            match cognee_database::ops::datasets::get_dataset_by_name(
+                database.as_ref(),
+                &dataset_name,
+                owner_id,
+                tenant_id,
+            )
+            .await
+            {
+                Ok(Some(ds)) => {
+                    let ts = cognee_cognify::build_truth_subspace(
+                        ds.id,
+                        sids,
+                        Arc::clone(&graph_db),
+                        Arc::clone(&vector_db),
+                        Arc::clone(&embedding_engine),
+                        cognee_cognify::DEFAULT_K,
+                    )
+                    .await;
+                    info!(
+                        anchors = ts.anchors,
+                        nodes_scored = ts.nodes_scored,
+                        truth_epoch = ts.truth_epoch,
+                        "improve stage 2d (build_truth_subspace) complete"
+                    );
+                    result.stages_run.push("build_truth_subspace".to_string());
+                }
+                Ok(None) => warn!("improve stage 2d: dataset not found; skipping"),
+                Err(e) => {
+                    warn!("improve stage 2d: dataset lookup failed (non-fatal): {e}")
+                }
+            }
+        } else {
+            warn!("improve stage 2d: DatabaseConnection required; skipping build_truth_subspace");
+        }
+    }
+
     // ---- Stage 3: Default Enrichment (always) ----
     let memify_config = if let Some(names) = node_name {
         MemifyConfig::default().with_node_name_filter(names)
@@ -712,6 +850,8 @@ mod tests {
         assert_eq!(result.feedback_entries_processed, 0);
         assert_eq!(result.feedback_entries_applied, 0);
         assert_eq!(result.sessions_persisted, 0);
+        assert_eq!(result.sessions_distilled, 0);
+        assert_eq!(result.lessons_published, 0);
         assert_eq!(result.edges_synced, 0);
     }
 }

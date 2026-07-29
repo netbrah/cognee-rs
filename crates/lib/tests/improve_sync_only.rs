@@ -136,6 +136,7 @@ async fn improve_with_sessions_runs_at_least_memify() {
         enrichment_tasks: None,
         data: None,
         build_global_context_index: false,
+        build_truth_subspace: false,
         run_in_background: false,
     })
     .await
@@ -183,6 +184,7 @@ async fn improve_without_sessions_runs_only_memify() {
         enrichment_tasks: None,
         data: None,
         build_global_context_index: false,
+        build_truth_subspace: false,
         run_in_background: false,
     })
     .await
@@ -238,6 +240,7 @@ async fn improve_skips_when_locked() {
         enrichment_tasks: None,
         data: None,
         build_global_context_index: false,
+        build_truth_subspace: false,
         run_in_background: false,
     })
     .await

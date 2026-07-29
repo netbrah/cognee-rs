@@ -8,6 +8,8 @@ pub mod brute_force_vector_db;
 pub mod error;
 /// Data models for vector points, search results, and collection configuration.
 pub mod models;
+/// Server-side `belongs_to_set` (NodeSet) membership predicate for filtered search.
+mod node_filter;
 /// Vector database trait definition.
 pub mod vector_db_trait;
 

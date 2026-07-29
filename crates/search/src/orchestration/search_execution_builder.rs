@@ -13,8 +13,8 @@ use crate::retrievers::{
     ChunksRetriever, CodingRulesRetriever, CompletionRetriever, CypherSearchRetriever,
     FeedbackRetriever, FeelingLuckyRetriever, GraphCompletionContextExtensionRetriever,
     GraphCompletionCotRetriever, GraphCompletionRetriever, GraphSummaryCompletionRetriever,
-    LexicalRetriever, NaturalLanguageRetriever, SearchRetrieverRef, SummariesRetriever,
-    TemporalRetriever, TripletRetriever,
+    HybridRetriever, LexicalRetriever, NaturalLanguageRetriever, SearchRetrieverRef,
+    SummariesRetriever, TemporalRetriever, TripletRetriever,
 };
 use crate::types::SearchType;
 
@@ -228,6 +228,31 @@ impl SearchBuilder {
         );
 
         self.retrievers.insert(
+            SearchType::HybridCompletion,
+            Arc::new(HybridRetriever::new(
+                Arc::clone(&vector_db),
+                Arc::clone(&embedding_engine),
+                Arc::clone(&graph_db),
+                Arc::clone(&llm),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )),
+        );
+
+        self.retrievers.insert(
             SearchType::Feedback,
             Arc::new(FeedbackRetriever::new(
                 Arc::clone(&graph_db),
@@ -334,6 +359,15 @@ mod tests {
 
     #[async_trait]
     impl VectorDB for TestVectorDb {
+        async fn retrieve(
+            &self,
+            _data_type: &str,
+            _field_name: &str,
+            _ids: &[Uuid],
+        ) -> VectorDBResult<Vec<SearchResult>> {
+            Ok(vec![])
+        }
+
         async fn create_collection(
             &self,
             _data_type: &str,
@@ -736,6 +770,62 @@ mod tests {
                 assert_eq!(items[0].payload["text"], "summary item");
             }
             _ => panic!("expected items result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hybrid_completion_resolves_to_a_registered_retriever() {
+        // With P1-09, HYBRID_COMPLETION is registered by the standard builder.
+        // The empty `TestVectorDb` has no DocumentChunk_text collection, so the
+        // registered `HybridRetriever` runs and fails with `NotFound` — proving
+        // the type is no longer `UnsupportedSearchType`.
+        let orchestrator = SearchBuilder::new(
+            Arc::new(TestVectorDb),
+            Arc::new(TestEmbedding),
+            Arc::new(TestGraphDb),
+            Arc::new(TestLlm),
+            Arc::new(TestDatabase),
+        )
+        .build();
+
+        let request = SearchRequest {
+            query_text: "hello".to_string(),
+            search_type: SearchType::HybridCompletion,
+            top_k: Some(3),
+            datasets: None,
+            dataset_ids: None,
+            system_prompt: None,
+            system_prompt_path: None,
+            only_context: Some(true),
+            use_combined_context: Some(false),
+            session_id: None,
+            node_type: None,
+            node_name: None,
+            node_name_filter_operator: None,
+            wide_search_top_k: None,
+            triplet_distance_penalty: None,
+            save_interaction: None,
+            user_id: None,
+            verbose: None,
+            feedback_influence: None,
+            retriever_specific_config: None,
+            response_schema: None,
+            custom_search_type: None,
+            auto_feedback_detection: None,
+            neighborhood_depth: None,
+            neighborhood_seed_top_k: None,
+            summarize_context: None,
+        };
+
+        let result = orchestrator.search(&request).await;
+        match result {
+            Err(SearchError::UnsupportedSearchType(_)) => {
+                panic!("HYBRID_COMPLETION should be registered after P1-09")
+            }
+            Err(SearchError::NotFound(_)) => {}
+            other => {
+                panic!("expected NotFound from the registered hybrid retriever, got {other:?}")
+            }
         }
     }
 }

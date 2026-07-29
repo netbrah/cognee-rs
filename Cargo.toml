@@ -26,6 +26,7 @@ members = [
     "crates/search",
     "crates/session",
     "crates/delete",
+    "crates/truth-subspace",
     "crates/test-utils",
     "crates/visualization",
     "crates/http-server",

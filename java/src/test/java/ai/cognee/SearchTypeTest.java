@@ -14,6 +14,8 @@ class SearchTypeTest {
     void wireValuesAreConstantNames() {
         assertEquals("GRAPH_COMPLETION", SearchType.GRAPH_COMPLETION.wire());
         assertEquals(SearchType.CHUNKS_LEXICAL, SearchType.fromWire("CHUNKS_LEXICAL"));
+        assertEquals("HYBRID_COMPLETION", SearchType.HYBRID_COMPLETION.wire());
+        assertEquals(SearchType.HYBRID_COMPLETION, SearchType.fromWire("HYBRID_COMPLETION"));
     }
 
     @Test

@@ -46,6 +46,9 @@ returned to the caller (printed to stdout by the CLI).
 
 Enriches memory and bridges sessions: runs the feedback/enrichment improvement
 stages over the graph (memify-style triplet enrichment plus feedback weighting).
+When session IDs are supplied it also distills each session's Q&A into curated,
+entity-anchored "session-learnings" lesson documents (tagged with the
+`session_learnings` node-set) and cognifies them into the permanent graph.
 Can target specific sessions or graph nodes and tune the feedback weight.
 rustdoc: `api::improve`.
 
@@ -90,12 +93,15 @@ indexes them into the `Triplet`/`text` vector collection for
 
 ### search (retrieval)
 
-Unified orchestration across 15 retrieval strategies selected by `SearchType`
+Unified orchestration across 16 retrieval strategies selected by `SearchType`
 ([`crates/search/src/types/search_type.rs`](../crates/search/src/types/search_type.rs)):
 `GraphCompletion` (default), `GraphCompletionCot`, `GraphCompletionContextExtension`,
 `GraphSummaryCompletion`, `TripletCompletion`, `RagCompletion`, `Chunks`,
 `Summaries`, `Temporal`, `Cypher`, `NaturalLanguage`, `FeelingLucky`, `Feedback`,
-`CodingRules`, `ChunksLexical`. Entry: [`cognee-search`](../crates/search/)
+`CodingRules`, `ChunksLexical`, `HybridCompletion` (combines a per-query BM25
+lexical pass over chunks, vector search over chunks/entities/edge-facts, and
+1-hop graph-neighborhood expansion around matched entities, then answers via
+LLM completion). Entry: [`cognee-search`](../crates/search/)
 (`SearchBuilder` / `SearchOrchestrator`).
 
 ## Additional operations

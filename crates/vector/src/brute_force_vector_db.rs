@@ -29,6 +29,7 @@ use uuid::Uuid;
 
 use crate::error::{VectorDBError, VectorDBResult};
 use crate::models::{SearchResult, VectorPoint};
+use crate::node_filter::metadata_matches_node_filter;
 use crate::vector_db_trait::VectorDB;
 
 #[derive(Debug)]
@@ -148,6 +149,39 @@ impl VectorDB for BruteForceVectorDB {
         Ok(())
     }
 
+    async fn upsert_raw_vectors(
+        &self,
+        data_type: &str,
+        field_name: &str,
+        points: &[VectorPoint],
+    ) -> VectorDBResult<()> {
+        // Empty input is a no-op — must not touch `points[0]`.
+        if points.is_empty() {
+            return Ok(());
+        }
+        let key = Self::key(data_type, field_name);
+        let mut g = self.collections.write().await;
+
+        // Self-create the collection when absent, sized from the first vector
+        // (nothing else ever creates a system-owned collection like
+        // TruthCentroid_vector). `index_points` deliberately does NOT do this.
+        let coll = g.entry(key).or_insert_with(|| Collection {
+            dimension: points[0].vector.len(),
+            points: Vec::new(),
+        });
+
+        // Full-metadata by-id insert-or-replace — NO dataset-membership union
+        // (that is index_points' job; raw upsert writes each point verbatim).
+        for p in points {
+            if let Some(existing) = coll.points.iter_mut().find(|x| x.id == p.id) {
+                *existing = p.clone();
+            } else {
+                coll.points.push(p.clone());
+            }
+        }
+        Ok(())
+    }
+
     async fn search_similar(
         &self,
         data_type: &str,
@@ -192,6 +226,102 @@ impl VectorDB for BruteForceVectorDB {
                 id,
                 score,
                 metadata,
+            })
+            .collect())
+    }
+
+    /// Exact server-side node-set filter: drop out-of-set points during the
+    /// scan, *before* ranking + `top_k` truncation (filter-then-limit), so an
+    /// in-set point is never crowded out by higher-similarity out-of-set points
+    /// regardless of collection size (finding F9). With no filter this is
+    /// identical to [`search_similar`](Self::search_similar).
+    async fn search_similar_filtered(
+        &self,
+        data_type: &str,
+        field_name: &str,
+        query_vector: &[f32],
+        top_k: usize,
+        node_name: Option<&[String]>,
+        node_name_filter_operator: &str,
+    ) -> VectorDBResult<Vec<SearchResult>> {
+        let requested: Option<&[String]> = match node_name {
+            Some(names) if !names.is_empty() => Some(names),
+            _ => None,
+        };
+        let key = Self::key(data_type, field_name);
+        // Score (and filter) under the read guard, then drop it before the
+        // sort/truncate, mirroring `search_similar`.
+        let mut scored: Vec<(Uuid, f32, HashMap<String, serde_json::Value>)> = {
+            let g = self.collections.read().await;
+            let coll = g
+                .get(&key)
+                .ok_or_else(|| VectorDBError::CollectionNotFound(key.clone()))?;
+            if query_vector.len() != coll.dimension {
+                return Err(VectorDBError::DimensionMismatch {
+                    collection: key.clone(),
+                    expected: coll.dimension,
+                    actual: query_vector.len(),
+                });
+            }
+            coll.points
+                .iter()
+                .filter(|p| match requested {
+                    Some(names) => metadata_matches_node_filter(
+                        &p.metadata,
+                        Some(names),
+                        node_name_filter_operator,
+                    ),
+                    None => true,
+                })
+                .map(|p| {
+                    (
+                        p.id,
+                        cosine_similarity(&p.vector, query_vector),
+                        p.metadata.clone(),
+                    )
+                })
+                .collect()
+        };
+
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+        scored.truncate(top_k);
+        Ok(scored
+            .into_iter()
+            .map(|(id, score, metadata)| SearchResult {
+                id,
+                score,
+                metadata,
+            })
+            .collect())
+    }
+
+    async fn retrieve(
+        &self,
+        data_type: &str,
+        field_name: &str,
+        ids: &[Uuid],
+    ) -> VectorDBResult<Vec<SearchResult>> {
+        // Empty input short-circuits before taking the lock (mirrors
+        // index_points's empty-input guard).
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let key = Self::key(data_type, field_name);
+        let g = self.collections.read().await;
+        // Deliberate divergence from the CollectionNotFound idiom used
+        // elsewhere in this file: a missing collection yields an empty result
+        // (Python-parity — see the trait doc-comment on `retrieve`).
+        let Some(coll) = g.get(&key) else {
+            return Ok(vec![]);
+        };
+        Ok(coll
+            .points
+            .iter()
+            .filter(|p| ids.contains(&p.id))
+            .map(|p| SearchResult {
+                id: p.id,
+                score: 0.0,
+                metadata: p.metadata.clone(),
             })
             .collect())
     }
@@ -434,6 +564,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(db.collection_size("T", "f").await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn retrieve_returns_matching_points_only() {
+        let db = BruteForceVectorDB::new();
+        db.create_collection("T", "f", 2).await.unwrap();
+        let mut p1 = point(1, vec![1.0, 0.0]);
+        p1.metadata.insert("k".to_string(), serde_json::json!("v1"));
+        let p2 = point(2, vec![0.0, 1.0]);
+        let p3 = point(3, vec![1.0, 1.0]);
+        db.index_points("T", "f", &[p1, p2, p3]).await.unwrap();
+
+        let unknown = Uuid::from_u128(999);
+        let results = db
+            .retrieve("T", "f", &[Uuid::from_u128(1), Uuid::from_u128(2), unknown])
+            .await
+            .unwrap();
+
+        // Exactly the two known ids, order-independent.
+        let ids: std::collections::HashSet<Uuid> = results.iter().map(|r| r.id).collect();
+        assert_eq!(
+            ids,
+            [Uuid::from_u128(1), Uuid::from_u128(2)]
+                .into_iter()
+                .collect()
+        );
+        for r in &results {
+            assert_eq!(r.score, 0.0, "retrieve always sets score to 0.0");
+        }
+        // Metadata is returned verbatim.
+        let r1 = results.iter().find(|r| r.id == Uuid::from_u128(1)).unwrap();
+        assert_eq!(r1.metadata.get("k"), Some(&serde_json::json!("v1")));
+    }
+
+    #[tokio::test]
+    async fn retrieve_missing_collection_returns_empty() {
+        let db = BruteForceVectorDB::new();
+        // Never created — must be Ok([]), not Err(CollectionNotFound).
+        let results = db
+            .retrieve("Nope", "field", &[Uuid::from_u128(1)])
+            .await
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn retrieve_empty_ids_returns_empty() {
+        let db = BruteForceVectorDB::new();
+        db.create_collection("T", "f", 2).await.unwrap();
+        db.index_points("T", "f", &[point(1, vec![1.0, 0.0])])
+            .await
+            .unwrap();
+        let results = db.retrieve("T", "f", &[]).await.unwrap();
+        assert!(results.is_empty());
     }
 
     #[tokio::test]

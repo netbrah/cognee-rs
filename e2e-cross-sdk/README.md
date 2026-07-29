@@ -27,7 +27,7 @@ docker compose -f docker-compose.yml run --rm e2e-telemetry
 # LLM-gated phases (requires OPENAI_KEY):
 OPENAI_TOKEN=sk-... \
 docker compose -f docker-compose.yml run --rm e2e-http-tests \
-  pytest -vs /harness/ -k "test_http_(cognify|remember|recall|memify|improve|llm)" --tb=short
+  pytest -vs /harness/ -k "test_http_(cognify|remember|recall|memify|improve|llm|hybrid)" --tb=short
 ```
 
 ## DB bootstrap (Option B1 fix)
@@ -56,7 +56,7 @@ push and PR to `main`/`master`.
 | Phase-1 (health/auth/datasets/add/search/forget/openapi/errors) | push + PR | no | **required** |
 | Telemetry parity | push + PR | no | **required** |
 | Logging parity | push + PR (when `OPENAI_KEY` present) | no | recommended |
-| Phase-2 (cognify/remember/recall/memify/improve/llm) | push + PR when `OPENAI_KEY` set | yes | recommended (best-effort on forks) |
+| Phase-2 (cognify/remember/recall/memify/improve/llm/hybrid) | push + PR when `OPENAI_KEY` set | yes | recommended (best-effort on forks) |
 | Provenance parity | push + PR when `OPENAI_KEY` set | yes | recommended |
 | Phase-3 (websocket/sync/permissions/visualize) | `workflow_dispatch` only | mixed | optional/manual |
 

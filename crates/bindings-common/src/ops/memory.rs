@@ -407,6 +407,7 @@ pub async fn run_improve(
         enrichment_tasks: None,
         data: None,
         build_global_context_index: false,
+        build_truth_subspace: false,
         run_in_background: false,
         llm: svc.llm.clone(),
         storage: svc.storage.clone(),

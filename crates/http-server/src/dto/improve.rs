@@ -56,6 +56,12 @@ pub struct ImprovePayloadDTO {
     /// session-bridge path (Stages 1, 2, 4 in `crates/cognify/src/memify/`).
     #[serde(default, alias = "session_ids")]
     pub session_ids: Option<Vec<String>>,
+
+    /// When `true` and sessions are present, build/refresh the truth-subspace
+    /// centroid slots and per-chunk alignment (Stage 2d). Default-off; inert
+    /// when absent or `false`.
+    #[serde(default, alias = "build_truth_subspace")]
+    pub build_truth_subspace: Option<bool>,
 }
 
 #[cfg(test)]
@@ -143,6 +149,7 @@ mod tests {
             node_name: Some(vec!["n1".into()]),
             run_in_background: Some(false),
             session_ids: Some(vec!["s1".into()]),
+            build_truth_subspace: Some(false),
         };
         let s = serde_json::to_string(&dto).expect("serialize");
         for required in [
@@ -187,5 +194,40 @@ mod tests {
         assert!(parsed.data.is_none());
         assert!(parsed.node_name.is_none());
         assert!(parsed.run_in_background.is_none());
+        assert!(parsed.build_truth_subspace.is_none());
+    }
+
+    #[test]
+    fn improve_dto_round_trips_build_truth_subspace_both_cases() {
+        // camelCase wire.
+        let camel = r#"{ "buildTruthSubspace": true, "datasetName": "ds" }"#;
+        let parsed: ImprovePayloadDTO = serde_json::from_str(camel).expect("parse camelCase");
+        assert_eq!(parsed.build_truth_subspace, Some(true));
+
+        // snake_case alias.
+        let snake = r#"{ "build_truth_subspace": true, "dataset_name": "ds" }"#;
+        let parsed: ImprovePayloadDTO =
+            serde_json::from_str(snake).expect("parse snake_case alias");
+        assert_eq!(parsed.build_truth_subspace, Some(true));
+
+        // Absent -> None (default-off).
+        let absent = r#"{ "datasetName": "ds" }"#;
+        let parsed: ImprovePayloadDTO = serde_json::from_str(absent).expect("parse absent");
+        assert_eq!(parsed.build_truth_subspace, None);
+
+        // Serializes to camelCase only.
+        let dto = ImprovePayloadDTO {
+            build_truth_subspace: Some(true),
+            ..Default::default()
+        };
+        let s = serde_json::to_string(&dto).expect("serialize");
+        assert!(
+            s.contains("\"buildTruthSubspace\""),
+            "missing camelCase: {s}"
+        );
+        assert!(
+            !s.contains("\"build_truth_subspace\""),
+            "snake_case key leaked: {s}"
+        );
     }
 }

@@ -605,6 +605,7 @@ async fn remember_session(
             // Global context index and background mode are not used by the
             // inline remember() improve path.
             build_global_context_index: false,
+            build_truth_subspace: false,
             run_in_background: false,
         })
         .await;

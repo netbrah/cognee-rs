@@ -61,7 +61,7 @@ from cognee_py._native import (
 COGNEE_BINDING_SUPPRESS_LOGS: str
 
 class SearchType(str, Enum):
-    """Enumeration of the 15 supported search strategy types.
+    """Enumeration of the 16 supported search strategy types.
 
     Inherits from ``str`` so values compare equal to their string forms and
     can be passed wherever a plain string search-type is accepted.  Matches

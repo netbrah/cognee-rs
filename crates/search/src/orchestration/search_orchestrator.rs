@@ -80,10 +80,19 @@ fn apply_context_char_limit(gc: &str, max_chars: Option<usize>) -> &str {
     }
 }
 
-/// Extract node/edge IDs from context items produced by graph-traversal retrievers.
+/// Extract node/edge IDs from retrieved context items for the session cache.
 ///
-/// Items that came from a graph search carry `source_id` and `target_id` in
-/// their JSON payload. Pure-RAG items carry neither, so they contribute nothing.
+/// Two orthogonal item shapes are folded in:
+/// - **Graph-traversal items** (NaturalLanguage / GraphCompletion) carry
+///   top-level `source_id`/`target_id` (→ `node_ids`) and an optional `edge_id`
+///   (→ `edge_ids`) in their JSON payload. Pure-RAG items carry none, so they
+///   contribute nothing.
+/// - **Hybrid items** are `"kind"`-tagged (chunk/entity/fact); their graph node
+///   ids are derived by [`extract_used_ids`] — chunk ids, entity ids, and entity
+///   edge endpoints — and folded into `node_ids` ONLY (never `edge_ids`).
+///   Facts are excluded. This mirrors Python's `extract_context_object_ids`
+///   (`hybrid/context.py:33-58`), which returns `node_ids` alone.
+///
 /// The result shape matches Python's `UsedGraphElementIds` dict.
 fn build_used_graph_element_ids(
     context: Option<&[crate::types::SearchItem]>,
@@ -104,6 +113,11 @@ fn build_used_graph_element_ids(
             edge_ids.insert(eid.to_string());
         }
     }
+
+    // Fold hybrid (kind-tagged) node ids into `node_ids` only — never `edge_ids`.
+    // Safe on a mixed batch: graph-traversal items carry no `"kind"`, so
+    // `extract_used_ids` skips them.
+    node_ids.extend(crate::retrievers::extract_used_ids(items));
 
     if node_ids.is_empty() && edge_ids.is_empty() {
         None
@@ -529,6 +543,31 @@ impl SearchOrchestrator {
             }
             // If no feedback, or feedback with follow-up, proceed normally.
         }
+
+        // P1-10 parity: an unscoped hybrid completion still needs its retrieved
+        // context so the session cache can record `used_graph_element_ids`.
+        // On the default path `include_context`
+        // (`only_context || use_combined_context || use_dataset_scope`) is false,
+        // so `context` is `None` and the hybrid retriever would fetch its context
+        // privately inside `get_completion` — leaving the orchestrator blind to the
+        // graph elements that produced the answer, making the P1-10 feature inert.
+        // Python's `HybridRetriever.get_completion` computes
+        // `extract_context_object_ids(retrieved_objects)` on EVERY completion path
+        // (`hybrid_retriever.py:242-296`). We fetch the context here once and hand
+        // it to `get_completion`, so the retriever does not fetch twice and the
+        // answer is unchanged. This is deliberately scoped to the hybrid retriever
+        // (so other search types are untouched) and only when a session will
+        // actually be saved. Access tracking stays gated on `include_context`
+        // above and is intentionally not re-run here.
+        let context = if context.is_none()
+            && request.session_id.is_some()
+            && self.session_manager.is_some()
+            && retriever.search_type() == crate::types::SearchType::HybridCompletion
+        {
+            Some(retriever.get_context(&request.query_text, &params).await?)
+        } else {
+            context
+        };
 
         let output = retriever
             .get_completion(
@@ -1683,5 +1722,107 @@ mod tests {
             matches!(err, SearchError::InvalidInput(_)),
             "expected InvalidInput error, got: {err:?}"
         );
+    }
+
+    // ---- build_used_graph_element_ids extractor tests --------------------
+    //
+    // These call the private extractor directly with hand-built context
+    // fixtures. They pin the Rust port of Python's
+    // `extract_context_object_ids` (hybrid/context.py:33-58): hybrid items
+    // contribute graph node ids ONLY (never edge ids), facts are excluded,
+    // and the pre-existing graph-traversal path (source_id/target_id/edge_id)
+    // is preserved side by side.
+
+    fn item(payload: serde_json::Value) -> crate::types::SearchItem {
+        crate::types::SearchItem {
+            id: None,
+            score: None,
+            payload,
+        }
+    }
+
+    #[test]
+    fn used_ids_hybrid_chunk_only_populates_node_ids() {
+        let context = vec![item(
+            json!({ "kind": "chunk", "id": "chunk-1", "text": "t" }),
+        )];
+        let ids = super::build_used_graph_element_ids(Some(&context))
+            .expect("chunk id should yield Some");
+        assert_eq!(ids.node_ids, vec!["chunk-1".to_string()]);
+        assert!(ids.edge_ids.is_empty(), "hybrid path never emits edge_ids");
+    }
+
+    #[test]
+    fn used_ids_hybrid_entity_with_edges_collects_endpoints_deduped() {
+        let context = vec![item(json!({
+            "kind": "entity",
+            "id": "entity-1",
+            "name": "Alice",
+            "edges": [
+                { "source_id": "entity-1", "target_id": "acme-id" },
+                { "source_id": "entity-1", "target_id": "tennis-id" }
+            ]
+        }))];
+        let ids = super::build_used_graph_element_ids(Some(&context))
+            .expect("entity ids should yield Some");
+        // entity id + both endpoints, entity-1 deduped despite three mentions.
+        assert_eq!(
+            ids.node_ids,
+            vec![
+                "acme-id".to_string(),
+                "entity-1".to_string(),
+                "tennis-id".to_string()
+            ]
+        );
+        assert!(ids.edge_ids.is_empty());
+    }
+
+    #[test]
+    fn used_ids_hybrid_fact_contributes_nothing() {
+        let context = vec![item(json!({
+            "kind": "fact",
+            "id": "fact-1",
+            "text": "Acme acquired Initech."
+        }))];
+        // A fact-only batch yields no node ids and no edge ids -> None.
+        assert!(super::build_used_graph_element_ids(Some(&context)).is_none());
+    }
+
+    #[test]
+    fn used_ids_mixed_graph_traversal_and_hybrid_entity() {
+        let context = vec![
+            // Graph-traversal item: source/target -> node_ids, edge_id -> edge_ids.
+            item(json!({
+                "source_id": "gt-src",
+                "target_id": "gt-tgt",
+                "edge_id": "gt-edge"
+            })),
+            // Hybrid entity item: node ids only.
+            item(json!({
+                "kind": "entity",
+                "id": "entity-1",
+                "name": "Alice",
+                "edges": [ { "source_id": "entity-1", "target_id": "acme-id" } ]
+            })),
+        ];
+        let ids = super::build_used_graph_element_ids(Some(&context))
+            .expect("mixed batch should yield Some");
+        assert_eq!(
+            ids.node_ids,
+            vec![
+                "acme-id".to_string(),
+                "entity-1".to_string(),
+                "gt-src".to_string(),
+                "gt-tgt".to_string()
+            ]
+        );
+        // edge_ids contains ONLY the graph-traversal item's edge_id.
+        assert_eq!(ids.edge_ids, vec!["gt-edge".to_string()]);
+    }
+
+    #[test]
+    fn used_ids_empty_and_none_return_none() {
+        assert!(super::build_used_graph_element_ids(None).is_none());
+        assert!(super::build_used_graph_element_ids(Some(&[])).is_none());
     }
 }

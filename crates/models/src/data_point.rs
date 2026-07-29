@@ -13,6 +13,16 @@ fn default_feedback_weight() -> f64 {
     0.5
 }
 
+/// Default value for `importance_weight` (used by serde).
+///
+/// Mirrors Python's `DataPoint.importance_weight: float | None = 0.5`.
+/// Using a named serde default (rather than bare `#[serde(default)]`)
+/// ensures old payloads missing the key deserialize to `Some(0.5)` — the
+/// neutral rank — rather than `None`.
+fn default_importance_weight() -> Option<f64> {
+    Some(0.5)
+}
+
 /// Default value for `version` (used by serde).
 fn default_version() -> i32 {
     1
@@ -87,6 +97,14 @@ pub struct DataPoint {
     /// Feedback weight (default 0.5, matching Python)
     #[serde(default = "default_feedback_weight")]
     pub feedback_weight: f64,
+
+    /// Importance weight (default `Some(0.5)`, matching Python
+    /// `importance_weight: float | None = 0.5`). Propagated from the source
+    /// `Data` record through classify → chunk → summarize. Emitted
+    /// unconditionally (no `skip_serializing_if`) since it is effectively
+    /// always present.
+    #[serde(default = "default_importance_weight")]
+    pub importance_weight: Option<f64>,
 }
 
 impl DataPoint {
@@ -113,6 +131,7 @@ impl DataPoint {
             source_user: None,
             source_content_hash: None,
             feedback_weight: 0.5,
+            importance_weight: Some(0.5),
         }
     }
 
@@ -139,6 +158,7 @@ impl DataPoint {
             source_user: None,
             source_content_hash: None,
             feedback_weight: 0.5,
+            importance_weight: Some(0.5),
         }
     }
 
@@ -221,8 +241,42 @@ mod tests {
         assert!(dp.source_user.is_none());
         assert!(dp.source_content_hash.is_none());
         assert!((dp.feedback_weight - 0.5).abs() < f64::EPSILON);
+        assert_eq!(dp.importance_weight, Some(0.5));
         assert!(dp.created_at > 0);
         assert!(dp.updated_at > 0);
+    }
+
+    #[test]
+    fn with_metadata_initializes_importance_weight_default() {
+        let dp = DataPoint::with_metadata("Entity", None, HashMap::new());
+        assert_eq!(dp.importance_weight, Some(0.5));
+    }
+
+    #[test]
+    fn test_data_point_importance_weight_default_on_missing_field() {
+        // Simulate an old stored payload lacking the `importance_weight` key.
+        let json = json!({
+            "id": Uuid::new_v4().to_string(),
+            "created_at": 1_i64,
+            "updated_at": 1_i64,
+            "ontology_valid": false,
+            "metadata": {},
+            "type": "Entity",
+            "belongs_to_set": null,
+        });
+        let dp: DataPoint = serde_json::from_value(json).unwrap();
+        assert_eq!(dp.importance_weight, Some(0.5));
+    }
+
+    #[test]
+    fn importance_weight_round_trips_with_expected_key() {
+        let mut dp = DataPoint::new("Entity", None);
+        dp.importance_weight = Some(0.9);
+        let json = serde_json::to_string(&dp).unwrap();
+        assert!(json.contains(r#""importance_weight":0.9"#));
+
+        let parsed: DataPoint = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.importance_weight, Some(0.9));
     }
 
     #[test]

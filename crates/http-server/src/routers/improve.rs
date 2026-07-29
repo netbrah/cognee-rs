@@ -12,8 +12,9 @@
 use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::post};
 use cognee_cognify::memify::sync_graph_session::DEFAULT_MAX_LINES;
 use cognee_cognify::{
-    ChunkStrategy, CognifyConfig, MemifyConfig, apply_feedback_weights_pipeline,
-    persist_sessions_in_knowledge_graph, run_memify, sync_graph_to_session,
+    ChunkStrategy, CognifyConfig, DEFAULT_K, MemifyConfig, apply_feedback_weights_pipeline,
+    build_truth_subspace, distill_sessions_in_knowledge_graph, persist_sessions_in_knowledge_graph,
+    run_memify, sync_graph_to_session,
 };
 use cognee_database::{IngestDb, NoopPipelineRunRepository};
 use cognee_ingestion::AddPipeline;
@@ -27,6 +28,14 @@ use crate::dto::pipeline_run::PipelineRunInfoDTO;
 use crate::error::{ApiError, PipelineErrorSource};
 use crate::pipelines::dispatch::{DispatchOutcome, box_pipeline_future, dispatch_pipeline};
 use crate::state::AppState;
+
+/// Default feedback-weight mixing factor for the HTTP improve path.
+///
+/// Python parity: the HTTP improve router does not accept a `feedback_alpha`
+/// and `improve()` defaults it to `0.1`
+/// (`cognee/api/v1/improve/improve.py`: `kwargs.pop("feedback_alpha", 0.1)`).
+/// This is the same default used by the CLI, bindings, and remember paths.
+const DEFAULT_FEEDBACK_ALPHA: f64 = 0.1;
 
 // ─── post_improve ─────────────────────────────────────────────────────────────
 
@@ -244,7 +253,7 @@ async fn run_real_improve(
         .filter(|ids| !ids.is_empty())
         .cloned();
     let has_sessions = session_ids.is_some();
-    let feedback_alpha = 0.5f64;
+    let feedback_alpha = DEFAULT_FEEDBACK_ALPHA;
 
     let ontology_resolver: Arc<dyn OntologyResolver> = components
         .ontology_resolver
@@ -325,6 +334,91 @@ async fn run_real_improve(
                 );
             }
         }
+    }
+
+    // ---- Stage 2c: Distill Sessions into Learnings ----
+    //
+    // Mirrors the SDK `improve()`'s Stage 2c (`distill_sessions_in_knowledge_graph`).
+    // Each session's Q&A is curated into durable, entity-anchored lesson documents
+    // tagged with the `session_learnings` node-set and cognified into the graph.
+    // Gated on sessions being present, same as the SDK. Without this the HTTP
+    // improve() would build a different graph than an identical SDK call.
+    // Log-only; never aborts (matches the surrounding stage style).
+    if let Some(sids) = session_ids.as_ref() {
+        match (components.session_store.as_ref(), components.llm.as_ref()) {
+            (Some(store), Some(llm)) => {
+                let add_pipeline = AddPipeline::new(storage.clone(), database.clone())
+                    .with_thread_pool(thread_pool.clone())
+                    .with_graph_db(graph_db.clone())
+                    .with_vector_db(vector_db.clone())
+                    .with_database(database.clone())
+                    .with_pipeline_run_repo(NoopPipelineRunRepository::arc());
+
+                let mut cognify_config =
+                    CognifyConfig::default().with_chunk_strategy(ChunkStrategy::Paragraph);
+                if let Some(ref t) = components.transcriber {
+                    cognify_config = cognify_config.with_transcriber(Arc::clone(t));
+                }
+
+                let r = distill_sessions_in_knowledge_graph(
+                    sids,
+                    dataset_name,
+                    user.id,
+                    user.tenant_id,
+                    Arc::clone(store),
+                    &add_pipeline,
+                    Arc::clone(llm),
+                    storage.clone(),
+                    graph_db.clone(),
+                    vector_db.clone(),
+                    embedding_engine.clone(),
+                    database.clone(),
+                    NoopPipelineRunRepository::arc(),
+                    thread_pool.clone(),
+                    Arc::clone(&ontology_resolver),
+                    &cognify_config,
+                )
+                .await;
+                tracing::info!(
+                    sessions_distilled = r.sessions_distilled,
+                    lessons_published = r.lessons_published,
+                    "improve stage 2c (distill_sessions) complete"
+                );
+            }
+            _ => {
+                tracing::warn!(
+                    "improve stage 2c: session_store and llm are required; skipping distill_sessions"
+                );
+            }
+        }
+    }
+
+    // ---- Stage 2d: Build Truth Subspace (opt-in) ----
+    //
+    // Phase-2 join point, mirroring `improve()`'s Stage 2d. Gated on
+    // `has_sessions && buildTruthSubspace`; fully inert (zero I/O) when off. The
+    // `dataset_id` is already resolved in scope, so — unlike the SDK path — no
+    // `get_dataset_by_name` lookup is needed. Log-only; never aborts (the call
+    // is infallible). `vector_db`/`embedding_engine` are moved into Stage 3
+    // below, so clone them here.
+    if payload.build_truth_subspace.unwrap_or(false)
+        && let Some(sids) = session_ids.as_ref()
+    {
+        let ts = build_truth_subspace(
+            dataset_id,
+            sids,
+            graph_db.clone(),
+            vector_db.clone(),
+            embedding_engine.clone(),
+            DEFAULT_K,
+        )
+        .await;
+        tracing::info!(
+            anchors = ts.anchors,
+            nodes_scored = ts.nodes_scored,
+            truth_epoch = ts.truth_epoch,
+            "improve stage 2d (build_truth_subspace) complete"
+        );
     }
 
     // ---- Stage 3: Default Enrichment (always) ----
@@ -432,6 +526,14 @@ mod tests {
             auth_method: crate::auth::AuthMethod::DefaultUser,
         };
         post_improve(user, State(state), Json(payload)).await
+    }
+
+    /// Python parity: the HTTP improve path must default `feedback_alpha` to
+    /// `0.1` (`cognee/api/v1/improve/improve.py`: `kwargs.pop("feedback_alpha",
+    /// 0.1)`), NOT the previously-hardcoded `0.5` which was 5x too strong.
+    #[test]
+    fn default_feedback_alpha_matches_python() {
+        assert_eq!(DEFAULT_FEEDBACK_ALPHA, 0.1);
     }
 
     #[tokio::test]

@@ -1,7 +1,23 @@
-use crate::error::VectorDBResult;
+use crate::error::{VectorDBError, VectorDBResult};
 use crate::models::{SearchResult, VectorPoint};
+use crate::node_filter::metadata_matches_node_filter;
 use async_trait::async_trait;
 use uuid::Uuid;
+
+/// Upper bound on the over-fetch window used by the *default* (client-side)
+/// [`VectorDB::search_similar_filtered`] fallback.
+///
+/// The default fallback cannot filter inside the engine, so it over-fetches by
+/// pure similarity and drops out-of-set rows afterwards (limit-then-filter).
+/// Widening the fetch to the whole collection whenever it fits under this cap
+/// makes that limit-then-filter *exactly* equal to a server-side
+/// filter-then-limit (the window can no longer be exhausted by out-of-set rows),
+/// so the fallback is exact for any collection at or below the cap. Only
+/// collections above the cap keep a bounded heuristic window and a residual
+/// recall gap. Adapters that override `search_similar_filtered` with a real
+/// server-side predicate (in-memory scan, pgvector JSONB `WHERE`) never touch
+/// this constant and are exact at any size.
+pub const NODE_FILTER_RECALL_FETCH_CAP: usize = 4096;
 
 /// Vector database trait
 #[async_trait]
@@ -72,6 +88,82 @@ pub trait VectorDB: Send + Sync {
         top_k: usize,
     ) -> VectorDBResult<Vec<SearchResult>>;
 
+    /// Search for similar vectors, scoped to rows whose `belongs_to_set`
+    /// membership satisfies a NodeSet filter (finding F9's server-side
+    /// filter-then-limit).
+    ///
+    /// # Arguments
+    /// * `data_type` / `field_name` / `query_vector` / `top_k` — as
+    ///   [`search_similar`](Self::search_similar).
+    /// * `node_name` — requested NodeSet names. `None`/empty means "no filter",
+    ///   in which case this is exactly [`search_similar`](Self::search_similar).
+    /// * `node_name_filter_operator` — `"AND"` (requested ⊆ row's set) or
+    ///   anything else (`"OR"`, non-empty intersection); see
+    ///   [`crate::node_filter`] for the full membership semantics.
+    ///
+    /// Direct port of the `node_name` argument Python threads into
+    /// `vector_engine.search(...)`, which filters **inside the engine before
+    /// applying the limit** so every returned row is in-set and no valid in-set
+    /// row is ever crowded out by higher-similarity out-of-set rows.
+    ///
+    /// # Default implementation (bounded, client-side)
+    /// The provided default cannot push the predicate into the engine, so it
+    /// over-fetches by pure similarity, drops out-of-set rows via
+    /// [`crate::node_filter::metadata_matches_node_filter`], then truncates to
+    /// `top_k` (limit-then-filter). It widens the fetch to the whole collection
+    /// whenever that fits under [`NODE_FILTER_RECALL_FETCH_CAP`], making it
+    /// **exact** at or below the cap and only bounded above it. This is the
+    /// correct behavior for engines that cannot express the nested-array
+    /// membership predicate (e.g. the LanceDB adapter, whose `metadata` is an
+    /// opaque JSON string) and for the in-tree test doubles, which inherit it
+    /// unchanged.
+    ///
+    /// Adapters that *can* filter server-side (the in-memory scanners and
+    /// pgvector's JSONB `WHERE`) override this with an **exact** filter-then-limit
+    /// at any collection size.
+    async fn search_similar_filtered(
+        &self,
+        data_type: &str,
+        field_name: &str,
+        query_vector: &[f32],
+        top_k: usize,
+        node_name: Option<&[String]>,
+        node_name_filter_operator: &str,
+    ) -> VectorDBResult<Vec<SearchResult>> {
+        let requested = match node_name {
+            Some(names) if !names.is_empty() => names,
+            // No filter requested — identical to plain search_similar.
+            _ => {
+                return self
+                    .search_similar(data_type, field_name, query_vector, top_k)
+                    .await;
+            }
+        };
+
+        // Limit-then-filter with a bounded over-fetch. Widen the window to the
+        // whole collection when it fits under the cap so dropping out-of-set
+        // rows and truncating to `top_k` reproduces server-side
+        // filter-then-limit exactly; only collections above the cap keep the
+        // bounded heuristic window and its residual recall gap.
+        let heuristic_window = top_k.saturating_mul(4).max(top_k + 20);
+        let collection_size = self.collection_size(data_type, field_name).await?;
+        let fetch_limit = heuristic_window.max(collection_size.min(NODE_FILTER_RECALL_FETCH_CAP));
+        let results = self
+            .search_similar(data_type, field_name, query_vector, fetch_limit)
+            .await?;
+        Ok(results
+            .into_iter()
+            .filter(|r| {
+                metadata_matches_node_filter(
+                    &r.metadata,
+                    Some(requested),
+                    node_name_filter_operator,
+                )
+            })
+            .take(top_k)
+            .collect())
+    }
+
     /// Delete collection
     async fn delete_collection(&self, data_type: &str, field_name: &str) -> VectorDBResult<()>;
 
@@ -85,6 +177,78 @@ pub trait VectorDB: Send + Sync {
         let _ = (data_type, field_name, point_ids);
         Ok(())
     }
+
+    /// Upsert caller-provided vectors into `(data_type, field_name)` without
+    /// invoking any embedding engine.
+    ///
+    /// This is the escape hatch for **small, system-owned vector state**
+    /// (e.g. truth-subspace centroids) where the caller has *already* computed
+    /// the vector and re-embedding it from text would be wrong. It is NOT the
+    /// content-indexing path — use [`index_points`](Self::index_points) for
+    /// content-addressed data points.
+    ///
+    /// Direct port of Python's `VectorDBInterface.upsert_raw_vectors`
+    /// (`vector_db_interface.py:66-79`), whose base likewise
+    /// `raise NotImplementedError`. Only the four real adapters (Mock,
+    /// BruteForce, LanceDB, PgVector) override it; every other implementor
+    /// inherits this error-returning default (the correct "unsupported" answer).
+    ///
+    /// # Semantics (for overriding adapters)
+    /// * **Empty `points`** → `Ok(())` no-op (never touches storage; do not
+    ///   read `points[0]`).
+    /// * **Missing collection** → self-created with `points[0].vector.len()` as
+    ///   the dimension (nothing else ever creates a system-owned collection like
+    ///   `TruthCentroid_vector`, so the raw-upsert path must bootstrap it).
+    /// * **By-id insert-or-replace with FULL metadata replace** — unlike
+    ///   [`index_points`](Self::index_points), this does **not** union
+    ///   `dataset_ids`/`dataset_id` membership from a prior point at the same id.
+    ///   Each raw point is written verbatim (its id already scopes it), matching
+    ///   Python's raw write.
+    ///
+    /// # API divergence from Python
+    /// Python threads a `payload_schema: Optional[Any]` argument for
+    /// provider-side schema declaration. Rust has no adapter-level runtime schema
+    /// hook — validation happens where the caller deserializes the retrieved
+    /// metadata — so the parameter is dropped entirely rather than threaded
+    /// through and ignored.
+    async fn upsert_raw_vectors(
+        &self,
+        data_type: &str,
+        field_name: &str,
+        points: &[VectorPoint],
+    ) -> VectorDBResult<()> {
+        let _ = (data_type, field_name, points);
+        Err(VectorDBError::StorageError(
+            "upsert_raw_vectors is not implemented for this adapter".to_string(),
+        ))
+    }
+
+    /// Fetch stored points by ID (direct lookup, no similarity search).
+    ///
+    /// Returns the stored `metadata` payload for each of the requested `ids`
+    /// that exists in the `(data_type, field_name)` collection, with a
+    /// placeholder `score` of `0.0` on every result (the field only carries
+    /// meaning for similarity search, so callers must not read it as a
+    /// similarity value). Direct port of Python's `VectorDBInterface.retrieve`.
+    ///
+    /// # Semantics
+    /// * **Empty `ids`** → `Ok(vec![])` without touching storage.
+    /// * **Unknown collection** → `Ok(vec![])` (a *deliberate* divergence from
+    ///   [`search_similar`](Self::search_similar) /
+    ///   [`delete_points`](Self::delete_points) /
+    ///   [`collection_size`](Self::collection_size), which return
+    ///   `CollectionNotFound`; faithful to Python, whose adapters special-case
+    ///   a missing collection to `[]`).
+    /// * **IDs not present** in the collection are silently absent from the
+    ///   result — no error, no placeholder entry.
+    /// * **Result order is NOT guaranteed** to match input-`ids` order; callers
+    ///   needing a specific order must re-index by [`SearchResult::id`].
+    async fn retrieve(
+        &self,
+        data_type: &str,
+        field_name: &str,
+        ids: &[Uuid],
+    ) -> VectorDBResult<Vec<SearchResult>>;
 
     /// Get collection statistics
     async fn collection_size(&self, data_type: &str, field_name: &str) -> VectorDBResult<usize>;

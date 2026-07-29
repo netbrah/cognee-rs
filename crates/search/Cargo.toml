@@ -26,20 +26,21 @@ cognee-llm = { path = "../llm", version = "0.1.3" }
 cognee-models = { path = "../models", version = "0.1.3" }
 cognee-session = { path = "../session", version = "0.1.3", features = ["sea-orm-store"] }
 cognee-telemetry = { path = "../telemetry", version = "0.1.3" }
+cognee-truth-subspace = { path = "../truth-subspace", version = "0.1.3" }
 cognee-utils = { path = "../utils", version = "0.1.3" }
 cognee-vector = { path = "../vector", version = "0.1.3" }
 
 async-trait.workspace = true
 indexmap = "2"
 regex = "1"
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "macros"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 chrono.workspace = true
 schemars.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-uuid = { workspace = true, features = ["serde", "v4"] }
+uuid = { workspace = true, features = ["serde", "v4", "v5"] }
 
 [dev-dependencies]
 cognee-core      = { path = "../core" }

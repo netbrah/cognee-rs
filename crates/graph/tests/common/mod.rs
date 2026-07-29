@@ -9,7 +9,7 @@
 //! with *any* backend (Ladybug, PostgreSQL, Mock, …). Backend-specific
 //! integration tests construct their adapter and call these helpers.
 
-use cognee_graph::{EdgeData, GraphDBTrait, GraphDBTraitExt};
+use cognee_graph::{EdgeData, GraphDBTrait, GraphDBTraitExt, NodeTruthState};
 use serde::Serialize;
 use serde_json::json;
 use std::borrow::Cow;
@@ -528,4 +528,291 @@ pub async fn test_properties_json_round_trip(db: &dyn GraphDBTrait) {
             .unwrap(),
         1
     );
+}
+
+// -- node truth state --------------------------------------------------------
+
+pub async fn test_node_truth_state_round_trip(db: &dyn GraphDBTrait) {
+    db.delete_graph().await.unwrap();
+
+    let a = TestNode::new("ts_a", "A", "T", 0);
+    let b = TestNode::new("ts_b", "B", "T", 0);
+    db.add_nodes(&[&a, &b]).await.unwrap();
+
+    let mut updates = HashMap::new();
+    updates.insert(
+        "ts_a".to_string(),
+        NodeTruthState {
+            truth_alignment: vec![0.1, 0.2, 0.3],
+            truth_epoch: 5,
+        },
+    );
+    // Epoch 0 is a legitimate real epoch and must survive as 0, not -1.
+    updates.insert(
+        "ts_b".to_string(),
+        NodeTruthState {
+            truth_alignment: vec![],
+            truth_epoch: 0,
+        },
+    );
+
+    let set_result = db.set_node_truth_state(&updates).await.unwrap();
+    assert_eq!(set_result.get("ts_a"), Some(&true));
+    assert_eq!(set_result.get("ts_b"), Some(&true));
+
+    let got = db
+        .get_node_truth_state(&["ts_a".to_string(), "ts_b".to_string()])
+        .await
+        .unwrap();
+
+    let a_state = got.get("ts_a").expect("ts_a present");
+    assert_eq!(a_state.truth_alignment, vec![0.1, 0.2, 0.3]);
+    assert_eq!(a_state.truth_epoch, 5);
+
+    let b_state = got.get("ts_b").expect("ts_b present");
+    assert_eq!(b_state.truth_alignment, Vec::<f64>::new());
+    assert_eq!(b_state.truth_epoch, 0);
+}
+
+pub async fn test_node_truth_state_missing_and_invalid(db: &dyn GraphDBTrait) {
+    db.delete_graph().await.unwrap();
+
+    // (a) never-added id -> absent from the result map.
+    let ghost = db
+        .get_node_truth_state(&["ghost".to_string()])
+        .await
+        .unwrap();
+    assert!(!ghost.contains_key("ghost"));
+
+    // (b) plain node with no truth props -> present with defaults ([], -1).
+    let plain = TestNode::new("ts_plain", "P", "T", 0);
+    db.add_node(&plain).await.unwrap();
+
+    // (c) numeric-string epoch "3" parses to 3; non-array alignment -> [].
+    db.add_node_raw(json!({
+        "id": "ts_str",
+        "name": "Str",
+        "type": "T",
+        "truth_epoch": "3",
+        "truth_alignment": "not-an-array"
+    }))
+    .await
+    .unwrap();
+
+    // non-numeric epoch "bad" -> -1 sentinel.
+    db.add_node_raw(json!({
+        "id": "ts_bad",
+        "name": "Bad",
+        "type": "T",
+        "truth_epoch": "bad"
+    }))
+    .await
+    .unwrap();
+
+    let got = db
+        .get_node_truth_state(&[
+            "ts_plain".to_string(),
+            "ts_str".to_string(),
+            "ts_bad".to_string(),
+        ])
+        .await
+        .unwrap();
+
+    let plain_state = got
+        .get("ts_plain")
+        .expect("ts_plain present with defaults, not omitted");
+    assert_eq!(plain_state.truth_alignment, Vec::<f64>::new());
+    assert_eq!(plain_state.truth_epoch, -1);
+
+    let str_state = got.get("ts_str").expect("ts_str present");
+    assert_eq!(str_state.truth_epoch, 3);
+    assert_eq!(str_state.truth_alignment, Vec::<f64>::new());
+
+    let bad_state = got.get("ts_bad").expect("ts_bad present");
+    assert_eq!(bad_state.truth_epoch, -1);
+}
+
+/// `set_node_truth_state` must read-merge-write: writing `truth_alignment` /
+/// `truth_epoch` onto a node must NOT clobber the node's other, pre-existing
+/// properties. Seeds a node carrying a *custom* sibling property
+/// (`feedback_weight`) that the fixed-schema `TestNode` doesn't have, so a
+/// clobbering (delete-then-re-add-only-truth-fields) impl would be detected.
+pub async fn test_node_truth_state_preserves_other_properties(db: &dyn GraphDBTrait) {
+    db.delete_graph().await.unwrap();
+
+    // Seed via add_node_raw so we can attach an arbitrary sibling property that
+    // is not part of the truth-state payload.
+    db.add_node_raw(json!({
+        "id": "ts_pres",
+        "name": "Preserved",
+        "type": "Person",
+        "value": 77,
+        "feedback_weight": 0.42
+    }))
+    .await
+    .unwrap();
+
+    let mut updates = HashMap::new();
+    updates.insert(
+        "ts_pres".to_string(),
+        NodeTruthState {
+            truth_alignment: vec![0.7, 0.8],
+            truth_epoch: 9,
+        },
+    );
+    let set_result = db.set_node_truth_state(&updates).await.unwrap();
+    assert_eq!(set_result.get("ts_pres"), Some(&true));
+
+    // Fetch the *whole* node and assert the sibling props AND the freshly
+    // written truth-state fields all coexist.
+    let node = db
+        .get_node("ts_pres")
+        .await
+        .unwrap()
+        .expect("node should still exist");
+
+    // Pre-existing siblings survived the truth-state write.
+    assert_eq!(
+        node.get("name").unwrap().as_str().unwrap(),
+        "Preserved",
+        "name must be preserved after set_node_truth_state"
+    );
+    assert_eq!(
+        node.get("type").unwrap().as_str().unwrap(),
+        "Person",
+        "type must be preserved after set_node_truth_state"
+    );
+    assert_eq!(
+        node.get("value").unwrap().as_i64().unwrap(),
+        77,
+        "value must be preserved after set_node_truth_state"
+    );
+    assert_eq!(
+        node.get("feedback_weight").unwrap().as_f64().unwrap(),
+        0.42,
+        "custom sibling property feedback_weight must not be clobbered"
+    );
+
+    // The truth-state fields were actually written.
+    let alignment: Vec<f64> = node
+        .get("truth_alignment")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_f64().unwrap())
+        .collect();
+    assert_eq!(alignment, vec![0.7, 0.8]);
+    assert_eq!(node.get("truth_epoch").unwrap().as_i64().unwrap(), 9);
+
+    // Cross-check the canonical reader agrees.
+    let got = db
+        .get_node_truth_state(&["ts_pres".to_string()])
+        .await
+        .unwrap();
+    let state = got.get("ts_pres").expect("ts_pres present");
+    assert_eq!(state.truth_alignment, vec![0.7, 0.8]);
+    assert_eq!(state.truth_epoch, 9);
+}
+
+// -- get_neighborhood --------------------------------------------------------
+
+pub async fn test_get_neighborhood_depth1(db: &dyn GraphDBTrait) {
+    db.delete_graph().await.unwrap();
+
+    // Fixture: `seed` is the stored TARGET of `source -> seed` (rel "in") and
+    // the stored SOURCE of `seed -> target` (rel "out"). `far` is two hops away
+    // via `target -> far` and must NOT appear at depth 1.
+    let seed = TestNode::new("seed", "Seed", "T", 0);
+    let target = TestNode::new("target", "Target", "T", 0);
+    let source = TestNode::new("source", "Source", "T", 0);
+    let far = TestNode::new("far", "Far", "T", 0);
+    db.add_nodes(&[&seed, &target, &source, &far])
+        .await
+        .unwrap();
+
+    db.add_edge("seed", "target", "out", None).await.unwrap();
+    db.add_edge("source", "seed", "in", None).await.unwrap();
+    db.add_edge("target", "far", "out", None).await.unwrap();
+
+    let (nodes, edges) = db.get_neighborhood(&["seed".to_string()], 1).await.unwrap();
+
+    // Node set is exactly {seed, target, source} — not `far`.
+    let node_ids: std::collections::HashSet<&str> =
+        nodes.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(node_ids.len(), 3, "expected exactly seed, target, source");
+    assert!(node_ids.contains("seed"));
+    assert!(node_ids.contains("target"));
+    assert!(node_ids.contains("source"));
+    assert!(!node_ids.contains("far"), "far is two hops away");
+
+    // Exact-direction (anti-flip) assertions — the regression guard for
+    // locked decision 6.
+    let edge_set: std::collections::HashSet<(&str, &str, &str)> = edges
+        .iter()
+        .map(|(s, t, r, _)| (s.as_str(), t.as_str(), r.as_str()))
+        .collect();
+    assert!(
+        edge_set.contains(&("source", "seed", "in")),
+        "stored direction source->seed must be preserved, got {edge_set:?}"
+    );
+    assert!(
+        edge_set.contains(&("seed", "target", "out")),
+        "stored direction seed->target must be preserved, got {edge_set:?}"
+    );
+    // The flipped forms must be ABSENT.
+    assert!(
+        !edge_set.contains(&("seed", "source", "in")),
+        "flipped edge seed->source must NOT appear"
+    );
+    assert!(
+        !edge_set.contains(&("target", "seed", "out")),
+        "flipped edge target->seed must NOT appear"
+    );
+    // The two-hop edge must not appear (far not in the resolved set).
+    assert!(!edge_set.contains(&("target", "far", "out")));
+    assert_eq!(edges.len(), 2, "exactly the two seed-incident edges");
+}
+
+pub async fn test_get_neighborhood_multiple_seeds(db: &dyn GraphDBTrait) {
+    db.delete_graph().await.unwrap();
+
+    // Two seeds (s1, s2) share one common neighbor (`shared`) and have one edge
+    // directly between them.
+    let s1 = TestNode::new("s1", "S1", "T", 0);
+    let s2 = TestNode::new("s2", "S2", "T", 0);
+    let shared = TestNode::new("shared", "Shared", "T", 0);
+    db.add_nodes(&[&s1, &s2, &shared]).await.unwrap();
+
+    db.add_edge("s1", "shared", "r", None).await.unwrap();
+    db.add_edge("s2", "shared", "r", None).await.unwrap();
+    db.add_edge("s1", "s2", "between", None).await.unwrap();
+
+    let (nodes, edges) = db
+        .get_neighborhood(&["s1".to_string(), "s2".to_string()], 1)
+        .await
+        .unwrap();
+
+    // `shared` must appear exactly once (dedup across the two seeds).
+    let shared_count = nodes.iter().filter(|(id, _)| id == "shared").count();
+    assert_eq!(shared_count, 1, "shared neighbor must be deduped");
+    assert_eq!(nodes.len(), 3, "expected exactly s1, s2, shared");
+
+    // The seed-seed edge must appear exactly once.
+    let between_count = edges
+        .iter()
+        .filter(|(s, t, r, _)| s == "s1" && t == "s2" && r == "between")
+        .count();
+    assert_eq!(between_count, 1, "seed-seed edge must appear exactly once");
+    assert_eq!(edges.len(), 3, "all three edges, no duplicates");
+}
+
+pub async fn test_get_neighborhood_empty_seeds(db: &dyn GraphDBTrait) {
+    db.delete_graph().await.unwrap();
+
+    // Empty seeds must short-circuit to an empty result without issuing a query
+    // that would error on an empty `IN (...)` / `unnest`.
+    let (nodes, edges) = db.get_neighborhood(&[], 1).await.unwrap();
+    assert!(nodes.is_empty());
+    assert!(edges.is_empty());
 }

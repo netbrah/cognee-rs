@@ -439,11 +439,11 @@ void cg_sdk_add_and_cognify(const CgSdk*        sdk,
  *       "searchResponse": null | {...}     // SearchResponse or null
  *     }
  *
- * SearchType strings (SCREAMING_SNAKE_CASE — all 15 valid values):
+ * SearchType strings (SCREAMING_SNAKE_CASE — all 16 valid values):
  *   SUMMARIES, CHUNKS, RAG_COMPLETION, TRIPLET_COMPLETION, GRAPH_COMPLETION,
  *   GRAPH_SUMMARY_COMPLETION, CYPHER, NATURAL_LANGUAGE, GRAPH_COMPLETION_COT,
  *   GRAPH_COMPLETION_CONTEXT_EXTENSION, FEELING_LUCKY, FEEDBACK, TEMPORAL,
- *   CODING_RULES, CHUNKS_LEXICAL
+ *   CODING_RULES, CHUNKS_LEXICAL, HYBRID_COMPLETION
  *
  * RecallScope strings (5 valid values):
  *   "auto" | "graph" | "session" | "trace" | "graph_context"

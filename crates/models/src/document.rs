@@ -126,6 +126,8 @@ pub fn classify_documents(data_items: &[Data]) -> Vec<Document> {
             let class_name = doc_type_to_class_name(doc_type);
             let mut base = DataPoint::new(class_name, None);
             base.id = data.id; // use Data's deterministic ID
+            // Port of classify_documents.py:144-146 — coalesce None to 0.5.
+            base.importance_weight = Some(data.importance_weight.unwrap_or(0.5));
             base.set_metadata("index_fields", json!(["name"]));
 
             // Format external_metadata as indented JSON (Python does json.dumps(..., indent=4))
@@ -233,7 +235,44 @@ mod tests {
         .build()
     }
 
+    fn make_data_with_importance(
+        mime_type: &str,
+        extension: &str,
+        importance_weight: Option<f64>,
+    ) -> Data {
+        let mut builder = Data::builder(
+            Uuid::new_v4(),
+            format!("test.{extension}"),
+            "/storage/test",
+            "text://test",
+            extension,
+            mime_type,
+            "hash123",
+            Uuid::new_v4(),
+        );
+        if let Some(w) = importance_weight {
+            builder = builder.importance_weight(w);
+        }
+        builder.build()
+    }
+
     // ----- Extension-based classification tests -----
+
+    #[test]
+    fn classify_documents_propagates_importance_weight() {
+        let data = vec![make_data_with_importance("text/plain", "txt", Some(0.9))];
+        let docs = classify_documents(&data);
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].base.importance_weight, Some(0.9));
+    }
+
+    #[test]
+    fn classify_documents_coalesces_none_importance_weight_to_default() {
+        let data = vec![make_data_with_importance("text/plain", "txt", None)];
+        let docs = classify_documents(&data);
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].base.importance_weight, Some(0.5));
+    }
 
     #[test]
     fn classifies_text_plain() {

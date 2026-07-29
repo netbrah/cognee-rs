@@ -4,10 +4,10 @@
  *
  * Tests (no network, no LLM required — MOCK_EMBEDDING=true):
  *
- *   1. String-mapping check — all 15 valid SearchType strings are accepted
+ *   1. String-mapping check — all 16 valid SearchType strings are accepted
  *      (not rejected as CG_ERR_SDK_VALIDATION); an invalid string IS rejected.
  *      This sub-test does NOT execute live searches; it just verifies that
- *      parse_search_type accepts all 15 known values and rejects unknowns.
+ *      parse_search_type accepts all 16 known values and rejects unknowns.
  *      (Mirrors the TS locked SearchType ↔ string test.)
  *
  *   2. Valid cg_sdk_search with a non-LLM search type (CHUNKS_LEXICAL) against
@@ -176,7 +176,7 @@ int main(void)
 
     /* ── Test 1: SearchType string-mapping check ─────────────────────────── */
     /*
-     * This is a string-mapping sub-test only: verify that all 15 valid
+     * This is a string-mapping sub-test only: verify that all 16 valid
      * SearchType strings are NOT rejected as CG_ERR_SDK_VALIDATION (14), and
      * that an invalid string IS rejected as CG_ERR_SDK_VALIDATION.
      *
@@ -198,7 +198,7 @@ int main(void)
         cg_string_destroy(result);
         printf("  invalid searchType → CG_ERR_SDK_VALIDATION  OK\n");
 
-        /* 1b: all 15 valid strings must NOT yield CG_ERR_SDK_VALIDATION. */
+        /* 1b: all 16 valid strings must NOT yield CG_ERR_SDK_VALIDATION. */
         const char *search_types[] = {
             "SUMMARIES",
             "CHUNKS",
@@ -215,6 +215,7 @@ int main(void)
             "TEMPORAL",
             "CODING_RULES",
             "CHUNKS_LEXICAL",
+            "HYBRID_COMPLETION",
         };
         int n_types = (int)(sizeof(search_types) / sizeof(search_types[0]));
         char opts_buf[128];
@@ -232,7 +233,7 @@ int main(void)
                    st_code == CG_OK ? ", CG_OK" : "");
             cg_string_destroy(st_result);
         }
-        printf("  all 15 searchType strings accepted (not CG_ERR_SDK_VALIDATION)  OK\n");
+        printf("  all 16 searchType strings accepted (not CG_ERR_SDK_VALIDATION)  OK\n");
     }
 
     /* ── Test 2: cg_sdk_search non-LLM type → CG_OK, well-formed JSON ──── */

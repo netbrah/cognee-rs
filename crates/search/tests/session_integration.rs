@@ -313,6 +313,141 @@ async fn save_qa_populates_used_graph_element_ids() {
 }
 
 // ---------------------------------------------------------------------------
+// FakeHybridRetriever — reports SearchType::HybridCompletion and returns
+// hybrid `kind`-tagged context items so `build_used_graph_element_ids` (via
+// `extract_used_ids`) can derive node ids from the hybrid lane.
+// ---------------------------------------------------------------------------
+
+struct FakeHybridRetriever;
+
+#[async_trait]
+impl SearchRetriever for FakeHybridRetriever {
+    fn search_type(&self) -> SearchType {
+        SearchType::HybridCompletion
+    }
+
+    async fn get_context(
+        &self,
+        _query: &str,
+        _params: &SearchParams,
+    ) -> Result<SearchContext, SearchError> {
+        // A chunk item and an entity item, both kind-tagged like the real
+        // hybrid retriever emits. `extract_used_ids` folds the chunk id and the
+        // entity id + edge endpoints into node_ids.
+        Ok(vec![
+            SearchItem {
+                id: None,
+                score: Some(0.9),
+                payload: json!({ "kind": "chunk", "id": "hybrid-chunk-1", "text": "t" }),
+            },
+            SearchItem {
+                id: None,
+                score: Some(0.8),
+                payload: json!({
+                    "kind": "entity",
+                    "id": "hybrid-entity-1",
+                    "name": "Alice",
+                    "edges": [ { "source_id": "hybrid-entity-1", "target_id": "acme-id" } ]
+                }),
+            },
+        ])
+    }
+
+    async fn get_completion(
+        &self,
+        query: &str,
+        context: Option<SearchContext>,
+        _session: &SessionContext,
+        params: &SearchParams,
+    ) -> Result<SearchOutput, SearchError> {
+        // Standard retriever contract: use the passed context if present,
+        // otherwise fetch privately. The orchestrator fix must supply the
+        // context on the unscoped path so used ids are captured.
+        let _ctx = match context {
+            Some(existing) => existing,
+            None => self.get_context(query, params).await?,
+        };
+        Ok(SearchOutput::Text("hybrid answer".to_string()))
+    }
+}
+
+fn hybrid_request(query: &str, session_id: Option<&str>) -> SearchRequest {
+    SearchRequest {
+        search_type: SearchType::HybridCompletion,
+        // Unscoped: no dataset scope, not only_context, not combined_context.
+        only_context: Some(false),
+        use_combined_context: Some(false),
+        ..graph_request(query, session_id)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 2b: unscoped_hybrid_completion_populates_used_graph_element_ids
+//
+// Regression test for the P1-10 default-path gap: a HYBRID_COMPLETION search
+// with a session_id but WITHOUT only_context / use_combined_context / dataset
+// scope must still record used_graph_element_ids on the saved QA entry. Before
+// the fix, `context` was None on this path (include_context false), so
+// `build_used_graph_element_ids(None)` returned None and the feature was inert.
+// Python's HybridRetriever computes extract_context_object_ids on every path.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn unscoped_hybrid_completion_populates_used_graph_element_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_store = Arc::new(FsSessionStore::new(dir.path().join("sessions")));
+    let session_manager = Arc::new(SessionManager::new(session_store.clone()));
+
+    let session_id = "hybrid-unscoped-session";
+
+    let mut registry = SearchTypeRegistry::new();
+    registry.register(Arc::new(FakeHybridRetriever));
+
+    let orchestrator = SearchOrchestrator::new(registry)
+        .with_database(Arc::new(NoOpHistoryDb))
+        .with_session_manager(session_manager.clone());
+
+    // Deliberately unscoped: only_context=false, use_combined_context=false,
+    // no dataset_ids — the default path where the bug lived.
+    orchestrator
+        .search(&hybrid_request("what happened?", Some(session_id)))
+        .await
+        .expect("search must succeed");
+
+    let entries = session_store
+        .get_all_qa_entries(session_id, None)
+        .await
+        .expect("reading session entries must succeed");
+
+    assert_eq!(entries.len(), 1, "one QA entry must be saved");
+    let ids = entries[0]
+        .used_graph_element_ids
+        .as_ref()
+        .expect("used_graph_element_ids must be Some on the unscoped hybrid path");
+
+    assert!(
+        ids.node_ids.contains(&"hybrid-chunk-1".to_string()),
+        "chunk id must be captured; got: {:?}",
+        ids.node_ids
+    );
+    assert!(
+        ids.node_ids.contains(&"hybrid-entity-1".to_string()),
+        "entity id must be captured; got: {:?}",
+        ids.node_ids
+    );
+    assert!(
+        ids.node_ids.contains(&"acme-id".to_string()),
+        "entity edge endpoint must be captured; got: {:?}",
+        ids.node_ids
+    );
+    assert!(
+        ids.edge_ids.is_empty(),
+        "hybrid path never emits edge_ids; got: {:?}",
+        ids.edge_ids
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Test 3: conversational_feedback_persists_to_prior_entry
 //
 // 1. Save a first QA entry (the "prior" entry).

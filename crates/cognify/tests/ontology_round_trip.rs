@@ -9,7 +9,7 @@
 //! (no LLM needed) to verify end-to-end ontology expansion including subgraph
 //! injection (ancestor nodes, is_a edges).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use cognee_cognify::fact_extraction::{Edge, KnowledgeGraph, Node};
@@ -87,6 +87,8 @@ async fn test_ontology_round_trip_with_real_resolver() {
     let (nodes, edges) = expand_with_nodes_and_edges(
         vec![(chunk_id, graph)],
         dataset_id,
+        &HashMap::new(),
+        &HashMap::new(),
         &HashSet::new(),
         &resolver,
         None,
@@ -171,6 +173,8 @@ async fn test_ontology_unmatched_type_not_validated() {
     let (nodes, _edges) = expand_with_nodes_and_edges(
         vec![(chunk_id, graph)],
         dataset_id,
+        &HashMap::new(),
+        &HashMap::new(),
         &HashSet::new(),
         &resolver,
         None,
@@ -207,6 +211,8 @@ async fn test_ontology_noop_resolver_leaves_everything_unvalidated() {
     let (nodes, _edges) = expand_with_nodes_and_edges(
         vec![(chunk_id, graph)],
         dataset_id,
+        &HashMap::new(),
+        &HashMap::new(),
         &HashSet::new(),
         &resolver,
         None,

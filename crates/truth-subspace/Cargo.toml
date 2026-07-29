@@ -1,0 +1,31 @@
+[package]
+name = "cognee-truth-subspace"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Pure truth-subspace alignment math (cosine projection, truth scoring) for cognee's hybrid retriever."
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+sha2 = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+# Vector-engine-backed persistence for load_centroids/upsert_centroids. This
+# edge is one-directional (truth-subspace -> vector) and cycle-free: cognee-vector
+# depends only on cognee-utils and does NOT depend on truth-subspace.
+cognee-vector = { path = "../vector", version = "0.1.3" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# MockVectorDB (behind the `testing` feature) backs the persistence tests.
+cognee-vector = { path = "../vector", features = ["testing"] }
