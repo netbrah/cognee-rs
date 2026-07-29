@@ -324,4 +324,145 @@ mod tests {
         let to_load = source_chunk_ids_to_load(&pairs);
         assert_eq!(to_load, vec![chunk_id]);
     }
+
+    #[test]
+    fn attach_source_chunks_fills_summary_only_pair() {
+        let chunk_id = Uuid::new_v4().to_string();
+        // Summary-only pair: has a source_chunk_id but no chunk attached yet.
+        let summaries = vec![item(json!({
+            "id": "summary-id",
+            "text": "the summary",
+            "source_chunk_id": chunk_id,
+        }))];
+        let mut pairs = chunk_summary_pairs(&[], &[], &summaries, None, "OR");
+        assert_eq!(pairs.len(), 1);
+        assert!(pairs[0].chunk.is_none(), "no chunk before backfill");
+
+        // Backfill the source chunk by matching id.
+        attach_source_chunks(&mut pairs, &[item(json!({"id": chunk_id, "text": "body"}))]);
+        assert!(pairs[0].chunk.is_some());
+        assert_eq!(pairs[0].chunk_text.as_deref(), Some("body"));
+
+        // A second call carrying a non-matching id is a no-op: the existing
+        // chunk stays, and no new pair is appended.
+        attach_source_chunks(
+            &mut pairs,
+            &[item(
+                json!({"id": Uuid::new_v4().to_string(), "text": "other"}),
+            )],
+        );
+        assert_eq!(pairs.len(), 1, "non-matching id adds no pair");
+        assert_eq!(
+            pairs[0].chunk_text.as_deref(),
+            Some("body"),
+            "existing chunk untouched by the non-matching backfill"
+        );
+    }
+
+    #[test]
+    fn summary_text_by_chunk_id_only_includes_complete_pairs() {
+        let pairs = vec![
+            // (a) both chunk_id and summary_text present -> included.
+            ChunkSummaryPair {
+                chunk_id: Some("x".to_string()),
+                summary_text: Some("s".to_string()),
+                ..Default::default()
+            },
+            // (b) chunk_id present but no summary_text -> excluded.
+            ChunkSummaryPair {
+                chunk_id: Some("y".to_string()),
+                summary_text: None,
+                ..Default::default()
+            },
+            // (c) empty chunk_id (falsy) even with summary_text -> excluded.
+            ChunkSummaryPair {
+                chunk_id: Some(String::new()),
+                summary_text: Some("z".to_string()),
+                ..Default::default()
+            },
+        ];
+        let map = summary_text_by_chunk_id(&pairs);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get("x").map(String::as_str), Some("s"));
+        assert!(!map.contains_key("y"));
+        assert!(!map.contains_key(""));
+    }
+
+    #[test]
+    fn summary_lane_respects_node_filter() {
+        let keep_chunk = Uuid::new_v4().to_string();
+        let drop_chunk = Uuid::new_v4().to_string();
+        let summaries = vec![
+            item(json!({
+                "id": "keep-summary",
+                "text": "keep me",
+                "source_chunk_id": keep_chunk,
+                "belongs_to_set": ["keep"],
+            })),
+            item(json!({
+                "id": "drop-summary",
+                "text": "drop me",
+                "source_chunk_id": drop_chunk,
+                "belongs_to_set": ["drop"],
+            })),
+        ];
+        let keep = vec!["keep".to_string()];
+        let pairs = chunk_summary_pairs(&[], &[], &summaries, Some(&keep), "OR");
+        assert_eq!(pairs.len(), 1, "only the 'keep' summary passes the filter");
+        assert_eq!(pairs[0].chunk_id.as_deref(), Some(keep_chunk.as_str()));
+
+        // Operator threading: a summary in ["keep"] with a request of
+        // ["keep","extra"] passes OR (non-empty intersection) but fails AND
+        // (request not a subset). If the operator were hard-coded to OR, the
+        // AND call would still produce a pair.
+        let single = vec![item(json!({
+            "id": "keep-summary",
+            "text": "keep me",
+            "source_chunk_id": keep_chunk,
+            "belongs_to_set": ["keep"],
+        }))];
+        let request = vec!["keep".to_string(), "extra".to_string()];
+        let or_pairs = chunk_summary_pairs(&[], &[], &single, Some(&request), "OR");
+        assert_eq!(or_pairs.len(), 1, "OR matches on the shared 'keep' entry");
+        let and_pairs = chunk_summary_pairs(&[], &[], &single, Some(&request), "AND");
+        assert!(
+            and_pairs.is_empty(),
+            "AND requires the full request to be a subset -> no pair"
+        );
+    }
+
+    #[test]
+    fn duplicate_hit_in_lane_keeps_first_rank() {
+        // BM25 lane: the same id appears twice; first-rank-wins collapses to one
+        // pair whose bm25_rank stays at the first occurrence.
+        let id = Uuid::new_v4().to_string();
+        let bm25 = vec![
+            item(json!({"id": id, "text": "hello"})),
+            item(json!({"id": id, "text": "hello"})),
+        ];
+        let pairs = chunk_summary_pairs(&bm25, &[], &[], None, "OR");
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].bm25_rank, Some(0));
+
+        // Summary lane: two summaries share one source_chunk_id; summary_rank and
+        // the recorded summary_id/text stay at the first hit.
+        let chunk_id = Uuid::new_v4().to_string();
+        let summaries = vec![
+            item(json!({
+                "id": "first-summary",
+                "text": "first",
+                "source_chunk_id": chunk_id,
+            })),
+            item(json!({
+                "id": "second-summary",
+                "text": "second",
+                "source_chunk_id": chunk_id,
+            })),
+        ];
+        let pairs = chunk_summary_pairs(&[], &[], &summaries, None, "OR");
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].summary_rank, Some(0));
+        assert_eq!(pairs[0].summary_id.as_deref(), Some("first-summary"));
+        assert_eq!(pairs[0].summary_text.as_deref(), Some("first"));
+    }
 }
