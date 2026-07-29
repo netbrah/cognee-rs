@@ -473,6 +473,25 @@ mod tests {
             .unwrap();
     }
 
+    /// Index a TextSummary_text vector point carrying a `belongs_to_set` tag.
+    async fn index_summary_with_set(
+        db: &MockVectorDB,
+        id: Uuid,
+        text: &str,
+        source_chunk_id: Uuid,
+        belongs_to_set: Vec<&str>,
+        vector: Vec<f32>,
+    ) {
+        let point = VectorPoint::new(id, vector)
+            .with_metadata("id", json!(id.to_string()))
+            .with_metadata("text", json!(text))
+            .with_metadata("source_chunk_id", json!(source_chunk_id.to_string()))
+            .with_metadata("belongs_to_set", json!(belongs_to_set));
+        db.index_points(TEXT_SUMMARY_TYPE, TEXT_FIELD, &[point])
+            .await
+            .unwrap();
+    }
+
     #[derive(Serialize)]
     struct ChunkNode {
         id: String,
@@ -481,11 +500,32 @@ mod tests {
         text: String,
     }
 
+    #[derive(Serialize)]
+    struct ChunkNodeWithSet {
+        id: String,
+        #[serde(rename = "type")]
+        kind: String,
+        text: String,
+        belongs_to_set: Vec<String>,
+    }
+
     async fn add_graph_chunk(graph: &MockGraphDB, id: Uuid, text: &str) {
         let node = ChunkNode {
             id: id.to_string(),
             kind: DOCUMENT_CHUNK_TYPE.to_string(),
             text: text.to_string(),
+        };
+        graph.add_node(&node).await.unwrap();
+    }
+
+    /// Add a graph DocumentChunk carrying a `belongs_to_set` tag, so the BM25
+    /// lane's node filter sees the membership on the raw graph payload.
+    async fn add_graph_chunk_with_set(graph: &MockGraphDB, id: Uuid, text: &str, sets: &[&str]) {
+        let node = ChunkNodeWithSet {
+            id: id.to_string(),
+            kind: DOCUMENT_CHUNK_TYPE.to_string(),
+            text: text.to_string(),
+            belongs_to_set: sets.iter().map(|s| s.to_string()).collect(),
         };
         graph.add_node(&node).await.unwrap();
     }
@@ -845,6 +885,290 @@ mod tests {
                 .chunks
                 .iter()
                 .any(|c| c.payload.get("id") == Some(&json!(chunk_id.to_string())))
+        );
+    }
+
+    #[test]
+    fn summary_candidate_limit_honors_explicit_and_default() {
+        // `None` defaults to `chunks_top_k`; an explicit value (including 0) is
+        // used verbatim. Port of `summary_candidate_limit` (chunks.py:106-109).
+        assert_eq!(summary_candidate_limit(3, None), 3);
+        assert_eq!(summary_candidate_limit(3, Some(0)), 0);
+        assert_eq!(summary_candidate_limit(3, Some(5)), 5);
+        assert_eq!(summary_candidate_limit(3, Some(1)), 1);
+    }
+
+    #[tokio::test]
+    async fn text_summaries_top_k_zero_disables_summary_lane() {
+        // An explicit text_summaries_top_k = 0 sets summary_limit = 0, which
+        // both short-circuits the summary vector lane AND skips the
+        // `load_summary_text_for_ranked_pairs` backfill (the `summary_limit > 0`
+        // gate). Even with a perfectly valid, query-aligned TextSummary indexed,
+        // no summaries are reported.
+        let db = MockVectorDB::new();
+        db.create_collection(DOCUMENT_CHUNK_TYPE, TEXT_FIELD, 2)
+            .await
+            .unwrap();
+        db.create_collection(TEXT_SUMMARY_TYPE, TEXT_FIELD, 2)
+            .await
+            .unwrap();
+
+        let chunk_id = Uuid::new_v4();
+        index_chunk(&db, chunk_id, "rust ownership", None, vec![1.0, 0.0]).await;
+        // A valid, aligned summary keyed to the chunk — would be backfilled if
+        // the summary lane were enabled.
+        let summary_id = Uuid::new_v5(&chunk_id, b"TextSummary");
+        index_summary(&db, summary_id, "the summary", chunk_id, vec![1.0, 0.0]).await;
+
+        let vector_db = dyn_vector(db);
+        let graph_db: Arc<dyn GraphDBTrait> = Arc::new(MockGraphDB::new());
+
+        let result = retrieve_hybrid_chunks(
+            &vector_db,
+            &graph_db,
+            "query",
+            3,
+            Some(0),
+            None,
+            "OR",
+            false,
+            &[1.0, 0.0],
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The chunk still comes through the (required) DocumentChunk lane...
+        assert_eq!(result.chunks.len(), 1);
+        // ...but the summary lane is fully disabled.
+        assert!(result.chunk_summaries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn summary_failing_node_filter_is_not_backfilled() {
+        // The winning in-set chunk has a deterministically-paired TextSummary
+        // tagged with a DIFFERENT set. The summary lane filters it out, so the
+        // ranked pair reaches `load_summary_text_for_ranked_pairs`, which
+        // fetches the summary by its deterministic id — and must drop it on the
+        // node-filter check (chunks.py: `payload_matches_node_filter`) rather
+        // than backfilling its text.
+        let db = MockVectorDB::new();
+        db.create_collection(DOCUMENT_CHUNK_TYPE, TEXT_FIELD, 2)
+            .await
+            .unwrap();
+        db.create_collection(TEXT_SUMMARY_TYPE, TEXT_FIELD, 2)
+            .await
+            .unwrap();
+
+        let keep_chunk = Uuid::new_v4();
+        index_chunk(
+            &db,
+            keep_chunk,
+            "kept chunk",
+            Some(vec!["keep"]),
+            vec![1.0, 0.0],
+        )
+        .await;
+        // Deterministic paired summary id, tagged "drop" so it fails ["keep"].
+        let summary_id = Uuid::new_v5(&keep_chunk, b"TextSummary");
+        index_summary_with_set(
+            &db,
+            summary_id,
+            "the drop-tagged summary",
+            keep_chunk,
+            vec!["drop"],
+            vec![1.0, 0.0],
+        )
+        .await;
+
+        let vector_db = dyn_vector(db);
+        let graph_db: Arc<dyn GraphDBTrait> = Arc::new(MockGraphDB::new());
+
+        let node_name = vec!["keep".to_string()];
+        let result = retrieve_hybrid_chunks(
+            &vector_db,
+            &graph_db,
+            "query",
+            3,
+            None,
+            Some(&node_name),
+            "OR",
+            false,
+            &[1.0, 0.0],
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The in-set chunk survives...
+        let keep_str = keep_chunk.to_string();
+        assert!(
+            result
+                .chunks
+                .iter()
+                .any(|c| c.payload.get("id") == Some(&json!(keep_str))),
+            "in-set chunk should survive ranking"
+        );
+        // ...but its out-of-set summary is never backfilled.
+        assert!(
+            !result.chunk_summaries.contains_key(&keep_str),
+            "summary failing the node filter must not be backfilled"
+        );
+        assert!(result.chunk_summaries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn backfilled_source_chunk_failing_node_filter_is_dropped() {
+        // A summary-only hit references source chunk C. C is out-of-set
+        // (["drop"]) while the request is ["keep"], so the summary reaches the
+        // pipeline (its own tag passes) but the retrieve-by-id backfill of C in
+        // `load_source_chunks_for_summaries` must drop C on the node filter. A
+        // pair whose chunk never lands is skipped in ranking, so C appears in
+        // neither the chunks nor the summaries.
+        let db = MockVectorDB::new();
+        db.create_collection(DOCUMENT_CHUNK_TYPE, TEXT_FIELD, 2)
+            .await
+            .unwrap();
+        db.create_collection(TEXT_SUMMARY_TYPE, TEXT_FIELD, 2)
+            .await
+            .unwrap();
+
+        // Source chunk C: out-of-set and orthogonal to the query, so it only
+        // reaches the pipeline via the summary's source_chunk_id backfill.
+        let chunk_c = Uuid::new_v4();
+        index_chunk(
+            &db,
+            chunk_c,
+            "drop-tagged source chunk",
+            Some(vec!["drop"]),
+            vec![0.0, 1.0],
+        )
+        .await;
+        // Summary S references C, is in-set (["keep"]) and query-aligned, so it
+        // survives the summary lane's node filter and triggers the backfill.
+        let summary_id = Uuid::new_v5(&chunk_c, b"TextSummary");
+        index_summary_with_set(
+            &db,
+            summary_id,
+            "the summary",
+            chunk_c,
+            vec!["keep"],
+            vec![1.0, 0.0],
+        )
+        .await;
+
+        let vector_db = dyn_vector(db);
+        let graph_db: Arc<dyn GraphDBTrait> = Arc::new(MockGraphDB::new());
+
+        let node_name = vec!["keep".to_string()];
+        let result = retrieve_hybrid_chunks(
+            &vector_db,
+            &graph_db,
+            "query",
+            2,
+            None,
+            Some(&node_name),
+            "OR",
+            false,
+            &[1.0, 0.0],
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let chunk_c_str = chunk_c.to_string();
+        assert!(
+            !result
+                .chunks
+                .iter()
+                .any(|c| c.payload.get("id") == Some(&json!(chunk_c_str))),
+            "backfilled source chunk failing the node filter must not appear in chunks"
+        );
+        assert!(
+            !result.chunk_summaries.contains_key(&chunk_c_str),
+            "its summary must not survive either (the pair has no chunk)"
+        );
+    }
+
+    #[tokio::test]
+    async fn bm25_out_of_set_graph_chunk_is_filtered() {
+        // Two lexically-matching graph DocumentChunks feed the BM25 lane: one
+        // tagged ["keep"], one ["drop"]. With node_name = ["keep"], the BM25
+        // lane's node filter (over the raw graph payload) must drop the ["drop"]
+        // chunk while keeping the ["keep"] one. The keep chunk is also indexed
+        // in the vector collection (required lane) so it carries the tag there.
+        let db = MockVectorDB::new();
+        db.create_collection(DOCUMENT_CHUNK_TYPE, TEXT_FIELD, 2)
+            .await
+            .unwrap();
+        let keep_chunk = Uuid::new_v4();
+        let drop_chunk = Uuid::new_v4();
+        index_chunk(
+            &db,
+            keep_chunk,
+            "ownership borrow checker",
+            Some(vec!["keep"]),
+            vec![1.0, 0.0],
+        )
+        .await;
+        let vector_db = dyn_vector(db);
+
+        let mock_graph = MockGraphDB::new();
+        add_graph_chunk_with_set(
+            &mock_graph,
+            keep_chunk,
+            "ownership borrow checker",
+            &["keep"],
+        )
+        .await;
+        add_graph_chunk_with_set(&mock_graph, drop_chunk, "ownership borrow model", &["drop"])
+            .await;
+        let graph_db: Arc<dyn GraphDBTrait> = Arc::new(mock_graph);
+
+        let node_name = vec!["keep".to_string()];
+        let result = retrieve_hybrid_chunks(
+            &vector_db,
+            &graph_db,
+            "ownership borrow",
+            3,
+            None,
+            Some(&node_name),
+            "OR",
+            false,
+            &[1.0, 0.0],
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let keep_str = keep_chunk.to_string();
+        let drop_str = drop_chunk.to_string();
+        assert_eq!(result.chunks.len(), 1, "only the in-set chunk survives");
+        assert!(
+            result
+                .chunks
+                .iter()
+                .any(|c| c.payload.get("id") == Some(&json!(keep_str))),
+            "the ['keep'] graph chunk must survive the BM25-lane node filter"
+        );
+        assert!(
+            !result
+                .chunks
+                .iter()
+                .any(|c| c.payload.get("id") == Some(&json!(drop_str))),
+            "the ['drop'] graph chunk must be filtered out of the BM25 lane"
         );
     }
 }
