@@ -987,6 +987,20 @@ mod retriever_tests {
             .collect()
     }
 
+    /// The `text` bodies of the chunk items, in context order.
+    fn chunk_texts(context: &SearchContext) -> Vec<String> {
+        context
+            .iter()
+            .filter(|item| item.payload.get("kind").and_then(Value::as_str) == Some("chunk"))
+            .filter_map(|item| {
+                item.payload
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn get_context_returns_tagged_chunk_entity_and_fact_items() {
         let (vector_db, graph_db, _alice) = populated_dbs().await;
@@ -1267,6 +1281,291 @@ mod retriever_tests {
             }
             other => panic!("expected InvalidInput, got {other:?}"),
         }
+    }
+
+    /// A lone `top_k` (all per-channel knobs `None`) must drive EVERY lane's
+    /// limit through the `.or(top_k)` middle layer, not just the chunk lane. Seed
+    /// 3 aligned chunks and 3 aligned entities; with the default limit (15) more
+    /// than one of each survives, but `top_k = 1` must cap BOTH lanes to exactly
+    /// one item. A regression that fed `top_k` only to chunks would leave the
+    /// entity lane at its default 15 and return all 3 entities.
+    #[tokio::test]
+    async fn top_k_drives_all_channel_limits_when_no_per_channel_knob() {
+        let (vector_db, graph_db, _alice) = populated_dbs().await;
+
+        // Grow each vector lane to 3 aligned rows (populated_dbs seeds one each).
+        for i in 0..2 {
+            let extra_chunk = Uuid::new_v4();
+            vector_db
+                .index_points(
+                    "DocumentChunk",
+                    "text",
+                    &[VectorPoint::new(extra_chunk, vec![1.0, 0.0])
+                        .with_metadata("id", json!(extra_chunk.to_string()))
+                        .with_metadata("text", json!(format!("{CHUNK_TEXT} {i}")))],
+                )
+                .await
+                .unwrap();
+            let extra_entity = Uuid::new_v4();
+            vector_db
+                .index_points(
+                    "Entity",
+                    "name",
+                    &[VectorPoint::new(extra_entity, vec![1.0, 0.0])
+                        .with_metadata("id", json!(extra_entity.to_string()))
+                        .with_metadata("name", json!(format!("{ENTITY_NAME} {i}")))],
+                )
+                .await
+                .unwrap();
+        }
+
+        let llm = Arc::new(CapturingLlm::default());
+        let retriever = retriever(vector_db, graph_db, llm);
+
+        // Baseline: the default limit keeps more than one of BOTH kinds, so the
+        // top_k=1 assertions below are non-vacuous.
+        let default_context = retriever
+            .get_context("query", &SearchParams::default())
+            .await
+            .unwrap();
+        let default_kinds = kinds(&default_context);
+        assert!(
+            default_kinds.iter().filter(|k| *k == "chunk").count() > 1,
+            "default limit should keep >1 chunk, got {default_kinds:?}"
+        );
+        assert!(
+            default_kinds.iter().filter(|k| *k == "entity").count() > 1,
+            "default limit should keep >1 entity, got {default_kinds:?}"
+        );
+
+        // Only top_k set; every per-channel knob left None.
+        let params = SearchParams {
+            top_k: Some(1),
+            ..SearchParams::default()
+        };
+        let context = retriever.get_context("query", &params).await.unwrap();
+        let ctx_kinds = kinds(&context);
+        assert_eq!(
+            ctx_kinds.iter().filter(|k| *k == "chunk").count(),
+            1,
+            "top_k must cap the chunk lane to one item, got {ctx_kinds:?}"
+        );
+        assert_eq!(
+            ctx_kinds.iter().filter(|k| *k == "entity").count(),
+            1,
+            "top_k must feed the entity lane too, got {ctx_kinds:?}"
+        );
+    }
+
+    /// The importance-weight boost is applied by default and can be disabled.
+    /// Two chunks with IDENTICAL vectors differ only in `importance_weight`
+    /// (0.0 vs 1.0). With importance ON (default) the `high` chunk's 1.25 factor
+    /// overtakes `low`'s 0.75 despite the one-slot RRF gap; with importance OFF
+    /// ranking collapses to pure RRF by vector rank, so `low` (indexed first ->
+    /// rank 0) leads and the order flips.
+    #[tokio::test]
+    async fn get_context_applies_importance_weight_by_default_and_honors_disable() {
+        let db = MockVectorDB::new();
+        db.create_collection("DocumentChunk", "text", 2)
+            .await
+            .unwrap();
+        // `low` indexed first -> vector_rank 0 (stable tie order in MockVectorDB).
+        let low_id = Uuid::new_v4();
+        db.index_points(
+            "DocumentChunk",
+            "text",
+            &[VectorPoint::new(low_id, vec![1.0, 0.0])
+                .with_metadata("id", json!(low_id.to_string()))
+                .with_metadata("text", json!("low importance chunk"))
+                .with_metadata("importance_weight", json!(0.0))],
+        )
+        .await
+        .unwrap();
+        let high_id = Uuid::new_v4();
+        db.index_points(
+            "DocumentChunk",
+            "text",
+            &[VectorPoint::new(high_id, vec![1.0, 0.0])
+                .with_metadata("id", json!(high_id.to_string()))
+                .with_metadata("text", json!("high importance chunk"))
+                .with_metadata("importance_weight", json!(1.0))],
+        )
+        .await
+        .unwrap();
+
+        let vector_db: Arc<dyn VectorDB> = Arc::new(db);
+        let graph_db: Arc<dyn GraphDBTrait> = Arc::new(MockGraphDB::new());
+        let llm = Arc::new(CapturingLlm::default());
+        let retriever = retriever(vector_db, graph_db, llm);
+
+        // (1) Default: importance weighting ON -> high outranks low.
+        let default_ctx = retriever
+            .get_context("query", &SearchParams::default())
+            .await
+            .unwrap();
+        let default_order = chunk_texts(&default_ctx);
+        assert_eq!(
+            default_order,
+            vec!["high importance chunk", "low importance chunk"],
+            "importance-on default must rank the higher-weight chunk first"
+        );
+
+        // (2) Disabled: pure RRF -> low (rank 0) leads; order distinct from (1).
+        let params = SearchParams {
+            use_importance_weight: Some(false),
+            ..SearchParams::default()
+        };
+        let disabled_ctx = retriever.get_context("query", &params).await.unwrap();
+        let disabled_order = chunk_texts(&disabled_ctx);
+        assert_eq!(
+            disabled_order,
+            vec!["low importance chunk", "high importance chunk"],
+            "importance-off ranking must fall back to pure RRF by vector rank"
+        );
+        assert_ne!(
+            disabled_order, default_order,
+            "disabling importance weighting must change the order"
+        );
+    }
+
+    /// End-to-end truth-subspace re-ranking through the real `get_context`
+    /// wiring (`build_truth_context` -> `MockVectorDB` centroid load ->
+    /// `get_node_truth_state` -> `rank_chunk_summary_pairs`). Two identical-vector
+    /// chunks: `b` is indexed first (RRF rank 0, the baseline winner), `a` second
+    /// (rank 1) but carries an aligned truth state at the current epoch. With the
+    /// truth weight ON `a`'s 1.25 alignment factor lifts it past `b`; with it OFF
+    /// the baseline RRF order (`b` first) stands.
+    #[tokio::test]
+    async fn truth_subspace_lane_reranks_through_get_context() {
+        use cognee_truth_subspace::{TruthCentroidPayload, upsert_centroids};
+
+        let dataset_id = Uuid::new_v4();
+        let db = MockVectorDB::new();
+        db.create_collection("DocumentChunk", "text", 2)
+            .await
+            .unwrap();
+
+        // `b` first -> vector_rank 0; `a` second -> vector_rank 1.
+        let chunk_b = Uuid::new_v4();
+        db.index_points(
+            "DocumentChunk",
+            "text",
+            &[VectorPoint::new(chunk_b, vec![1.0, 0.0])
+                .with_metadata("id", json!(chunk_b.to_string()))
+                .with_metadata("text", json!("baseline chunk b"))],
+        )
+        .await
+        .unwrap();
+        let chunk_a = Uuid::new_v4();
+        db.index_points(
+            "DocumentChunk",
+            "text",
+            &[VectorPoint::new(chunk_a, vec![1.0, 0.0])
+                .with_metadata("id", json!(chunk_a.to_string()))
+                .with_metadata("text", json!("aligned chunk a"))],
+        )
+        .await
+        .unwrap();
+
+        // One centroid slot for the dataset at epoch 3, aligned with the query.
+        upsert_centroids(
+            &db,
+            &[TruthCentroidPayload {
+                dataset_id: dataset_id.to_string(),
+                slot: 0,
+                count: 1,
+                truth_epoch: 3,
+                updated_at: 0,
+                centroid: vec![1.0, 0.0],
+                learning_ids: vec![],
+            }],
+        )
+        .await
+        .unwrap();
+
+        let vector_db: Arc<dyn VectorDB> = Arc::new(db);
+
+        // Only `a` has an aligned truth state at the current epoch (3); `b` is
+        // absent from the graph, so it receives no truth multiplier.
+        let graph = MockGraphDB::new();
+        graph
+            .add_node_raw(json!({
+                "id": chunk_a.to_string(),
+                "truth_alignment": [1.0],
+                "truth_epoch": 3,
+            }))
+            .await
+            .unwrap();
+        let graph_db: Arc<dyn GraphDBTrait> = Arc::new(graph);
+
+        let llm = Arc::new(CapturingLlm::default());
+        let retriever = retriever(vector_db, graph_db, llm);
+
+        // Truth ON (single dataset in scope): `a` overtakes `b`.
+        let truth_on = SearchParams {
+            use_truth_weight: Some(true),
+            dataset_id: Some(dataset_id),
+            ..SearchParams::default()
+        };
+        let on_ctx = retriever.get_context("query", &truth_on).await.unwrap();
+        assert_eq!(
+            chunk_texts(&on_ctx),
+            vec!["aligned chunk a", "baseline chunk b"],
+            "truth weighting must lift the aligned chunk to first"
+        );
+
+        // Truth OFF: baseline RRF order (`b` first) stands.
+        let truth_off = SearchParams {
+            use_truth_weight: Some(false),
+            dataset_id: Some(dataset_id),
+            ..SearchParams::default()
+        };
+        let off_ctx = retriever.get_context("query", &truth_off).await.unwrap();
+        assert_eq!(
+            chunk_texts(&off_ctx),
+            vec!["baseline chunk b", "aligned chunk a"],
+            "with truth off the baseline RRF order must stand"
+        );
+    }
+
+    /// The rendered user prompt must carry the three context sections in the
+    /// exact order passages -> entities -> facts, each joined by a blank line and
+    /// built from the real seeded bodies (not order-blind `.contains`). This pins
+    /// the `format_hybrid_context` section ordering + join through the full
+    /// `get_completion` render path.
+    #[tokio::test]
+    async fn get_context_context_sections_in_order() {
+        let (vector_db, graph_db, _alice) = populated_dbs().await;
+        let llm = Arc::new(CapturingLlm {
+            response_text: "answer".to_string(),
+            ..Default::default()
+        });
+        let retriever = retriever(vector_db, graph_db, Arc::clone(&llm) as Arc<dyn Llm>);
+
+        retriever
+            .get_completion(
+                "what happened?",
+                None,
+                &SessionContext::default(),
+                &SearchParams::default(),
+            )
+            .await
+            .unwrap();
+
+        let messages = llm.last_messages.lock().unwrap().clone();
+        let user = &messages[1].content;
+
+        // A single contiguous block: passages, then entities, then facts, each
+        // section joined to the next by exactly one blank line.
+        let expected = format!(
+            "## Relevant passages\n{CHUNK_TEXT}\n\n\
+             ## Relevant entities\n### {ENTITY_NAME}\n- {BULLET_TEXT}\n\n\
+             ## Related facts\n- {FACT_TEXT}"
+        );
+        assert!(
+            user.contains(&expected),
+            "user prompt must contain the ordered section block:\n{expected}\n---\nGOT:\n{user}"
+        );
     }
 }
 
