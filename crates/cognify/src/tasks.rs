@@ -466,10 +466,21 @@ pub async fn extract_graph_from_data(
         })
         .collect();
 
+    // Map each source chunk to its `importance_weight` so every extracted
+    // EntityType / Entity / ontology node inherits it (parity with Python
+    // `importance_weight=data_chunk.importance_weight` in
+    // expand_with_nodes_and_edges.py:66,79,163,229). Default 0.5 when None,
+    // matching Python's `DataPoint.importance_weight` default.
+    let chunk_importance_weights: HashMap<Uuid, f64> = chunks_for_extraction
+        .iter()
+        .map(|chunk| (chunk.base.id, chunk.base.importance_weight.unwrap_or(0.5)))
+        .collect();
+
     let (nodes, edges) = expand_with_nodes_and_edges(
         all_graphs,
         input.dataset_id,
         &chunk_node_sets,
+        &chunk_importance_weights,
         &existing_edges_set,
         ontology_resolver.as_ref(),
         user_label_owned.as_deref(),
@@ -4521,6 +4532,7 @@ mod tests {
         let (_nodes, edges) = expand_with_nodes_and_edges(
             vec![(chunk_id, graph)],
             dataset_id,
+            &HashMap::new(),
             &HashMap::new(),
             &HashSet::new(),
             &resolver,

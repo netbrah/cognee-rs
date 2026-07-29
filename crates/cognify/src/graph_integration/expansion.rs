@@ -79,6 +79,13 @@ pub(crate) fn pre_stamp_extraction(
 ///   `expand_with_nodes_and_edges.py:227`. This is what keeps a node_name-scoped
 ///   (NodeSet-filtered) search from dropping every extracted entity. Chunks with
 ///   no NodeSet metadata are simply absent from the map.
+/// * `chunk_importance_weights` - Map from source chunk UUID to that chunk's
+///   `importance_weight`. Every created EntityType, Entity, and ontology-derived
+///   node inherits the `importance_weight` of the chunk it was extracted from,
+///   mirroring Python's `importance_weight=data_chunk.importance_weight` on the
+///   type node, entity node, and ontology nodes in
+///   `expand_with_nodes_and_edges.py:66,79,163,229`. Chunks absent from the map
+///   default to `0.5` (Python's `DataPoint.importance_weight` default).
 /// * `existing_edges_set` - Set of edges that already exist in the database
 /// * `ontology_resolver` - Ontology resolver for entity validation and enrichment.
 ///   When loaded, validates entity types against "classes" and entities against
@@ -90,6 +97,7 @@ pub async fn expand_with_nodes_and_edges(
     graphs: Vec<(Uuid, KnowledgeGraph)>,
     dataset_id: Uuid,
     chunk_node_sets: &HashMap<Uuid, Vec<serde_json::Value>>,
+    chunk_importance_weights: &HashMap<Uuid, f64>,
     existing_edges_set: &HashSet<String>,
     ontology_resolver: &dyn OntologyResolver,
     user_label: Option<&str>,
@@ -118,6 +126,16 @@ pub async fn expand_with_nodes_and_edges(
 
     // Process all graphs — each graph carries its source chunk_id
     for (chunk_id, graph) in graphs {
+        // The importance_weight every EntityType / Entity / ontology node
+        // extracted from this chunk inherits, mirroring Python's
+        // `importance_weight=data_chunk.importance_weight`
+        // (expand_with_nodes_and_edges.py:66,79,163,229). Default 0.5 for chunks
+        // absent from the map (Python's `DataPoint.importance_weight` default).
+        let chunk_importance_weight = chunk_importance_weights
+            .get(&chunk_id)
+            .copied()
+            .unwrap_or(0.5);
+
         for node in graph.nodes {
             // Step 1: Create or get EntityType (with ontology subgraph expansion)
             let type_key = format!("{}_type", node.node_type);
@@ -130,6 +148,9 @@ pub async fn expand_with_nodes_and_edges(
 
             if !type_map.contains_key(&effective_key) {
                 let mut et = EntityType::from_node_type(&node.node_type, Some(dataset_id));
+                // Python: `importance_weight=data_chunk.importance_weight`
+                // (expand_with_nodes_and_edges.py:163).
+                et.base.importance_weight = Some(chunk_importance_weight);
                 pre_stamp_extraction(&mut et, user_label, &mut local_visited);
 
                 if ontology_resolver.is_loaded() {
@@ -151,6 +172,7 @@ pub async fn expand_with_nodes_and_edges(
                             process_ontology_nodes(
                                 &onto_nodes,
                                 dataset_id,
+                                chunk_importance_weight,
                                 &node_map,
                                 &type_map,
                                 &mut ontology_types_map,
@@ -227,6 +249,7 @@ pub async fn expand_with_nodes_and_edges(
                     dataset_id,
                     chunk_id,
                     chunk_node_sets.get(&chunk_id),
+                    chunk_importance_weight,
                 );
                 pre_stamp_extraction(&mut entity_pair.entity, user_label, &mut local_visited);
 
@@ -275,6 +298,7 @@ pub async fn expand_with_nodes_and_edges(
                 process_ontology_nodes(
                     &ont_nodes,
                     dataset_id,
+                    chunk_importance_weight,
                     &node_map,
                     &type_map,
                     &mut ontology_types_map,
@@ -403,12 +427,17 @@ pub async fn expand_with_nodes_and_edges(
 /// the dataset-id entry in `Entity::new`, so we UNION the chunk's NodeSet entries
 /// in rather than overwriting — preserving dataset scoping while making the
 /// entity discoverable by a node_name-scoped (NodeSet-filtered) search.
+///
+/// `importance_weight` is the source chunk's `importance_weight`, stamped onto
+/// the entity to mirror Python's `Entity(importance_weight=data_chunk.importance_weight)`
+/// (expand_with_nodes_and_edges.py:229).
 fn create_entity_node(
     node: &Node,
     entity_type: EntityType,
     dataset_id: Uuid,
     chunk_id: Uuid,
     chunk_belongs_to_set: Option<&Vec<serde_json::Value>>,
+    importance_weight: f64,
 ) -> GraphNodePair {
     let entity = Entity::from_node(
         &node.id,
@@ -423,6 +452,9 @@ fn create_entity_node(
     entity_with_chunk
         .base
         .set_metadata("chunk_id", serde_json::json!(chunk_id.to_string()));
+
+    // Inherit the source chunk's importance_weight (Python line 229).
+    entity_with_chunk.base.importance_weight = Some(importance_weight);
 
     // Inherit the source chunk's NodeSet membership (union, not replace).
     if let Some(chunk_sets) = chunk_belongs_to_set {
@@ -456,6 +488,7 @@ fn create_entity_node(
 fn process_ontology_nodes(
     ontology_nodes: &[AttachedOntologyNode],
     dataset_id: Uuid,
+    importance_weight: f64,
     node_map: &HashMap<String, GraphNodePair>,
     type_map: &HashMap<String, EntityType>,
     ontology_types_map: &mut HashMap<String, EntityType>,
@@ -485,6 +518,9 @@ fn process_ontology_nodes(
                 let mut et = EntityType::new(&node.name, &node.name, Some(dataset_id));
                 et.base.id = node_id;
                 et.base.set_ontology_valid(true);
+                // Python: `importance_weight=data_chunk.importance_weight`
+                // (expand_with_nodes_and_edges.py:66).
+                et.base.importance_weight = Some(importance_weight);
                 pre_stamp_extraction(&mut et, user_label, visited);
                 ontology_types_map.insert(dedup_key, et);
             }
@@ -502,6 +538,9 @@ fn process_ontology_nodes(
                 let mut entity = Entity::new(&node.name, None, &node.name, Some(dataset_id));
                 entity.base.id = node_id;
                 entity.base.set_ontology_valid(true);
+                // Python: `importance_weight=data_chunk.importance_weight`
+                // (expand_with_nodes_and_edges.py:79).
+                entity.base.importance_weight = Some(importance_weight);
                 pre_stamp_extraction(&mut entity, user_label, visited);
 
                 // Placeholder EntityType for the GraphNodePair (Rust-only; the
@@ -622,6 +661,7 @@ mod tests {
             vec![(chunk_id, graph)],
             dataset_id,
             &HashMap::new(),
+            &HashMap::new(),
             &HashSet::new(),
             &noop(),
             None,
@@ -653,6 +693,7 @@ mod tests {
             vec![(chunk_id, graph1), (chunk_id, graph2)],
             dataset_id,
             &HashMap::new(),
+            &HashMap::new(),
             &HashSet::new(),
             &noop(),
             None,
@@ -675,6 +716,7 @@ mod tests {
         let (nodes, _) = expand_with_nodes_and_edges(
             vec![(chunk_id, graph)],
             dataset_id,
+            &HashMap::new(),
             &HashMap::new(),
             &HashSet::new(),
             &noop(),
@@ -704,6 +746,7 @@ mod tests {
             vec![(chunk_id, graph)],
             dataset_id,
             &HashMap::new(),
+            &HashMap::new(),
             &HashSet::new(),
             &noop(),
             None,
@@ -725,6 +768,7 @@ mod tests {
         let (nodes, _) = expand_with_nodes_and_edges(
             vec![(chunk_id, graph)],
             dataset_id,
+            &HashMap::new(),
             &HashMap::new(),
             &HashSet::new(),
             &noop(),
@@ -763,6 +807,7 @@ mod tests {
             vec![(chunk_id, graph)],
             dataset_id,
             &chunk_node_sets,
+            &HashMap::new(),
             &HashSet::new(),
             &noop(),
             None,
@@ -797,6 +842,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_expand_entity_and_type_inherit_source_chunk_importance_weight() {
+        // Parity with Python `importance_weight=data_chunk.importance_weight`
+        // (expand_with_nodes_and_edges.py:163,229): every extracted EntityType
+        // and Entity must carry the source chunk's importance_weight, not the
+        // DataPoint default of 0.5.
+        let graph = create_test_graph();
+        let chunk_id = Uuid::new_v4();
+        let dataset_id = Uuid::new_v4();
+
+        let mut chunk_importance_weights: HashMap<Uuid, f64> = HashMap::new();
+        chunk_importance_weights.insert(chunk_id, 0.9);
+
+        let (nodes, _edges) = expand_with_nodes_and_edges(
+            vec![(chunk_id, graph)],
+            dataset_id,
+            &HashMap::new(),
+            &chunk_importance_weights,
+            &HashSet::new(),
+            &noop(),
+            None,
+        )
+        .await;
+
+        assert!(!nodes.is_empty(), "expected at least one node");
+        for pair in &nodes {
+            assert_eq!(
+                pair.entity.base.importance_weight,
+                Some(0.9),
+                "entity '{}' should inherit its chunk's importance_weight",
+                pair.entity.name
+            );
+            assert_eq!(
+                pair.entity_type.base.importance_weight,
+                Some(0.9),
+                "entity_type '{}' should inherit its chunk's importance_weight",
+                pair.entity_type.name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_expand_importance_weight_defaults_to_half_when_absent() {
+        // Chunks absent from the importance map default to 0.5 (Python's
+        // `DataPoint.importance_weight` default).
+        let graph = create_test_graph();
+        let chunk_id = Uuid::new_v4();
+        let dataset_id = Uuid::new_v4();
+
+        let (nodes, _edges) = expand_with_nodes_and_edges(
+            vec![(chunk_id, graph)],
+            dataset_id,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            &noop(),
+            None,
+        )
+        .await;
+
+        assert!(!nodes.is_empty(), "expected at least one node");
+        for pair in &nodes {
+            assert_eq!(pair.entity.base.importance_weight, Some(0.5));
+            assert_eq!(pair.entity_type.base.importance_weight, Some(0.5));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_expand_ontology_nodes_inherit_source_chunk_importance_weight() {
+        // The ontology-derived ancestor ("legalentity") must also carry the
+        // source chunk's importance_weight (Python expand_with_nodes_and_edges.py:66).
+        let graph = KnowledgeGraph {
+            nodes: vec![Node {
+                id: "techcorp_1".to_string(),
+                name: "TechCorp".to_string(),
+                node_type: "Organization".to_string(),
+                description: "A technology company".to_string(),
+            }],
+            edges: vec![],
+        };
+
+        let chunk_id = Uuid::new_v4();
+        let dataset_id = Uuid::new_v4();
+        let resolver = MockOntologyResolver;
+
+        let mut chunk_importance_weights: HashMap<Uuid, f64> = HashMap::new();
+        chunk_importance_weights.insert(chunk_id, 0.9);
+
+        let (nodes, _edges) = expand_with_nodes_and_edges(
+            vec![(chunk_id, graph)],
+            dataset_id,
+            &HashMap::new(),
+            &chunk_importance_weights,
+            &HashSet::new(),
+            &resolver,
+            None,
+        )
+        .await;
+
+        let legalentity = nodes
+            .iter()
+            .find(|n| n.entity.name == "legalentity" || n.entity_type.name == "legalentity")
+            .expect("expected ontology-derived 'legalentity' node");
+
+        // The ontology-derived class type carries the chunk's importance_weight.
+        assert_eq!(
+            legalentity.entity_type.base.importance_weight,
+            Some(0.9),
+            "ontology-derived type should inherit the chunk's importance_weight"
+        );
+    }
+
+    #[tokio::test]
     async fn test_expand_missing_target_node_is_skipped() {
         let graph = KnowledgeGraph {
             nodes: vec![Node {
@@ -820,6 +977,7 @@ mod tests {
             vec![(chunk_id, graph)],
             dataset_id,
             &HashMap::new(),
+            &HashMap::new(),
             &HashSet::new(),
             &noop(),
             None,
@@ -838,6 +996,7 @@ mod tests {
         let (nodes, edges) = expand_with_nodes_and_edges(
             vec![],
             dataset_id,
+            &HashMap::new(),
             &HashMap::new(),
             &HashSet::new(),
             &noop(),
@@ -889,6 +1048,7 @@ mod tests {
             vec![(chunk_id, graph)],
             dataset_id,
             &HashMap::new(),
+            &HashMap::new(),
             &HashSet::new(),
             &noop(),
             None,
@@ -936,6 +1096,7 @@ mod tests {
         let (nodes, _edges) = expand_with_nodes_and_edges(
             vec![(chunk_id_a, graph_a), (chunk_id_b, graph_b)],
             dataset_id,
+            &HashMap::new(),
             &HashMap::new(),
             &HashSet::new(),
             &noop(),
@@ -1061,6 +1222,7 @@ mod tests {
             vec![(chunk_id, graph)],
             dataset_id,
             &HashMap::new(),
+            &HashMap::new(),
             &HashSet::new(),
             &resolver,
             None,
@@ -1124,6 +1286,7 @@ mod tests {
         let (nodes, _edges) = expand_with_nodes_and_edges(
             vec![(chunk_id, graph)],
             dataset_id,
+            &HashMap::new(),
             &HashMap::new(),
             &HashSet::new(),
             &noop(),
@@ -1195,6 +1358,7 @@ mod tests {
         process_ontology_nodes(
             &nodes,
             dataset_id,
+            0.5,
             &node_map,
             &type_map,
             &mut ontology_types_map,
@@ -1245,6 +1409,7 @@ mod tests {
         process_ontology_nodes(
             &nodes,
             dataset_id,
+            0.5,
             &node_map,
             &type_map,
             &mut ontology_types_map,
@@ -1274,6 +1439,7 @@ mod tests {
         process_ontology_nodes(
             &nodes,
             dataset_id,
+            0.5,
             &node_map,
             &type_map,
             &mut ontology_types_map,
@@ -1413,6 +1579,7 @@ mod tests {
             vec![(chunk_id, graph)],
             dataset_id,
             &HashMap::new(),
+            &HashMap::new(),
             &HashSet::new(),
             &resolver,
             None,
@@ -1462,6 +1629,7 @@ mod tests {
             vec![(chunk_id, graph)],
             dataset_id,
             &HashMap::new(),
+            &HashMap::new(),
             &HashSet::new(),
             &resolver,
             None,
@@ -1508,6 +1676,7 @@ mod tests {
         let (nodes, edges) = expand_with_nodes_and_edges(
             vec![(chunk_id, graph)],
             dataset_id,
+            &HashMap::new(),
             &HashMap::new(),
             &HashSet::new(),
             &resolver,
@@ -1573,6 +1742,7 @@ mod tests {
             vec![(chunk_id, graph)],
             dataset_id,
             &HashMap::new(),
+            &HashMap::new(),
             &HashSet::new(),
             &resolver,
             None,
@@ -1635,6 +1805,7 @@ mod tests {
             vec![(chunk_id, graph)],
             dataset_id,
             &HashMap::new(),
+            &HashMap::new(),
             &HashSet::new(),
             &resolver,
             None,
@@ -1670,6 +1841,7 @@ mod tests {
         let (nodes, _edges) = expand_with_nodes_and_edges(
             vec![(chunk_id, graph)],
             dataset_id,
+            &HashMap::new(),
             &HashMap::new(),
             &HashSet::new(),
             &noop(),

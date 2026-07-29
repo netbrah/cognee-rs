@@ -88,6 +88,7 @@ async fn test_ontology_round_trip_with_real_resolver() {
         vec![(chunk_id, graph)],
         dataset_id,
         &HashMap::new(),
+        &HashMap::new(),
         &HashSet::new(),
         &resolver,
         None,
@@ -173,6 +174,7 @@ async fn test_ontology_unmatched_type_not_validated() {
         vec![(chunk_id, graph)],
         dataset_id,
         &HashMap::new(),
+        &HashMap::new(),
         &HashSet::new(),
         &resolver,
         None,
@@ -209,6 +211,7 @@ async fn test_ontology_noop_resolver_leaves_everything_unvalidated() {
     let (nodes, _edges) = expand_with_nodes_and_edges(
         vec![(chunk_id, graph)],
         dataset_id,
+        &HashMap::new(),
         &HashMap::new(),
         &HashSet::new(),
         &resolver,
