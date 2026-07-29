@@ -171,29 +171,56 @@ fn start_phase_telemetry(_profile_dir: Option<&str>) {}
 #[cfg(not(feature = "profiling"))]
 fn finish_phase_telemetry(_profile_dir: Option<&str>, _phase: &str) {}
 
+/// Run one pipeline phase with profiling/telemetry armed, timing only the
+/// workload. The timer starts *after* the profiler/telemetry are armed and
+/// stops *before* the flamegraph/telemetry artifacts are written, so the
+/// returned elapsed is workload-only — not inflated by profiler startup or
+/// report generation. Centralizes the bracketing so the three phases (add /
+/// cognify / search) cannot drift out of sync. Returns `(elapsed_secs, result)`.
+async fn timed_phase(
+    profile_dir: Option<&str>,
+    phase: &str,
+    work: impl std::future::Future<Output = Result<(), String>>,
+) -> (f64, Result<(), String>) {
+    start_phase_telemetry(profile_dir);
+    let guard = start_phase_profiler(profile_dir);
+    let start = Instant::now();
+    let result = work.await;
+    let elapsed = start.elapsed().as_secs_f64();
+    finish_phase_profiler(guard, profile_dir, phase);
+    finish_phase_telemetry(profile_dir, phase);
+    (elapsed, result)
+}
+
 /// Round to 3 decimals to match Python's `round(x, 3)` output.
 fn round3(value: f64) -> f64 {
     (value * 1000.0).round() / 1000.0
 }
 
-/// Read `(node_count, edge_count)` from the graph after cognify. Returns
-/// `(0, 0)` (which trips the sanity guard) if the metrics can't be read.
-async fn graph_counts(cm: &Arc<ComponentManager>) -> (i64, i64) {
+/// Read `(node_count, edge_count)` from the graph after cognify.
+///
+/// Returns `None` if the metrics cannot be read (backend unavailable or the
+/// metrics query itself failed), which the caller distinguishes from a
+/// genuinely empty graph: an empty graph trips the stale-cassette guard with a
+/// "N nodes < floor" message, while unreadable metrics fail the run with a
+/// distinct "metrics unreadable" message — rather than being coerced to a
+/// fabricated 0-node count that a parity comparison would read as real.
+async fn graph_counts(cm: &Arc<ComponentManager>) -> Option<(i64, i64)> {
     let graph_db = match cm.graph_db().await {
         Ok(db) => db,
         Err(error) => {
             warn!("graph metrics unavailable: {error}");
-            return (0, 0);
+            return None;
         }
     };
     match graph_db.get_graph_metrics(false).await {
         Ok(metrics) => {
             let get = |k: &str| metrics.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
-            (get("node_count"), get("edge_count"))
+            Some((get("node_count"), get("edge_count")))
         }
         Err(error) => {
             warn!("graph metrics query failed: {error}");
-            (0, 0)
+            None
         }
     }
 }
@@ -246,6 +273,14 @@ pub fn run(args: BenchArgs, cm: Arc<ComponentManager>) -> Result<(), CliError> {
     }
     if let Some(limit) = args.num_memories {
         memories.truncate(limit);
+        // Truncating to an empty corpus would skip the graph sanity guard in
+        // run_phases (which is gated on a non-empty corpus) and let a 0/0 graph
+        // be reported with success=true. Reject it up front.
+        if memories.is_empty() {
+            return Err(CliError::Validation(
+                "--num-memories must be at least 1 (0 leaves an empty corpus)".to_string(),
+            ));
+        }
     }
 
     // ── Mock plumbing: configure Settings BEFORE any component init ──────
@@ -416,29 +451,29 @@ async fn run_phases(
 
     // ── Add ────────────────────────────────────────────────────────────────
     eprintln!("Phase 1: Adding {n} memories...");
-    let t_add_start = Instant::now();
-    start_phase_telemetry(profile_dir);
-    let add_prof = start_phase_profiler(profile_dir);
-    if let Err(msg) = phase_add(cm, owner_id, dataset_name, memories).await {
+    let (t_add, add_res) = timed_phase(
+        profile_dir,
+        "add",
+        phase_add(cm, owner_id, dataset_name, memories),
+    )
+    .await;
+    if let Err(msg) = add_res {
         warn!("Add FAILED: {msg}");
         status.add = format!("failed: {msg}");
     }
-    finish_phase_profiler(add_prof, profile_dir, "add");
-    finish_phase_telemetry(profile_dir, "add");
-    let t_add = t_add_start.elapsed().as_secs_f64();
 
     // ── Cognify ──────────────────────────────────────────────────────────
     eprintln!("Phase 2: Running cognify (knowledge graph build)...");
-    let t_cognify_start = Instant::now();
-    start_phase_telemetry(profile_dir);
-    let cognify_prof = start_phase_profiler(profile_dir);
-    if let Err(msg) = phase_cognify(cm, owner_id, dataset_name).await {
+    let (t_cognify, cognify_res) = timed_phase(
+        profile_dir,
+        "cognify",
+        phase_cognify(cm, owner_id, dataset_name),
+    )
+    .await;
+    if let Err(msg) = cognify_res {
         warn!("Cognify FAILED: {msg}");
         status.cognify = format!("failed: {msg}");
     }
-    finish_phase_profiler(cognify_prof, profile_dir, "cognify");
-    finish_phase_telemetry(profile_dir, "cognify");
-    let t_cognify = t_cognify_start.elapsed().as_secs_f64();
 
     let t_total = t_add + t_cognify;
 
@@ -447,31 +482,56 @@ async fn run_phases(
     // (or below-floor) graph means the replay cassette fell through to the
     // empty-graph fallback, which happens with a stale cassette. Fail the phase
     // loudly instead of reporting a silent "success" over nothing.
-    let (node_count, edge_count) = graph_counts(cm).await;
-    eprintln!("Graph after cognify: {node_count} nodes, {edge_count} edges");
+    let counts = graph_counts(cm).await;
+    match counts {
+        Some((node_count, edge_count)) => {
+            eprintln!("Graph after cognify: {node_count} nodes, {edge_count} edges");
+        }
+        None => eprintln!("Graph after cognify: metrics unavailable"),
+    }
     if status.cognify == PHASE_OK && !memories.is_empty() {
         let floor = min_graph_nodes.max(1);
-        if (node_count as u64) < floor {
-            let msg = format!(
-                "graph sanity: {node_count} nodes < floor {floor} (stale cassette / empty-graph fallback?)"
-            );
-            warn!("{msg}");
-            status.cognify = format!("failed: {msg}");
+        match counts {
+            // Genuinely-empty (or below-floor) graph: a stale cassette fell
+            // through to the empty-graph fallback. Fail loudly.
+            Some((node_count, _)) if (node_count as u64) < floor => {
+                let msg = format!(
+                    "graph sanity: {node_count} nodes < floor {floor} (stale cassette / empty-graph fallback?)"
+                );
+                warn!("{msg}");
+                status.cognify = format!("failed: {msg}");
+            }
+            // Healthy graph — guard passes.
+            Some(_) => {}
+            // Metrics unreadable: we cannot confirm cognify produced a
+            // non-empty graph. Fail rather than emit a fabricated 0/0 count
+            // alongside success=true, which a parity comparison would read as a
+            // genuine 0-node measurement of a successful run.
+            None => {
+                let msg = "graph sanity: graph metrics unreadable; cannot verify non-empty graph"
+                    .to_string();
+                warn!("{msg}");
+                status.cognify = format!("failed: {msg}");
+            }
         }
     }
+    // `BenchResult` requires integer counts (Python parity schema). Unreadable
+    // metrics are reported as 0/0, but the guard above has already flipped
+    // cognify to "failed" in that case, so 0/0 never coincides with success.
+    let (node_count, edge_count) = counts.unwrap_or((0, 0));
 
     // ── Search ───────────────────────────────────────────────────────────
     eprintln!("Phase 3: Running search query...");
-    let t_search_start = Instant::now();
-    start_phase_telemetry(profile_dir);
-    let search_prof = start_phase_profiler(profile_dir);
-    if let Err(msg) = phase_search(cm, owner_id, dataset_name).await {
+    let (t_search, search_res) = timed_phase(
+        profile_dir,
+        "search",
+        phase_search(cm, owner_id, dataset_name),
+    )
+    .await;
+    if let Err(msg) = search_res {
         warn!("Search FAILED: {msg}");
         status.search = format!("failed: {msg}");
     }
-    finish_phase_profiler(search_prof, profile_dir, "search");
-    finish_phase_telemetry(profile_dir, "search");
-    let t_search = t_search_start.elapsed().as_secs_f64();
 
     let success = status.prune == PHASE_OK
         && status.db_setup == PHASE_OK
