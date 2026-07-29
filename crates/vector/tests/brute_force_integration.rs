@@ -139,6 +139,28 @@ async fn brute_force_retrieve_chunking() {
     common::test_retrieve_chunking(&BruteForceVectorDB::new()).await;
 }
 
+// -- filtered search contract (shared helpers) ------------------------------
+
+#[tokio::test]
+async fn brute_force_search_similar_filtered_filter_then_limit() {
+    common::test_search_similar_filtered_filter_then_limit(&BruteForceVectorDB::new()).await;
+}
+
+#[tokio::test]
+async fn brute_force_search_similar_filtered_semantics() {
+    common::test_search_similar_filtered_semantics(&BruteForceVectorDB::new()).await;
+}
+
+#[tokio::test]
+async fn brute_force_search_similar_filtered_and_vs_or() {
+    common::test_search_similar_filtered_and_vs_or(&BruteForceVectorDB::new()).await;
+}
+
+#[tokio::test]
+async fn brute_force_search_similar_filtered_none_matches_all() {
+    common::test_search_similar_filtered_none_matches_all(&BruteForceVectorDB::new()).await;
+}
+
 // -- upsert_raw_vectors contract (shared helpers) ---------------------------
 
 #[tokio::test]

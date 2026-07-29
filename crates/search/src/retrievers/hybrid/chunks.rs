@@ -35,18 +35,6 @@ const DOCUMENT_CHUNK_TYPE: &str = "DocumentChunk";
 const TEXT_SUMMARY_TYPE: &str = "TextSummary";
 const TEXT_FIELD: &str = "text";
 
-/// Upper bound on the client-side node-filter over-fetch window in
-/// [`search_collection`].
-///
-/// When a `node_name` filter is active, `search_collection` fetches up to the
-/// full collection so that limit-then-filter matches Python's server-side
-/// filter-then-limit exactly. This cap keeps that widening bounded: collections
-/// larger than the cap fall back to the heuristic window and retain a residual
-/// recall gap (documented on [`search_collection`]). Sized to comfortably cover
-/// this project's edge-device / modest-dataset target while never fetching an
-/// unbounded number of rows.
-const NODE_FILTER_RECALL_FETCH_CAP: usize = 4096;
-
 /// Result of a hybrid chunk retrieval: the ranked chunks and their paired
 /// summaries keyed by chunk id.
 pub(crate) struct HybridChunksResult {
@@ -67,42 +55,33 @@ pub(crate) fn summary_candidate_limit(
 }
 
 /// Similarity-search a vector collection, guarding a missing collection and
-/// applying the client-side node filter (Python filters server-side).
+/// applying the node-set filter through the vector engine (finding F9).
 ///
-/// Port of `search_collection` (`chunks.py:143-175`) adapted to Rust's
-/// `VectorDB` trait, which has no server-side `node_name` parameter. A missing
-/// collection is a hard [`SearchError::NotFound`] when `required` (Python raises
-/// `NoDataError`; Rust reuses `NotFound`, matching `ChunksRetriever` /
-/// `SummariesRetriever`), otherwise an empty channel.
+/// Port of `search_collection` (`chunks.py:143-175`). Python threads `node_name`
+/// into `vector_engine.search(...)`, which filters **server-side then limits**
+/// (`filter-then-limit`): the engine only counts in-set rows toward `limit`, so
+/// every returned row is in-set and no valid in-set row is ever crowded out by
+/// higher-similarity out-of-set rows. Rust now mirrors this by threading
+/// `node_name`/`operator` into [`VectorDB::search_similar_filtered`], so the
+/// filter is applied inside the adapter rather than after an over-fetch here.
 ///
-/// # Node-filter recall bound (divergence from Python)
+/// A missing collection is a hard [`SearchError::NotFound`] when `required`
+/// (Python raises `NoDataError`; Rust reuses `NotFound`, matching
+/// `ChunksRetriever` / `SummariesRetriever`), otherwise an empty channel.
 ///
-/// Python threads `node_name` into `vector_engine.search(...)`, which filters
-/// **server-side then limits** (`filter-then-limit`): the engine only counts
-/// in-set rows toward `limit`, so every returned row is in-set and no valid
-/// in-set row is ever crowded out by out-of-set rows. `VectorDB::search_similar`
-/// has no filter parameter, so this port must **limit-then-filter**: fetch a
-/// window ordered by pure similarity, then drop out-of-set rows and truncate to
-/// `limit`.
+/// # Recall parity
 ///
-/// That inverts the ordering, so it has a **recall bound**: an in-set row is
-/// silently dropped when strictly more than `fetch_limit - limit` out-of-set
-/// rows outrank it by similarity (they exhaust the window before it is reached).
+/// The in-memory adapters (`BruteForceVectorDB`, `MockVectorDB`) and the
+/// pgvector adapter override `search_similar_filtered` with an **exact**
+/// server-side filter-then-limit at any collection size. The default trait
+/// fallback (used by the LanceDB adapter, whose `metadata` is an opaque JSON
+/// string it cannot predicate on) keeps a bounded limit-then-filter that is
+/// exact for collections at or below `NODE_FILTER_RECALL_FETCH_CAP` and only
+/// approximate above it. See [`VectorDB::search_similar_filtered`] for the full
+/// per-backend recall discussion.
 ///
-/// To keep that gap out of the realistic case, `fetch_limit` widens to the
-/// **entire collection** whenever the collection fits under
-/// [`NODE_FILTER_RECALL_FETCH_CAP`]. Fetching every row makes limit-then-filter
-/// *exactly* equal to filter-then-limit (the window can no longer be exhausted),
-/// so parity is exact for any collection at or below the cap — which covers this
-/// project's edge-device / modest-dataset target. Only collections larger than
-/// the cap fall back to the bounded heuristic window and retain the residual
-/// recall gap above. The bound is intentional: the true fix (a server-side
-/// `node_name` filter on `VectorDB::search_similar`) is a larger, out-of-scope
-/// trait change, tracked as an accepted divergence in the Phase-2 plan
-/// (`docs/plans/hybrid-retriever/phase-2/P2-05.md`).
-///
-/// The fetch never grows without bound: it is capped at
-/// [`NODE_FILTER_RECALL_FETCH_CAP`].
+/// When `node_name` is `None`/empty the call is byte-identical to the previous
+/// plain `search_similar` + `search_results_to_context` path.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn search_collection(
     vector_db: &Arc<dyn VectorDB>,
@@ -129,33 +108,22 @@ pub(crate) async fn search_collection(
 
     match node_name {
         Some(names) if !names.is_empty() => {
-            // limit-then-filter (Python filters server-side). Widen the window
-            // to the whole collection when it fits under the cap so that
-            // dropping out-of-set rows and truncating to `limit` reproduces
-            // Python's filter-then-limit exactly; only collections above the
-            // cap keep the bounded heuristic window and its residual recall
-            // gap. See the fn doc comment for the full recall-bound rationale.
-            let heuristic_window = limit.saturating_mul(4).max(limit + 20);
-            let collection_size = vector_db.collection_size(data_type, field).await?;
-            let fetch_limit =
-                heuristic_window.max(collection_size.min(NODE_FILTER_RECALL_FETCH_CAP));
+            // Server-side filter-then-limit: the adapter drops out-of-set rows
+            // before applying `limit`, so in-set rows are never crowded out.
             let results = vector_db
-                .search_similar(data_type, field, query_vector, fetch_limit)
+                .search_similar_filtered(
+                    data_type,
+                    field,
+                    query_vector,
+                    limit,
+                    Some(names),
+                    node_name_filter_operator,
+                )
                 .await?;
-            let items = search_results_to_context(results)?;
-            Ok(items
-                .into_iter()
-                .filter(|item| {
-                    payload_matches_node_filter(
-                        &item.payload,
-                        Some(names),
-                        node_name_filter_operator,
-                    )
-                })
-                .take(limit)
-                .collect())
+            search_results_to_context(results)
         }
         _ => {
+            // No filter — byte-identical to the pre-F9 plain-search path.
             let results = vector_db
                 .search_similar(data_type, field, query_vector, limit)
                 .await?;
@@ -623,21 +591,21 @@ mod tests {
 
     #[tokio::test]
     async fn node_filter_keeps_in_set_chunks_outranked_by_many_out_of_set() {
-        // Regression for the client-side node-filter recall bound: 30 out-of-set
-        // chunks outrank the 2 in-set chunks by pure similarity. With
-        // chunks_top_k = 2 the candidate limit is 4 and the heuristic over-fetch
-        // window is 24 — smaller than the 30 out-of-set rows — so a plain
-        // limit-then-filter would exhaust the window on out-of-set rows and drop
-        // both in-set chunks. Widening the fetch to the full collection (below
-        // NODE_FILTER_RECALL_FETCH_CAP) restores filter-then-limit parity and
-        // recovers both in-set chunks.
+        // Regression for finding F9: 300 out-of-set chunks outrank the 2 in-set
+        // chunks by pure similarity. With chunks_top_k = 2 the candidate limit
+        // is 4, so the old limit-then-filter (fetch a small window, then drop
+        // out-of-set rows) would exhaust its window entirely on out-of-set rows
+        // and return zero in-set chunks. MockVectorDB now filters server-side
+        // (filter-then-limit) via `search_similar_filtered`, so both in-set
+        // chunks survive regardless of how many out-of-set rows outrank them —
+        // deliberately far more than any client-side over-fetch cap would cover.
         let db = MockVectorDB::new();
         db.create_collection(DOCUMENT_CHUNK_TYPE, TEXT_FIELD, 2)
             .await
             .unwrap();
 
-        // 30 out-of-set chunks, maximally aligned with the query [1, 0].
-        for i in 0..30 {
+        // 300 out-of-set chunks, maximally aligned with the query [1, 0].
+        for i in 0..300 {
             index_chunk(
                 &db,
                 Uuid::new_v4(),

@@ -72,3 +72,7 @@ pgvector_test!(test_retrieve_empty_ids);
 pgvector_test!(test_retrieve_chunking);
 pgvector_test!(test_upsert_raw_vectors_round_trip);
 pgvector_test!(test_upsert_raw_vectors_empty_noop);
+pgvector_test!(test_search_similar_filtered_filter_then_limit);
+pgvector_test!(test_search_similar_filtered_semantics);
+pgvector_test!(test_search_similar_filtered_and_vs_or);
+pgvector_test!(test_search_similar_filtered_none_matches_all);

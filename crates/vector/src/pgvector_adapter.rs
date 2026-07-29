@@ -190,6 +190,56 @@ impl PgVectorAdapter {
         format!("[{inner}]")
     }
 
+    /// Build the `belongs_to_set` NodeSet-membership `WHERE` fragment (over the
+    /// `metadata` JSONB column) plus the ordered name parameters, numbered from
+    /// `$first_param`. `names` must be non-empty. Names are bound as parameters
+    /// — never interpolated — so caller-supplied node names cannot inject SQL.
+    ///
+    /// Semantics mirror [`crate::node_filter::metadata_matches_node_filter`]:
+    /// each element's set-name is a bare string as-is, or an object's `"name"`
+    /// field, or nothing; `"AND"` requires the requested names to be a subset of
+    /// the row's names, anything else is `"OR"` (non-empty intersection). The
+    /// `CASE ... ELSE '[]'::jsonb` fallback keeps `jsonb_array_elements` from
+    /// erroring when `belongs_to_set` is missing or not an array — such a row
+    /// then yields an empty name-set and matches nothing, exactly as the
+    /// in-memory predicate returns `false` for it.
+    fn node_filter_where(
+        names: &[String],
+        operator: &str,
+        first_param: usize,
+    ) -> (String, Vec<sea_orm::Value>) {
+        // Set-name of one `belongs_to_set` element.
+        let elem_name = "(CASE jsonb_typeof(elem.v) \
+             WHEN 'string' THEN elem.v #>> '{}' \
+             WHEN 'object' THEN elem.v ->> 'name' \
+             ELSE NULL END)";
+        // Array-guarded element expansion (never errors on non-array values).
+        let elements = "jsonb_array_elements(\
+             CASE WHEN jsonb_typeof(metadata->'belongs_to_set') = 'array' \
+                  THEN metadata->'belongs_to_set' ELSE '[]'::jsonb END) AS elem(v)";
+
+        let placeholders: Vec<String> = (0..names.len())
+            .map(|i| format!("${}::text", first_param + i))
+            .collect();
+        let values: Vec<sea_orm::Value> = names.iter().map(|n| n.clone().into()).collect();
+
+        let where_sql = if operator == "AND" {
+            // Requested ⊆ payload: no requested name is absent from the row.
+            format!(
+                "NOT EXISTS (SELECT 1 FROM unnest(ARRAY[{}]) AS req(name) \
+                 WHERE NOT EXISTS (SELECT 1 FROM {elements} WHERE {elem_name} = req.name))",
+                placeholders.join(", ")
+            )
+        } else {
+            // OR: non-empty intersection.
+            format!(
+                "EXISTS (SELECT 1 FROM {elements} WHERE {elem_name} = ANY(ARRAY[{}]))",
+                placeholders.join(", ")
+            )
+        };
+        (where_sql, values)
+    }
+
     /// Fetch the current `metadata` JSONB for the given points (by id) from
     /// `coll`, keyed by id. Used to union dataset membership before an upsert so
     /// re-indexing a content-addressed point under a new dataset does not drop
@@ -607,6 +657,79 @@ impl VectorDB for PgVectorAdapter {
                 DatabaseBackend::Postgres,
                 &sql,
                 [vec_str.into(), (top_k as i64).into()],
+            ))
+            .await
+            .map_err(|e| VectorDBError::StorageError(e.to_string()))?;
+
+        let mut results = Vec::with_capacity(rows.len());
+        for row in &rows {
+            results.push(Self::row_to_search_result(row)?);
+        }
+
+        Span::current().record(COGNEE_VECTOR_RESULT_COUNT, results.len() as i64);
+        Ok(results)
+    }
+
+    #[instrument(
+        name = "cognee.db.vector.search_filtered",
+        level = "info",
+        skip_all,
+        fields(
+            cognee.db.system = "pgvector",
+            cognee.vector.collection = tracing::field::Empty,
+            cognee.vector.result_count = tracing::field::Empty,
+        ),
+        err,
+    )]
+    async fn search_similar_filtered(
+        &self,
+        data_type: &str,
+        field_name: &str,
+        query_vector: &[f32],
+        top_k: usize,
+        node_name: Option<&[String]>,
+        node_name_filter_operator: &str,
+    ) -> VectorDBResult<Vec<SearchResult>> {
+        // No filter requested — identical to the unfiltered similarity search.
+        let requested: &[String] = match node_name {
+            Some(names) if !names.is_empty() => names,
+            _ => {
+                return self
+                    .search_similar(data_type, field_name, query_vector, top_k)
+                    .await;
+            }
+        };
+
+        let coll = Self::collection_name(data_type, field_name)?;
+        Span::current().record(COGNEE_VECTOR_COLLECTION, coll.as_str());
+
+        let vec_str = Self::format_vector(query_vector);
+        // $1 = query vector, $2 = top_k, $3.. = requested node names. Pushing the
+        // NodeSet predicate into the WHERE clause makes the ORDER BY distance
+        // LIMIT run *after* the filter (server-side filter-then-limit), so every
+        // returned row is in-set and none is crowded out — exact at any size.
+        let (where_sql, name_values) =
+            Self::node_filter_where(requested, node_name_filter_operator, 3);
+
+        let sql = format!(
+            r#"SELECT id, 1 - (vector <=> $1::vector) AS score, metadata
+               FROM "{coll}"
+               WHERE {where_sql}
+               ORDER BY vector <=> $1::vector
+               LIMIT $2"#
+        );
+
+        let mut values: Vec<sea_orm::Value> = Vec::with_capacity(2 + name_values.len());
+        values.push(vec_str.into());
+        values.push((top_k as i64).into());
+        values.extend(name_values);
+
+        let rows = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                &sql,
+                values,
             ))
             .await
             .map_err(|e| VectorDBError::StorageError(e.to_string()))?;

@@ -29,6 +29,7 @@ use uuid::Uuid;
 
 use crate::error::{VectorDBError, VectorDBResult};
 use crate::models::{SearchResult, VectorPoint};
+use crate::node_filter::metadata_matches_node_filter;
 use crate::vector_db_trait::VectorDB;
 
 #[derive(Debug)]
@@ -217,6 +218,71 @@ impl VectorDB for BruteForceVectorDB {
         };
 
         // Higher score first (descending). `total_cmp` orders NaN deterministically.
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+        scored.truncate(top_k);
+        Ok(scored
+            .into_iter()
+            .map(|(id, score, metadata)| SearchResult {
+                id,
+                score,
+                metadata,
+            })
+            .collect())
+    }
+
+    /// Exact server-side node-set filter: drop out-of-set points during the
+    /// scan, *before* ranking + `top_k` truncation (filter-then-limit), so an
+    /// in-set point is never crowded out by higher-similarity out-of-set points
+    /// regardless of collection size (finding F9). With no filter this is
+    /// identical to [`search_similar`](Self::search_similar).
+    async fn search_similar_filtered(
+        &self,
+        data_type: &str,
+        field_name: &str,
+        query_vector: &[f32],
+        top_k: usize,
+        node_name: Option<&[String]>,
+        node_name_filter_operator: &str,
+    ) -> VectorDBResult<Vec<SearchResult>> {
+        let requested: Option<&[String]> = match node_name {
+            Some(names) if !names.is_empty() => Some(names),
+            _ => None,
+        };
+        let key = Self::key(data_type, field_name);
+        // Score (and filter) under the read guard, then drop it before the
+        // sort/truncate, mirroring `search_similar`.
+        let mut scored: Vec<(Uuid, f32, HashMap<String, serde_json::Value>)> = {
+            let g = self.collections.read().await;
+            let coll = g
+                .get(&key)
+                .ok_or_else(|| VectorDBError::CollectionNotFound(key.clone()))?;
+            if query_vector.len() != coll.dimension {
+                return Err(VectorDBError::DimensionMismatch {
+                    collection: key.clone(),
+                    expected: coll.dimension,
+                    actual: query_vector.len(),
+                });
+            }
+            coll.points
+                .iter()
+                .filter(|p| match requested {
+                    Some(names) => metadata_matches_node_filter(
+                        &p.metadata,
+                        Some(names),
+                        node_name_filter_operator,
+                    ),
+                    None => true,
+                })
+                .map(|p| {
+                    (
+                        p.id,
+                        cosine_similarity(&p.vector, query_vector),
+                        p.metadata.clone(),
+                    )
+                })
+                .collect()
+        };
+
         scored.sort_by(|a, b| b.1.total_cmp(&a.1));
         scored.truncate(top_k);
         Ok(scored
