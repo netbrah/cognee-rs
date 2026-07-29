@@ -613,4 +613,139 @@ mod tests {
         );
         assert_eq!(ids(&missing_ranked), base_ids);
     }
+
+    #[test]
+    fn final_score_composes_importance_then_truth() {
+        // Composition test: the full `rrf * importance_factor * truth_factor`
+        // product (1.25 * 1.25 = 1.5625) must be applied — and only the FULL
+        // product, not either factor alone, reproduces the winning order.
+        //
+        // limit=5 -> k=30, single-lane rrf = 1/(31 + rank).
+        //   plain: rank 0  -> rrf 1/31 = 0.0322581, importance 0.5 (factor 1.0),
+        //          absent from the truth map (no truth factor)  -> 0.0322581
+        //   boost: rank 12 -> rrf 1/43 = 0.0232558, importance 1.0 (factor 1.25),
+        //          aligned truth at the current epoch (factor 1.25).
+        //     full product : 0.0232558 * 1.5625 = 0.0363372 > 0.0322581  => boost wins
+        //     importance only: 0.0232558 * 1.25 = 0.0290698 < 0.0322581  => plain wins
+        //     truth only     : 0.0232558 * 1.25 = 0.0290698 < 0.0322581  => plain wins
+        //     neither        : 0.0232558          < 0.0322581            => plain wins
+        // So [boost, plain] is only reachable when BOTH factors compose.
+        let q_coords = vec![1.0, 0.0];
+        let epoch = 3;
+        let mut states = HashMap::new();
+        states.insert(
+            "boost".to_string(),
+            NodeTruthState {
+                truth_alignment: vec![1.0, 0.0], // aligned with q_coords -> factor 1.25
+                truth_epoch: epoch,
+            },
+        );
+
+        // Pin the two factors that must multiply to 1.5625 (proves the constants
+        // and that both are the real functions, not hand-copied literals).
+        let boost_payload = json!({"id": "boost", "importance_weight": 1.0});
+        assert!((importance_factor(&boost_payload) - 1.25).abs() < 1e-12);
+        assert!((truth_factor(&[1.0, 0.0], &q_coords) - 1.25).abs() < 1e-12);
+
+        let mk = || {
+            vec![
+                pair("plain", Some(0), None, None, Some(0.5)),
+                pair("boost", Some(12), None, None, Some(1.0)),
+            ]
+        };
+        let boost_first = vec![Some("boost".to_string()), Some("plain".to_string())];
+        let plain_first = vec![Some("plain".to_string()), Some("boost".to_string())];
+
+        // Full composition: importance ON + truth ON -> boost overtakes.
+        let both = rank_chunk_summary_pairs(
+            mk(),
+            5,
+            true,
+            true,
+            Some(&q_coords),
+            Some(&states),
+            Some(epoch),
+        );
+        assert_eq!(ids(&both), boost_first);
+
+        // Importance only (truth off): 1.25 alone is not enough -> plain first.
+        let imp_only = rank_chunk_summary_pairs(mk(), 5, true, false, None, None, None);
+        assert_eq!(ids(&imp_only), plain_first);
+
+        // Truth only (importance off): 1.25 alone is not enough -> plain first.
+        let truth_only = rank_chunk_summary_pairs(
+            mk(),
+            5,
+            false,
+            true,
+            Some(&q_coords),
+            Some(&states),
+            Some(epoch),
+        );
+        assert_eq!(ids(&truth_only), plain_first);
+
+        // Neither factor: pure rrf -> plain first.
+        let neither = rank_chunk_summary_pairs(mk(), 5, false, false, None, None, None);
+        assert_eq!(ids(&neither), plain_first);
+    }
+
+    #[test]
+    fn current_epoch_vector_overtakes_stale_vector() {
+        // Selective per-chunk epoch matching: only the chunk whose stored
+        // truth_epoch equals the current epoch receives the multiplier, even
+        // though BOTH chunks are equally aligned.
+        //
+        // limit=5 -> k=30. importance weighting OFF, so scores are pure rrf x
+        // (optional) truth factor.
+        //   stale:   rank 0 -> rrf 1/31 = 0.0322581; truth_epoch 1 != 2 -> no boost.
+        //   current: rank 1 -> rrf 1/32 = 0.0312500; truth_epoch 2 == 2 ->
+        //            * truth_factor([1.0],[1.0]) = 1.25 -> 0.0390625.
+        //   0.0390625 > 0.0322581  => order flips to [current, stale].
+        let q_coords = vec![1.0];
+        let current_epoch = 2;
+        let mut states = HashMap::new();
+        states.insert(
+            "stale".to_string(),
+            NodeTruthState {
+                truth_alignment: vec![1.0],
+                truth_epoch: 1, // stale
+            },
+        );
+        states.insert(
+            "current".to_string(),
+            NodeTruthState {
+                truth_alignment: vec![1.0],
+                truth_epoch: 2, // current
+            },
+        );
+
+        let mk = || {
+            vec![
+                pair("stale", Some(0), None, None, Some(0.5)),
+                pair("current", Some(1), None, None, Some(0.5)),
+            ]
+        };
+
+        // Positive control: with truth OFF the higher-rrf stale chunk wins.
+        let base = rank_chunk_summary_pairs(mk(), 5, false, false, None, None, None);
+        assert_eq!(
+            ids(&base),
+            vec![Some("stale".to_string()), Some("current".to_string())]
+        );
+
+        // Truth ON: only `current` (matching epoch) is boosted, overtaking stale.
+        let ranked = rank_chunk_summary_pairs(
+            mk(),
+            5,
+            false, // use_importance_weight
+            true,  // use_truth_weight
+            Some(&q_coords),
+            Some(&states),
+            Some(current_epoch),
+        );
+        assert_eq!(
+            ids(&ranked),
+            vec![Some("current".to_string()), Some("stale".to_string())]
+        );
+    }
 }
