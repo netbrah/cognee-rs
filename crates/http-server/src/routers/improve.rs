@@ -29,6 +29,14 @@ use crate::error::{ApiError, PipelineErrorSource};
 use crate::pipelines::dispatch::{DispatchOutcome, box_pipeline_future, dispatch_pipeline};
 use crate::state::AppState;
 
+/// Default feedback-weight mixing factor for the HTTP improve path.
+///
+/// Python parity: the HTTP improve router does not accept a `feedback_alpha`
+/// and `improve()` defaults it to `0.1`
+/// (`cognee/api/v1/improve/improve.py`: `kwargs.pop("feedback_alpha", 0.1)`).
+/// This is the same default used by the CLI, bindings, and remember paths.
+const DEFAULT_FEEDBACK_ALPHA: f64 = 0.1;
+
 // ─── post_improve ─────────────────────────────────────────────────────────────
 
 /// `POST /api/v1/improve`
@@ -245,7 +253,7 @@ async fn run_real_improve(
         .filter(|ids| !ids.is_empty())
         .cloned();
     let has_sessions = session_ids.is_some();
-    let feedback_alpha = 0.5f64;
+    let feedback_alpha = DEFAULT_FEEDBACK_ALPHA;
 
     let ontology_resolver: Arc<dyn OntologyResolver> = components
         .ontology_resolver
@@ -518,6 +526,14 @@ mod tests {
             auth_method: crate::auth::AuthMethod::DefaultUser,
         };
         post_improve(user, State(state), Json(payload)).await
+    }
+
+    /// Python parity: the HTTP improve path must default `feedback_alpha` to
+    /// `0.1` (`cognee/api/v1/improve/improve.py`: `kwargs.pop("feedback_alpha",
+    /// 0.1)`), NOT the previously-hardcoded `0.5` which was 5x too strong.
+    #[test]
+    fn default_feedback_alpha_matches_python() {
+        assert_eq!(DEFAULT_FEEDBACK_ALPHA, 0.1);
     }
 
     #[tokio::test]
