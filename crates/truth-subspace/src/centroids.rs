@@ -670,4 +670,151 @@ mod tests {
         );
         assert_eq!(built.iter().map(|c| c.count).sum::<usize>(), 1);
     }
+
+    // Helper: build a minimal payload for centroids_changed tests.
+    fn payload(
+        slot: usize,
+        count: usize,
+        centroid: Vec<f64>,
+        learning_ids: Vec<&str>,
+    ) -> TruthCentroidPayload {
+        TruthCentroidPayload {
+            dataset_id: "dataset-1".to_string(),
+            slot,
+            count,
+            truth_epoch: 1,
+            updated_at: 123,
+            centroid,
+            learning_ids: learning_ids.into_iter().map(str::to_string).collect(),
+        }
+    }
+
+    // 14 — nearest-slot merge picks the HIGHEST-cosine slot (not always slot 0).
+    // Distinct from test 11, which uses an equidistant vector; here the new
+    // vector is clearly closer to slot 1, so an "always slot 0" bug would fail.
+    #[test]
+    fn nearest_slot_merges_into_highest_cosine_slot() {
+        let centroids = extend_centroids_with_learning_vectors(
+            "dataset-1",
+            &[],
+            &[
+                ("a".to_string(), vec![1.0, 0.0]),
+                ("b".to_string(), vec![0.0, 1.0]),
+                // Clearly closer to slot 1 ([0,1]) than slot 0 ([1,0]).
+                ("c".to_string(), vec![0.05, 1.0]),
+            ],
+            1,
+            Some(123),
+            2,
+        );
+
+        assert_eq!(centroids.len(), 2);
+        // slot 0 stays untouched: just "a", count 1.
+        assert_eq!(centroids[0].learning_ids, vec!["a".to_string()]);
+        assert_eq!(centroids[0].count, 1);
+        // "c" merges into slot 1 (highest cosine): [b, c], count 2.
+        assert_eq!(
+            centroids[1].learning_ids,
+            vec!["b".to_string(), "c".to_string()]
+        );
+        assert_eq!(centroids[1].count, 2);
+    }
+
+    // 15 — centroids_changed treats sub-tolerance value drift as unchanged and
+    // above-tolerance drift as changed (tolerance 1e-6).
+    #[test]
+    fn centroids_changed_respects_value_tolerance() {
+        let base = vec![payload(0, 1, vec![0.6, 0.8], vec!["x"])];
+
+        // Bump one component by 5e-7 (< 1e-6) -> unchanged.
+        let within = vec![payload(0, 1, vec![0.6 + 5e-7, 0.8], vec!["x"])];
+        assert!(!centroids_changed(&base, &within, 1e-6));
+
+        // Bump one component by 2e-6 (> 1e-6) -> changed.
+        let beyond = vec![payload(0, 1, vec![0.6 + 2e-6, 0.8], vec!["x"])];
+        assert!(centroids_changed(&base, &beyond, 1e-6));
+    }
+
+    // 16 — centroids_changed detects learning-id reorder, count diff, and a
+    // missing/renumbered slot (all with equal length so no early length exit).
+    #[test]
+    fn centroids_changed_detects_reorder_count_and_slot_mismatch() {
+        // (a) identical values, learning_ids order-swapped -> changed.
+        let old_a = vec![payload(0, 2, vec![0.6, 0.8], vec!["x", "y"])];
+        let new_a = vec![payload(0, 2, vec![0.6, 0.8], vec!["y", "x"])];
+        assert!(centroids_changed(&old_a, &new_a, 1e-6));
+
+        // (b) same slot, count 3 vs 4 -> changed.
+        let old_b = vec![payload(0, 3, vec![0.6, 0.8], vec!["x"])];
+        let new_b = vec![payload(0, 4, vec![0.6, 0.8], vec!["x"])];
+        assert!(centroids_changed(&old_b, &new_b, 1e-6));
+
+        // (c) equal length but old slot 0 vs new slot 5 (no matching old slot).
+        let old_c = vec![payload(0, 1, vec![0.6, 0.8], vec!["x"])];
+        let new_c = vec![payload(5, 1, vec![0.6, 0.8], vec!["x"])];
+        assert!(centroids_changed(&old_c, &new_c, 1e-6));
+    }
+
+    // 17 — weighted_centroid: empty-old normalizes the new vector; a populated
+    // old applies count-weighted running mean (NOT an equal-weight average).
+    #[test]
+    fn weighted_centroid_running_mean_and_empty_old() {
+        // Empty old -> normalize(new): [3,4] / 5 = [0.6, 0.8].
+        let empty_old = weighted_centroid(&[], 7, &[3.0, 4.0]);
+        approx(empty_old[0], 0.6);
+        approx(empty_old[1], 0.8);
+
+        // count 3: merged = [(3*1+0)/4, (3*0+1)/4] = [0.75, 0.25], normalized.
+        // Equal-weight averaging would give normalize([0.5, 0.5]) instead.
+        let merged = weighted_centroid(&[1.0, 0.0], 3, &[0.0, 1.0]);
+        let denom = (0.75_f64 * 0.75 + 0.25 * 0.25).sqrt();
+        approx(merged[0], 0.75 / denom);
+        approx(merged[1], 0.25 / denom);
+        // Non-vacuous vs equal-weight: components must NOT be equal.
+        assert!((merged[0] - merged[1]).abs() > 0.1);
+    }
+
+    // 18 — unique_learning_vectors keeps the FIRST vector per id, drops
+    // blank-after-trim statements, and returns pairs sorted by id string.
+    #[test]
+    fn unique_learning_vectors_first_wins_sorted_and_skips_empty() {
+        let statements = vec![
+            "Coffee matters".to_string(),
+            " coffee  matters ".to_string(),
+            "  ".to_string(),
+            "Tea matters".to_string(),
+        ];
+        let vec_a = vec![1.0, 0.0];
+        let vec_b = vec![0.5, 0.5];
+        let vectors = vec![
+            vec_a.clone(),
+            vec_b.clone(),
+            vec![9.0, 9.0], // for the blank statement — must be dropped.
+            vec![0.0, 1.0],
+        ];
+        let pairs = unique_learning_vectors(&statements, &vectors);
+
+        // Blank dropped, Coffee variants collapse to one id -> 2 pairs.
+        assert_eq!(pairs.len(), 2);
+
+        let coffee_id = learning_id("Coffee matters");
+        let tea_id = learning_id("Tea matters");
+
+        // First-wins: Coffee keeps vec A, not vec B.
+        let coffee_pair = pairs
+            .iter()
+            .find(|(id, _)| id == &coffee_id)
+            .expect("coffee id present");
+        assert_eq!(coffee_pair.1, vec_a);
+        assert_ne!(coffee_pair.1, vec_b);
+
+        // Both expected ids present.
+        assert!(pairs.iter().any(|(id, _)| id == &tea_id));
+
+        // Sorted by id string.
+        let ids: Vec<String> = pairs.iter().map(|(id, _)| id.clone()).collect();
+        let mut sorted_ids = ids.clone();
+        sorted_ids.sort();
+        assert_eq!(ids, sorted_ids);
+    }
 }
