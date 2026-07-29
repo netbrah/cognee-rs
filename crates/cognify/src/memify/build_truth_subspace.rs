@@ -424,7 +424,7 @@ mod tests {
     use async_trait::async_trait;
     use cognee_embedding::MockEmbeddingEngine;
     use cognee_graph::{EdgeData, GraphDBError, GraphDBResult, GraphNode, MockGraphDB, NodeData};
-    use cognee_vector::MockVectorDB;
+    use cognee_vector::{MockVectorDB, SearchResult, VectorDBError, VectorDBResult, VectorPoint};
     use serde_json::Value;
 
     const DIM: usize = 8;
@@ -537,6 +537,197 @@ mod tests {
             depth: usize,
         ) -> GraphDBResult<(Vec<GraphNode>, Vec<EdgeData>)> {
             self.inner.get_neighborhood(node_ids, depth).await
+        }
+    }
+
+    /// A graph double that delegates everything to an inner [`MockGraphDB`]
+    /// (including `get_filtered_graph_data`, so chunk nodes DO load) but makes
+    /// the terminal `set_node_truth_state` write error — exercising the shape-5
+    /// persist-failure path. Mirrors [`NodeLoadFailGraph`]'s delegation shape.
+    struct PersistFailGraph {
+        inner: MockGraphDB,
+    }
+
+    #[async_trait]
+    impl GraphDBTrait for PersistFailGraph {
+        async fn set_node_truth_state(
+            &self,
+            _updates: &HashMap<String, NodeTruthState>,
+        ) -> GraphDBResult<HashMap<String, bool>> {
+            Err(GraphDBError::QueryError(
+                "truth-state write unavailable".into(),
+            ))
+        }
+        async fn get_filtered_graph_data(
+            &self,
+            filters: &HashMap<Cow<'static, str>, Vec<Value>>,
+        ) -> GraphDBResult<(Vec<GraphNode>, Vec<EdgeData>)> {
+            self.inner.get_filtered_graph_data(filters).await
+        }
+        async fn initialize(&self) -> GraphDBResult<()> {
+            self.inner.initialize().await
+        }
+        async fn is_empty(&self) -> GraphDBResult<bool> {
+            self.inner.is_empty().await
+        }
+        async fn query(
+            &self,
+            q: &str,
+            params: Option<HashMap<Cow<'static, str>, Value>>,
+        ) -> GraphDBResult<Vec<Vec<Value>>> {
+            self.inner.query(q, params).await
+        }
+        async fn delete_graph(&self) -> GraphDBResult<()> {
+            self.inner.delete_graph().await
+        }
+        async fn has_node(&self, id: &str) -> GraphDBResult<bool> {
+            self.inner.has_node(id).await
+        }
+        async fn add_node_raw(&self, node: Value) -> GraphDBResult<()> {
+            self.inner.add_node_raw(node).await
+        }
+        async fn add_nodes_raw(&self, nodes: Vec<Value>) -> GraphDBResult<()> {
+            self.inner.add_nodes_raw(nodes).await
+        }
+        async fn delete_node(&self, id: &str) -> GraphDBResult<()> {
+            self.inner.delete_node(id).await
+        }
+        async fn delete_nodes(&self, ids: &[String]) -> GraphDBResult<()> {
+            self.inner.delete_nodes(ids).await
+        }
+        async fn get_node(&self, id: &str) -> GraphDBResult<Option<NodeData>> {
+            self.inner.get_node(id).await
+        }
+        async fn get_nodes(&self, ids: &[String]) -> GraphDBResult<Vec<NodeData>> {
+            self.inner.get_nodes(ids).await
+        }
+        async fn has_edge(&self, s: &str, t: &str, r: &str) -> GraphDBResult<bool> {
+            self.inner.has_edge(s, t, r).await
+        }
+        async fn has_edges(&self, edges: &[EdgeData]) -> GraphDBResult<Vec<EdgeData>> {
+            self.inner.has_edges(edges).await
+        }
+        async fn add_edge(
+            &self,
+            s: &str,
+            t: &str,
+            r: &str,
+            p: Option<HashMap<Cow<'static, str>, Value>>,
+        ) -> GraphDBResult<()> {
+            self.inner.add_edge(s, t, r, p).await
+        }
+        async fn add_edges(&self, edges: &[EdgeData]) -> GraphDBResult<()> {
+            self.inner.add_edges(edges).await
+        }
+        async fn get_edges(&self, id: &str) -> GraphDBResult<Vec<EdgeData>> {
+            self.inner.get_edges(id).await
+        }
+        async fn get_neighbors(&self, id: &str) -> GraphDBResult<Vec<NodeData>> {
+            self.inner.get_neighbors(id).await
+        }
+        async fn get_connections(
+            &self,
+            id: &str,
+        ) -> GraphDBResult<Vec<(NodeData, HashMap<Cow<'static, str>, Value>, NodeData)>> {
+            self.inner.get_connections(id).await
+        }
+        async fn get_graph_data(&self) -> GraphDBResult<(Vec<GraphNode>, Vec<EdgeData>)> {
+            self.inner.get_graph_data().await
+        }
+        async fn get_graph_metrics(
+            &self,
+            include_optional: bool,
+        ) -> GraphDBResult<HashMap<Cow<'static, str>, Value>> {
+            self.inner.get_graph_metrics(include_optional).await
+        }
+        async fn get_nodeset_subgraph(
+            &self,
+            node_type: &str,
+            node_names: &[String],
+            op: &str,
+        ) -> GraphDBResult<(Vec<GraphNode>, Vec<EdgeData>)> {
+            self.inner
+                .get_nodeset_subgraph(node_type, node_names, op)
+                .await
+        }
+        async fn get_neighborhood(
+            &self,
+            node_ids: &[String],
+            depth: usize,
+        ) -> GraphDBResult<(Vec<GraphNode>, Vec<EdgeData>)> {
+            self.inner.get_neighborhood(node_ids, depth).await
+        }
+    }
+
+    /// A vector-db double that delegates the read path (`retrieve`, used by
+    /// `load_centroids`) to an inner [`MockVectorDB`] but makes
+    /// `upsert_raw_vectors` (used by `upsert_centroids`) error — exercising the
+    /// shape-5 centroid-upsert-failure path without a shared mock hook.
+    struct CentroidUpsertFailVector {
+        inner: MockVectorDB,
+    }
+
+    #[async_trait]
+    impl VectorDB for CentroidUpsertFailVector {
+        async fn upsert_raw_vectors(
+            &self,
+            _data_type: &str,
+            _field_name: &str,
+            _points: &[VectorPoint],
+        ) -> VectorDBResult<()> {
+            Err(VectorDBError::StorageError(
+                "centroid upsert unavailable".into(),
+            ))
+        }
+        async fn create_collection(
+            &self,
+            data_type: &str,
+            field_name: &str,
+            dimension: usize,
+        ) -> VectorDBResult<()> {
+            self.inner
+                .create_collection(data_type, field_name, dimension)
+                .await
+        }
+        async fn has_collection(&self, data_type: &str, field_name: &str) -> VectorDBResult<bool> {
+            self.inner.has_collection(data_type, field_name).await
+        }
+        async fn index_points(
+            &self,
+            data_type: &str,
+            field_name: &str,
+            points: &[VectorPoint],
+        ) -> VectorDBResult<()> {
+            self.inner.index_points(data_type, field_name, points).await
+        }
+        async fn search_similar(
+            &self,
+            data_type: &str,
+            field_name: &str,
+            query_vector: &[f32],
+            top_k: usize,
+        ) -> VectorDBResult<Vec<SearchResult>> {
+            self.inner
+                .search_similar(data_type, field_name, query_vector, top_k)
+                .await
+        }
+        async fn delete_collection(&self, data_type: &str, field_name: &str) -> VectorDBResult<()> {
+            self.inner.delete_collection(data_type, field_name).await
+        }
+        async fn retrieve(
+            &self,
+            data_type: &str,
+            field_name: &str,
+            ids: &[Uuid],
+        ) -> VectorDBResult<Vec<SearchResult>> {
+            self.inner.retrieve(data_type, field_name, ids).await
+        }
+        async fn collection_size(
+            &self,
+            data_type: &str,
+            field_name: &str,
+        ) -> VectorDBResult<usize> {
+            self.inner.collection_size(data_type, field_name).await
         }
     }
 
@@ -929,5 +1120,59 @@ mod tests {
             -1,
             "both text and name falsy -> never scored"
         );
+    }
+
+    // Test 10 — shape 5: persist failure. Learnings fetch + centroid build +
+    // node load + scoring all succeed, then the terminal set_node_truth_state
+    // write errors -> {anchors: centroids.len(), 0, signature, current_epoch}.
+    // The failure never propagates (build_truth_subspace is infallible).
+    #[tokio::test]
+    async fn persist_failure_returns_shape5() {
+        let dataset = Uuid::new_v4();
+        let k = 3;
+        let inner = MockGraphDB::new();
+        // Learnings so centroids build, plus a corpus chunk so there IS a
+        // scoreable node reaching the persist call (otherwise it short-circuits
+        // at the no-scoreable-nodes branch instead of the persist branch).
+        seed_graph(&inner, "s1", &["Lesson one", "Lesson two"], &["Corpus A"]).await;
+        let graph = PersistFailGraph { inner };
+        let vector = MockVectorDB::new();
+        let embed = MockEmbeddingEngine::deterministic(DIM);
+        let g: Arc<dyn GraphDBTrait> = Arc::new(graph);
+        let v: Arc<dyn VectorDB> = Arc::new(vector);
+        let e: Arc<dyn EmbeddingEngine> = Arc::new(embed);
+
+        let out = build_truth_subspace(dataset, &["s1".to_string()], g, v, e, k).await;
+        assert!(out.anchors > 0, "centroids were built before the persist");
+        assert_eq!(out.nodes_scored, 0, "persist failed -> nothing counted");
+        assert!(!out.signature.is_empty());
+        assert_eq!(out.truth_epoch, 1, "current_epoch after the upsert");
+    }
+
+    // Test 11 — shape 5: centroid-upsert failure. Learnings fetch + centroid
+    // build succeed and the change-detected upsert_raw_vectors errors ->
+    // {anchors: centroids.len(), 0, signature, current_epoch}. Fresh vector db
+    // (retrieve delegates -> no existing centroids), so centroids_changed is
+    // true and the epoch bumps to 1 before the failing upsert.
+    #[tokio::test]
+    async fn centroid_upsert_failure_returns_shape5() {
+        let dataset = Uuid::new_v4();
+        let k = 3;
+        let graph = MockGraphDB::new();
+        seed_graph(&graph, "s1", &["Lesson one", "Lesson two"], &[]).await;
+        let vector = CentroidUpsertFailVector {
+            inner: MockVectorDB::new(),
+        };
+        let embed = MockEmbeddingEngine::deterministic(DIM);
+        let g: Arc<dyn GraphDBTrait> = Arc::new(graph);
+        let v: Arc<dyn VectorDB> = Arc::new(vector);
+        let e: Arc<dyn EmbeddingEngine> = Arc::new(embed);
+
+        let out = build_truth_subspace(dataset, &["s1".to_string()], g, v, e, k).await;
+        // anchors == centroids.len() > 0 (built, then upsert failed).
+        assert!(out.anchors > 0, "centroids were built before the upsert");
+        assert_eq!(out.nodes_scored, 0, "upsert failed before any scoring");
+        assert!(!out.signature.is_empty());
+        assert_eq!(out.truth_epoch, 1, "current_epoch: previous(0) + 1");
     }
 }
