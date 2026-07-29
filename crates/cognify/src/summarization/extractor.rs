@@ -174,7 +174,14 @@ impl SummaryExtractor {
         // stream yields owned items. Mapping a stream over borrowed `&chunk`
         // references trips a higher-ranked-lifetime inference bug when the
         // surrounding future is boxed; owning the items avoids it.
-        let inputs: Vec<(usize, String, uuid::Uuid, Option<f64>)> = chunks
+        #[allow(clippy::type_complexity)]
+        let inputs: Vec<(
+            usize,
+            String,
+            uuid::Uuid,
+            Option<f64>,
+            Option<Vec<serde_json::Value>>,
+        )> = chunks
             .iter()
             .enumerate()
             .map(|(index, chunk)| {
@@ -183,6 +190,7 @@ impl SummaryExtractor {
                     chunk.text.clone(),
                     chunk.base.id,
                     chunk.base.importance_weight,
+                    chunk.base.belongs_to_set.clone(),
                 )
             })
             .collect();
@@ -195,21 +203,27 @@ impl SummaryExtractor {
         // of order, so each future carries its chunk index and we re-sort to
         // preserve the input order the callers expect.
         let mut indexed: Vec<(usize, TextSummary)> = stream::iter(inputs)
-            .map(|(index, text, chunk_id, importance_weight)| {
-                let llm = Arc::clone(&self.llm);
-                let summary_schema = self.summary_schema.clone();
-                let model_name = model_name.clone();
-                let prompt = custom_prompt.clone();
-                async move {
-                    let summarized =
-                        summarize_one(&llm, &summary_schema, &text, prompt.as_deref()).await?;
-                    let mut summary =
-                        TextSummary::from_summarized_content(chunk_id, summarized, model_name);
-                    // Port of summarize_text.py:81 — carry importance_weight from source chunk.
-                    summary.base.importance_weight = importance_weight;
-                    Ok::<(usize, TextSummary), CognifyError>((index, summary))
-                }
-            })
+            .map(
+                |(index, text, chunk_id, importance_weight, belongs_to_set)| {
+                    let llm = Arc::clone(&self.llm);
+                    let summary_schema = self.summary_schema.clone();
+                    let model_name = model_name.clone();
+                    let prompt = custom_prompt.clone();
+                    async move {
+                        let summarized =
+                            summarize_one(&llm, &summary_schema, &text, prompt.as_deref()).await?;
+                        let mut summary =
+                            TextSummary::from_summarized_content(chunk_id, summarized, model_name);
+                        // Port of summarize_text.py:81 — carry importance_weight from source chunk.
+                        summary.base.importance_weight = importance_weight;
+                        // Port of summarize_text.py:79 — inherit the source chunk's
+                        // belongs_to_set (NodeSet objects + dataset id) so each
+                        // TextSummary is scoped exactly like its chunk.
+                        summary.base.belongs_to_set = belongs_to_set;
+                        Ok::<(usize, TextSummary), CognifyError>((index, summary))
+                    }
+                },
+            )
             .buffer_unordered(self.max_parallel)
             .try_collect()
             .await?;
@@ -355,6 +369,69 @@ mod tests {
         assert!(
             vendored.contains("Max 200 tokens"),
             "token-limit marker missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn summarize_chunks_inherits_chunk_belongs_to_set() {
+        use cognee_llm::{GenerationResponse, LlmResult, Message};
+        use serde_json::{Value, json};
+        use uuid::Uuid;
+
+        /// Minimal mock LLM returning a fixed structured summary.
+        struct FixedLlm;
+
+        #[async_trait::async_trait]
+        impl Llm for FixedLlm {
+            async fn generate(
+                &self,
+                _messages: Vec<Message>,
+                _options: Option<GenerationOptions>,
+            ) -> LlmResult<GenerationResponse> {
+                unreachable!("summarization uses structured output, not generate")
+            }
+
+            async fn create_structured_output_with_messages_raw(
+                &self,
+                _messages: Vec<Message>,
+                _json_schema: &Value,
+                _options: Option<GenerationOptions>,
+            ) -> LlmResult<Value> {
+                Ok(json!({ "summary": "s", "description": "d" }))
+            }
+
+            fn model(&self) -> &str {
+                "mock-fixed"
+            }
+        }
+
+        let llm: Arc<dyn Llm> = Arc::new(FixedLlm);
+
+        // Source chunk scoped by a NodeSet object plus a dataset-id entry.
+        let dataset_id = Uuid::new_v4();
+        let belongs_to_set = vec![
+            json!({ "name": "my-node-set", "type": "NodeSet" }),
+            json!(dataset_id.to_string()),
+        ];
+
+        let mut chunk = DocumentChunk::new(
+            Uuid::new_v4(),
+            "chunk text".to_string(),
+            2,
+            0,
+            "paragraph_end".to_string(),
+            Uuid::new_v4(),
+        );
+        chunk.base.belongs_to_set = Some(belongs_to_set.clone());
+
+        let extractor = SummaryExtractor::new(llm);
+        let summaries = extractor.summarize_chunks(&[chunk], None).await.unwrap();
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0].base.belongs_to_set,
+            Some(belongs_to_set),
+            "TextSummary must inherit the source chunk's full belongs_to_set"
         );
     }
 
