@@ -76,3 +76,4 @@ pggraph_test!(test_get_neighborhood_multiple_seeds);
 pggraph_test!(test_get_neighborhood_empty_seeds);
 pggraph_test!(test_node_truth_state_round_trip);
 pggraph_test!(test_node_truth_state_missing_and_invalid);
+pggraph_test!(test_node_truth_state_preserves_other_properties);

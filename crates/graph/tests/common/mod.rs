@@ -632,6 +632,89 @@ pub async fn test_node_truth_state_missing_and_invalid(db: &dyn GraphDBTrait) {
     assert_eq!(bad_state.truth_epoch, -1);
 }
 
+/// `set_node_truth_state` must read-merge-write: writing `truth_alignment` /
+/// `truth_epoch` onto a node must NOT clobber the node's other, pre-existing
+/// properties. Seeds a node carrying a *custom* sibling property
+/// (`feedback_weight`) that the fixed-schema `TestNode` doesn't have, so a
+/// clobbering (delete-then-re-add-only-truth-fields) impl would be detected.
+pub async fn test_node_truth_state_preserves_other_properties(db: &dyn GraphDBTrait) {
+    db.delete_graph().await.unwrap();
+
+    // Seed via add_node_raw so we can attach an arbitrary sibling property that
+    // is not part of the truth-state payload.
+    db.add_node_raw(json!({
+        "id": "ts_pres",
+        "name": "Preserved",
+        "type": "Person",
+        "value": 77,
+        "feedback_weight": 0.42
+    }))
+    .await
+    .unwrap();
+
+    let mut updates = HashMap::new();
+    updates.insert(
+        "ts_pres".to_string(),
+        NodeTruthState {
+            truth_alignment: vec![0.7, 0.8],
+            truth_epoch: 9,
+        },
+    );
+    let set_result = db.set_node_truth_state(&updates).await.unwrap();
+    assert_eq!(set_result.get("ts_pres"), Some(&true));
+
+    // Fetch the *whole* node and assert the sibling props AND the freshly
+    // written truth-state fields all coexist.
+    let node = db
+        .get_node("ts_pres")
+        .await
+        .unwrap()
+        .expect("node should still exist");
+
+    // Pre-existing siblings survived the truth-state write.
+    assert_eq!(
+        node.get("name").unwrap().as_str().unwrap(),
+        "Preserved",
+        "name must be preserved after set_node_truth_state"
+    );
+    assert_eq!(
+        node.get("type").unwrap().as_str().unwrap(),
+        "Person",
+        "type must be preserved after set_node_truth_state"
+    );
+    assert_eq!(
+        node.get("value").unwrap().as_i64().unwrap(),
+        77,
+        "value must be preserved after set_node_truth_state"
+    );
+    assert_eq!(
+        node.get("feedback_weight").unwrap().as_f64().unwrap(),
+        0.42,
+        "custom sibling property feedback_weight must not be clobbered"
+    );
+
+    // The truth-state fields were actually written.
+    let alignment: Vec<f64> = node
+        .get("truth_alignment")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_f64().unwrap())
+        .collect();
+    assert_eq!(alignment, vec![0.7, 0.8]);
+    assert_eq!(node.get("truth_epoch").unwrap().as_i64().unwrap(), 9);
+
+    // Cross-check the canonical reader agrees.
+    let got = db
+        .get_node_truth_state(&["ts_pres".to_string()])
+        .await
+        .unwrap();
+    let state = got.get("ts_pres").expect("ts_pres present");
+    assert_eq!(state.truth_alignment, vec![0.7, 0.8]);
+    assert_eq!(state.truth_epoch, 9);
+}
+
 // -- get_neighborhood --------------------------------------------------------
 
 pub async fn test_get_neighborhood_depth1(db: &dyn GraphDBTrait) {
