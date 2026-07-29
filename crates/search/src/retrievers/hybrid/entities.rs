@@ -502,6 +502,20 @@ mod tests {
         graph.add_edge(src, tgt, rel, Some(props)).await.unwrap();
     }
 
+    /// Build a bare [`EdgeBullet`] carrying only a relationship + text, for
+    /// exercising [`is_type_edge`] in isolation.
+    fn type_edge_bullet(relationship: Option<&str>, text: &str) -> EdgeBullet {
+        EdgeBullet {
+            text: text.to_string(),
+            source: None,
+            target: None,
+            source_id: None,
+            relationship: relationship.map(str::to_string),
+            target_id: None,
+            edge_type_id: None,
+        }
+    }
+
     /// A graph double whose `get_neighborhood` always errors (fail-open test).
     struct FailingGraphDB {
         inner: MockGraphDB,
@@ -523,6 +537,123 @@ mod tests {
             _depth: usize,
         ) -> GraphDBResult<(Vec<GraphNode>, Vec<EdgeData>)> {
             Err(GraphDBError::QueryError("graph unavailable".into()))
+        }
+        async fn initialize(&self) -> GraphDBResult<()> {
+            self.inner.initialize().await
+        }
+        async fn is_empty(&self) -> GraphDBResult<bool> {
+            self.inner.is_empty().await
+        }
+        async fn query(
+            &self,
+            q: &str,
+            params: Option<HashMap<Cow<'static, str>, Value>>,
+        ) -> GraphDBResult<Vec<Vec<Value>>> {
+            self.inner.query(q, params).await
+        }
+        async fn delete_graph(&self) -> GraphDBResult<()> {
+            self.inner.delete_graph().await
+        }
+        async fn has_node(&self, id: &str) -> GraphDBResult<bool> {
+            self.inner.has_node(id).await
+        }
+        async fn add_node_raw(&self, node: Value) -> GraphDBResult<()> {
+            self.inner.add_node_raw(node).await
+        }
+        async fn add_nodes_raw(&self, nodes: Vec<Value>) -> GraphDBResult<()> {
+            self.inner.add_nodes_raw(nodes).await
+        }
+        async fn delete_node(&self, id: &str) -> GraphDBResult<()> {
+            self.inner.delete_node(id).await
+        }
+        async fn delete_nodes(&self, ids: &[String]) -> GraphDBResult<()> {
+            self.inner.delete_nodes(ids).await
+        }
+        async fn get_node(&self, id: &str) -> GraphDBResult<Option<NodeData>> {
+            self.inner.get_node(id).await
+        }
+        async fn get_nodes(&self, ids: &[String]) -> GraphDBResult<Vec<NodeData>> {
+            self.inner.get_nodes(ids).await
+        }
+        async fn has_edge(&self, s: &str, t: &str, r: &str) -> GraphDBResult<bool> {
+            self.inner.has_edge(s, t, r).await
+        }
+        async fn has_edges(&self, edges: &[EdgeData]) -> GraphDBResult<Vec<EdgeData>> {
+            self.inner.has_edges(edges).await
+        }
+        async fn add_edge(
+            &self,
+            s: &str,
+            t: &str,
+            r: &str,
+            p: Option<HashMap<Cow<'static, str>, Value>>,
+        ) -> GraphDBResult<()> {
+            self.inner.add_edge(s, t, r, p).await
+        }
+        async fn add_edges(&self, edges: &[EdgeData]) -> GraphDBResult<()> {
+            self.inner.add_edges(edges).await
+        }
+        async fn get_edges(&self, id: &str) -> GraphDBResult<Vec<EdgeData>> {
+            self.inner.get_edges(id).await
+        }
+        async fn get_neighbors(&self, id: &str) -> GraphDBResult<Vec<NodeData>> {
+            self.inner.get_neighbors(id).await
+        }
+        async fn get_connections(
+            &self,
+            id: &str,
+        ) -> GraphDBResult<Vec<(NodeData, HashMap<Cow<'static, str>, Value>, NodeData)>> {
+            self.inner.get_connections(id).await
+        }
+        async fn get_graph_data(&self) -> GraphDBResult<(Vec<GraphNode>, Vec<EdgeData>)> {
+            self.inner.get_graph_data().await
+        }
+        async fn get_graph_metrics(
+            &self,
+            include_optional: bool,
+        ) -> GraphDBResult<HashMap<Cow<'static, str>, Value>> {
+            self.inner.get_graph_metrics(include_optional).await
+        }
+        async fn get_filtered_graph_data(
+            &self,
+            filters: &HashMap<Cow<'static, str>, Vec<Value>>,
+        ) -> GraphDBResult<(Vec<GraphNode>, Vec<EdgeData>)> {
+            self.inner.get_filtered_graph_data(filters).await
+        }
+        async fn get_nodeset_subgraph(
+            &self,
+            node_type: &str,
+            node_names: &[String],
+            op: &str,
+        ) -> GraphDBResult<(Vec<GraphNode>, Vec<EdgeData>)> {
+            self.inner
+                .get_nodeset_subgraph(node_type, node_names, op)
+                .await
+        }
+    }
+
+    /// A graph double whose `get_neighborhood` panics if ever awaited — used to
+    /// prove `build_entities` never touches the graph when no hit has an id.
+    struct PanicOnNeighborhoodGraphDB {
+        inner: MockGraphDB,
+    }
+
+    impl PanicOnNeighborhoodGraphDB {
+        fn new() -> Self {
+            Self {
+                inner: MockGraphDB::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl GraphDBTrait for PanicOnNeighborhoodGraphDB {
+        async fn get_neighborhood(
+            &self,
+            _node_ids: &[String],
+            _depth: usize,
+        ) -> GraphDBResult<(Vec<GraphNode>, Vec<EdgeData>)> {
+            panic!("get_neighborhood must not be called when no entity has an id");
         }
         async fn initialize(&self) -> GraphDBResult<()> {
             self.inner.initialize().await
@@ -835,6 +966,97 @@ mod tests {
         let graph = MockGraphDB::new();
         let entities = build_entities(&graph, &[], 5, &HashMap::new()).await;
         assert!(entities.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ranked_edges_sorted_by_rank_value() {
+        // entity-1 has four edges. Two are query-ranked (tier 1) and their
+        // edge_ranks are the REVERSE of graph insertion order: "works_at" is
+        // inserted first but ranks 1, "knows" is inserted second but ranks 0.
+        // Two are unranked (tier 2). Expected bullet order:
+        //   tier 1 by rank ascending -> knows (0), works_at (1)
+        //   tier 2 in insertion order (stable sort) -> met, saw
+        // A `(1, 0)`-constant sort key would leave the tier-1 pair in insertion
+        // order [works_at, knows]; an unstable sort could swap met/saw.
+        let works_at = "Alice works at Acme";
+        let knows = "Alice knows Bob";
+        let met = "Alice met Carol";
+        let saw = "Alice saw Dave";
+
+        let graph = MockGraphDB::new();
+        add_node(&graph, "entity-1", "Alice").await;
+        add_node(&graph, "acme-id", "Acme").await;
+        add_node(&graph, "bob-id", "Bob").await;
+        add_node(&graph, "carol-id", "Carol").await;
+        add_node(&graph, "dave-id", "Dave").await;
+        add_edge(&graph, "entity-1", "acme-id", "works_at", Some(works_at)).await;
+        add_edge(&graph, "entity-1", "bob-id", "knows", Some(knows)).await;
+        add_edge(&graph, "entity-1", "carol-id", "met", Some(met)).await;
+        add_edge(&graph, "entity-1", "dave-id", "saw", Some(saw)).await;
+
+        // Rank knows(0) ahead of works_at(1) -> reverse of insertion order.
+        let edge_hits = vec![edge_hit(knows), edge_hit(works_at)];
+        let edge_ranks = edge_rank_by_id(&edge_hits);
+        let hits = vec![entity_hit(json!({"id": "entity-1", "name": "Alice"}))];
+        let entities = build_entities(&graph, &hits, 5, &edge_ranks).await;
+
+        let bullets: Vec<&str> = entities[0].edges.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(bullets, [knows, works_at, met, saw]);
+    }
+
+    #[test]
+    fn is_type_edge_detects_text_and_dash_relationship() {
+        // (a) No relationship, but the text reads " is a " once padded.
+        assert!(is_type_edge(&type_edge_bullet(None, "Alice is a person")));
+        // (b) A dash/upper "IS-A" relationship normalizes to "is a".
+        assert!(is_type_edge(&type_edge_bullet(Some("IS-A"), "")));
+        // (c) A non-type relationship whose text lacks " is a ".
+        assert!(!is_type_edge(&type_edge_bullet(
+            Some("plays"),
+            "Alice plays tennis"
+        )));
+        // (d) "is about" must NOT match " is a " (trailing-space guard).
+        assert!(!is_type_edge(&type_edge_bullet(
+            None,
+            "this is about a thing"
+        )));
+    }
+
+    #[tokio::test]
+    async fn neighbor_to_neighbor_edge_is_dropped() {
+        // entity-1 is the only seed. One edge connects two neighbors (n-a -> n-b)
+        // and never touches the seed; only the seed's own edge (entity-1 -> n-a)
+        // may surface as a bullet.
+        let graph = MockGraphDB::new();
+        add_node(&graph, "entity-1", "Entity1").await;
+        add_node(&graph, "n-a", "NA").await;
+        add_node(&graph, "n-b", "NB").await;
+        add_edge(&graph, "n-a", "n-b", "REL", None).await;
+        add_edge(&graph, "entity-1", "n-a", "REL2", None).await;
+        let hits = vec![entity_hit(json!({"id": "entity-1", "name": "Entity1"}))];
+        let entities = build_entities(&graph, &hits, 5, &HashMap::new()).await;
+
+        assert_eq!(entities[0].edges.len(), 1);
+        let bullet = &entities[0].edges[0];
+        assert_eq!(bullet.text, "Entity1 -- REL2 -- NA");
+        assert_eq!(bullet.target_id.as_deref(), Some("n-a"));
+        // The n-a -> n-b edge must not have leaked into the seed's bullets.
+        assert!(entities[0].edges.iter().all(|e| {
+            e.source_id.as_deref() != Some("n-b") && e.target_id.as_deref() != Some("n-b")
+        }));
+    }
+
+    #[tokio::test]
+    async fn build_entities_skips_neighborhood_when_no_ids() {
+        // The only hit has no id (payload lacks "id", SearchItem.id is None), so
+        // result_id is None and entity.id is empty. build_entities must return the
+        // bare entity WITHOUT ever awaiting get_neighborhood (which panics here).
+        let graph = PanicOnNeighborhoodGraphDB::new();
+        let hits = vec![entity_hit(json!({"name": "X"}))];
+        let entities = build_entities(&graph, &hits, 5, &HashMap::new()).await;
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].name, "X");
+        assert!(entities[0].edges.is_empty());
     }
 
     #[test]
