@@ -236,14 +236,15 @@ pub async fn build_truth_subspace(
         }
         // `_node_index_text`: DocumentChunk `text`, falling back to `name`
         // (`build.py:42-47,237`) — distinct from the learning-statement fetch,
-        // which reads only `text`.
-        let text = node_data
-            .get("text")
-            .or_else(|| node_data.get("name"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
+        // which reads only `text`. Python uses `text or name or ""`, so the
+        // fallback fires on ANY falsy `text` (missing, null, OR empty string),
+        // not just an absent key.
+        let text = node_field_str(&node_data, "text");
+        let text = if text.is_empty() {
+            node_field_str(&node_data, "name")
+        } else {
+            text
+        };
         if node_id.is_empty() || text.is_empty() {
             continue;
         }
@@ -341,6 +342,21 @@ pub async fn build_truth_subspace(
         signature,
         truth_epoch: current_epoch,
     }
+}
+
+/// Trimmed string value of a node field, with Python truthiness semantics.
+///
+/// Returns `""` when the key is missing, JSON `null`, or a non-string value;
+/// a present string is trimmed. This lets the caller reproduce Python's
+/// `node_data.get("text") or node_data.get("name") or ""` (`build.py:46`),
+/// where the `name` fallback fires on ANY falsy `text`, not just an absent key.
+fn node_field_str(node_data: &cognee_graph::NodeData, key: &str) -> String {
+    node_data
+        .get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
 /// Read accepted lesson statements from the `session_learnings` node set.
@@ -833,5 +849,85 @@ mod tests {
 
         let out = build_truth_subspace(dataset, &["s1".to_string()], g, v, e, 3).await;
         assert!(!out.signature.is_empty());
+    }
+
+    // Test 9 — node-scoring text/name truthiness fallback (`build.py:46`).
+    // A DocumentChunk whose `text` is empty-string or null but whose `name` is
+    // non-empty is scored via `name`; a chunk whose text AND name are both
+    // falsy is skipped. Mirrors Python's `text or name or ""`.
+    #[tokio::test]
+    async fn falsy_text_falls_back_to_name_for_scoring() {
+        let dataset = Uuid::new_v4();
+        let k = 3;
+        let graph = MockGraphDB::new();
+        // One real lesson so learnings/centroids build.
+        seed_graph(&graph, "s1", &["A lesson"], &[]).await;
+
+        // Corpus chunk with empty-string text but a real name -> scored via name.
+        graph
+            .add_node_raw(json!({
+                "id": "empty-text-named",
+                "type": DOCUMENT_CHUNK_TYPE,
+                "text": "",
+                "name": "Named via name field",
+            }))
+            .await
+            .unwrap();
+        // Corpus chunk with null text but a real name -> scored via name.
+        graph
+            .add_node_raw(json!({
+                "id": "null-text-named",
+                "type": DOCUMENT_CHUNK_TYPE,
+                "text": Value::Null,
+                "name": "Also named",
+            }))
+            .await
+            .unwrap();
+        // Corpus chunk with BOTH text and name empty -> skipped.
+        graph
+            .add_node_raw(json!({
+                "id": "both-empty",
+                "type": DOCUMENT_CHUNK_TYPE,
+                "text": "",
+                "name": "",
+            }))
+            .await
+            .unwrap();
+
+        let vector = MockVectorDB::new();
+        let embed = MockEmbeddingEngine::deterministic(DIM);
+        let graph_arc: Arc<dyn GraphDBTrait> = Arc::new(graph.clone());
+        let v: Arc<dyn VectorDB> = Arc::new(vector);
+        let e: Arc<dyn EmbeddingEngine> = Arc::new(embed);
+
+        let out = build_truth_subspace(dataset, &["s1".to_string()], graph_arc, v, e, k).await;
+        // 1 lesson + 2 name-fallback chunks scored; the both-empty chunk skipped.
+        assert_eq!(out.nodes_scored, 3);
+
+        // The name-fallback chunks got the current epoch persisted; the
+        // both-empty chunk was never scored (no truth_epoch field -> sentinel -1).
+        let scored = graph
+            .get_node_truth_state(&[
+                "empty-text-named".to_string(),
+                "null-text-named".to_string(),
+                "both-empty".to_string(),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(
+            scored.get("empty-text-named").unwrap().truth_epoch,
+            1,
+            "empty text -> scored via name"
+        );
+        assert_eq!(
+            scored.get("null-text-named").unwrap().truth_epoch,
+            1,
+            "null text -> scored via name"
+        );
+        assert_eq!(
+            scored.get("both-empty").unwrap().truth_epoch,
+            -1,
+            "both text and name falsy -> never scored"
+        );
     }
 }
