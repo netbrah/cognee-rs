@@ -428,3 +428,96 @@ async fn hybrid_orchestrator_completion_populates_used_graph_element_ids() {
         ids.edge_ids
     );
 }
+
+// ---------------------------------------------------------------------------
+// Test 3: deterministic force-materialize branch (no LLM creds needed)
+// ---------------------------------------------------------------------------
+
+/// Same session/used_graph_element_ids contract as test 2, but exercised through
+/// the `use_combined_context = false` **force-materialize** branch
+/// (`search_orchestrator.rs:562-570`): on the default completion path
+/// `include_context` is false, so the orchestrator must re-fetch the hybrid
+/// context solely to snapshot its graph node ids into the persisted QA entry.
+/// Driven by the deterministic `StubLlm`, so — unlike test 2 — it always runs
+/// (no `OPENAI_URL`/`OPENAI_TOKEN` gate) and still fails if the P1-10 wiring
+/// regresses.
+#[tokio::test]
+async fn hybrid_session_completion_persists_used_graph_element_ids_mock() {
+    let llm: Arc<dyn Llm> = Arc::new(StubLlm);
+
+    let (vector_db, graph_db, chunk_id, alice_id) = seed_dbs().await;
+    let retriever = build_hybrid_retriever(vector_db, graph_db, Arc::clone(&llm));
+
+    let mut registry = SearchTypeRegistry::new();
+    registry.register(Arc::new(retriever));
+
+    // Filesystem-backed session store so we can read the persisted QA entry
+    // (and its used_graph_element_ids) back after the search completes.
+    let temp_dir = TempDir::new().expect("TempDir::new should succeed");
+    let store: Arc<FsSessionStore> = Arc::new(FsSessionStore::new(temp_dir.path()));
+    let session_manager = Arc::new(SessionManager::new(
+        Arc::clone(&store) as Arc<dyn SessionStore>
+    ));
+
+    let orchestrator = SearchOrchestrator::new(registry)
+        .with_session_manager(session_manager)
+        .with_llm(Arc::clone(&llm));
+
+    let session_id = "hybrid-force-materialize-session";
+    // use_combined_context = false so `include_context` is false and the
+    // orchestrator hits the force-materialize branch rather than fetching the
+    // context up front.
+    let mut request = completion_request("Where does Alice work?", session_id);
+    request.use_combined_context = Some(false);
+
+    let response = orchestrator
+        .search(&request)
+        .await
+        .expect("orchestrator.search should succeed with the StubLlm and seeded mocks");
+
+    // The StubLlm always answers "stub answer" — deterministic, non-empty.
+    match &response.result {
+        SearchOutput::Text(answer) => {
+            assert_eq!(answer, "stub answer", "expected the StubLlm's fixed answer");
+        }
+        other => panic!("expected text completion output, got {other:?}"),
+    }
+
+    // The persisted QA entry must carry a populated used_graph_element_ids
+    // snapshot derived from the force-materialized hybrid context items.
+    let entries = store
+        .get_latest_qa_entries(session_id, None, 10)
+        .await
+        .expect("reading session QA entries should succeed");
+    let entry = entries
+        .first()
+        .expect("a QA entry should have been persisted for the session");
+    let ids = entry
+        .used_graph_element_ids
+        .as_ref()
+        .expect("used_graph_element_ids should be populated on the force-materialize branch");
+
+    // Chunk and entity ids from the seeded graph should be present.
+    assert!(
+        ids.node_ids.contains(&chunk_id.to_string()),
+        "node_ids should include the seeded chunk id; got {:?}",
+        ids.node_ids
+    );
+    assert!(
+        ids.node_ids.contains(&alice_id.to_string()),
+        "node_ids should include the seeded entity id; got {:?}",
+        ids.node_ids
+    );
+    // Entity edge endpoint should be captured too.
+    assert!(
+        ids.node_ids.contains(&"acme-id".to_string()),
+        "node_ids should include the entity edge endpoint; got {:?}",
+        ids.node_ids
+    );
+    // Hybrid path never emits edge_ids.
+    assert!(
+        ids.edge_ids.is_empty(),
+        "hybrid path must not populate edge_ids; got {:?}",
+        ids.edge_ids
+    );
+}
