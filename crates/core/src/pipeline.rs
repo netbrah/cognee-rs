@@ -1392,6 +1392,22 @@ fn dispatch_batch<'a>(
             // Acquired once per batch call — a batch is one external request.
             if let Some(rl) = next_info.rate_limiter.as_ref().or(env.rate_limiter) {
                 rl.acquire().await;
+
+                // The wait above is unbounded — a 1/s limiter parks here for
+                // roughly a second — so a cancellation arriving during it would
+                // otherwise still let this batch fire. Re-check before calling.
+                //
+                // Deliberately *not* racing `acquire()` against
+                // `cancellation.cancelled()`: `RateLimiter` is a public trait,
+                // and dropping a third-party `acquire()` future mid-poll would
+                // require a cancel-safety guarantee the trait does not state.
+                // (The built-in limiters are cancel-safe — they await a tokio
+                // `Semaphore` — but external impls need not be.) Letting the
+                // acquisition finish costs a cancelled run at most one limiter
+                // slot and never invokes the task.
+                if env.ctx.cancellation.is_cancelled() {
+                    return Err(ExecutionError::Cancelled);
+                }
             }
 
             // Progress: hand the batch task *its own* subtoken rather than the
@@ -1514,11 +1530,28 @@ async fn process_stream(
     let mut outputs = Vec::new();
     let mut batch: Vec<Box<dyn Value>> = Vec::with_capacity(batch_size);
 
-    while let Some(mut item) = stream.next().await {
-        // Stop pulling from the producer once cancelled — see `process_iter`.
-        if env.ctx.cancellation.is_cancelled() {
-            return Err(ExecutionError::Cancelled);
-        }
+    loop {
+        // Race the producer against cancellation rather than checking after
+        // each item: a slow or stalled stream would otherwise keep a cancelled
+        // run alive indefinitely, parked on `next()`. `biased` makes
+        // cancellation win deterministically when both are ready, and
+        // `StreamExt::next` is cancel-safe, so dropping it mid-poll loses
+        // nothing. (`process_iter` cannot do this — a synchronous iterator
+        // offers nothing to await, so it checks per item instead.)
+        //
+        // `cancel_requested`, *not* `cancelled`: the latter also resolves when
+        // the `CancellationHandle` is dropped, and every caller drops it
+        // (`let (_handle, ctx) = ..`), so that arm would win immediately and
+        // abort every streaming pipeline.
+        let next = tokio::select! {
+            biased;
+            () = env.ctx.cancellation.cancel_requested() => {
+                return Err(ExecutionError::Cancelled);
+            }
+            next = stream.next() => next,
+        };
+        let Some(mut item) = next else { break };
+
         // Drop sentinel: discard this item before stamping or accumulating.
         if crate::sentinels::is_dropped(item.as_ref()) {
             continue;
@@ -3653,6 +3686,130 @@ mod tests {
             calls.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "the batch task must not be invoked again after cancellation"
+        );
+    }
+
+    /// A limiter that parks until released, so a test can cancel *during*
+    /// acquisition — the window a pre-acquire-only check leaves open.
+    struct BlockingLimiter {
+        release: Arc<tokio::sync::Notify>,
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl crate::rate_limiter::RateLimiter for BlockingLimiter {
+        async fn acquire(&self) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_rate_limiter_wait_stops_the_batch() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_in_task = Arc::clone(&calls);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let entered = Arc::new(tokio::sync::Notify::new());
+
+        let limiter: Arc<dyn crate::rate_limiter::RateLimiter> = Arc::new(BlockingLimiter {
+            release: Arc::clone(&release),
+            entered: Arc::clone(&entered),
+        });
+
+        let collect = Task::sync_batch(
+            move |items: &[Box<dyn Value>],
+                  _ctx: Arc<TaskContext>|
+                  -> Result<Arc<dyn Value>, TaskError> {
+                calls_in_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Arc::new(items.len() as i32) as Arc<dyn Value>)
+            },
+        );
+
+        let pipeline = Pipeline::new("cancel-in-acquire")
+            .with_name("cancel-in-acquire")
+            .with_task(TaskInfo::new(fan_out_task(2)))
+            .with_task(
+                TaskInfo::new(collect)
+                    .with_batch_size(2)
+                    .with_rate_limiter(limiter),
+            );
+
+        let (handle, ctx) = cancellable_ctx("cancel-in-acquire").await;
+        let input: Arc<dyn Value> = Arc::new(0_i32);
+
+        // Cancel only once the limiter has parked, so the pre-acquire check has
+        // already passed and only a post-acquire check can catch it.
+        let canceller = tokio::spawn({
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            async move {
+                entered.notified().await;
+                handle.cancel();
+                release.notify_one();
+            }
+        });
+
+        let result = execute(&pipeline, vec![input], ctx, &NoopWatcher).await;
+        canceller.await.unwrap();
+
+        assert!(
+            matches!(result, Err(ExecutionError::Cancelled)),
+            "cancellation arriving while the rate limiter was parked must stop \
+             the batch — got {:?}",
+            result.map(|o| o.len())
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the batch task must not run when cancelled during acquisition"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_a_stalled_stream() {
+        // A stream that yields one item then never yields again. Without racing
+        // cancellation against `next()`, a cancelled run parks here forever.
+        let producer = Task::async_stream_typed(|_: &i32, _ctx| {
+            let s =
+                futures::stream::once(async { Box::new(1_i32) }).chain(futures::stream::pending());
+            Ok(s)
+        });
+
+        let collect = Task::sync_batch(
+            |items: &[Box<dyn Value>],
+             _ctx: Arc<TaskContext>|
+             -> Result<Arc<dyn Value>, TaskError> {
+                Ok(Arc::new(items.len() as i32) as Arc<dyn Value>)
+            },
+        );
+
+        // batch_size 2 with only one item ever produced: the loop is parked on
+        // `next()` when cancellation arrives, having dispatched nothing.
+        let pipeline = Pipeline::new("stalled-stream")
+            .with_name("stalled-stream")
+            .with_task(TaskInfo::new(producer))
+            .with_task(TaskInfo::new(collect).with_batch_size(2));
+
+        let (handle, ctx) = cancellable_ctx("stalled-stream").await;
+        let input: Arc<dyn Value> = Arc::new(0_i32);
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            handle.cancel();
+        });
+
+        // The timeout is the assertion: before the fix this never returns.
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            execute(&pipeline, vec![input], ctx, &NoopWatcher),
+        )
+        .await
+        .expect("a cancelled run must not hang on a stalled stream");
+
+        assert!(
+            matches!(result, Err(ExecutionError::Cancelled)),
+            "expected Cancelled, got {:?}",
+            result.map(|o| o.len())
         );
     }
 
