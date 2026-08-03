@@ -2032,9 +2032,10 @@ mod tests {
             let x = *x;
             Ok((0..3).map(move |i| Box::new(x + i)))
         });
-        // Raw `sync_batch` rather than `sync_batch_typed`: the typed variant's
-        // `borrow_item` helper mis-downcasts real batch items (pre-existing,
-        // unrelated to this test).
+        // Raw `sync_batch` rather than `sync_batch_typed`: this test only needs
+        // the item count and the context, so there is nothing to downcast and
+        // nothing to gain from the typed variant. (The typed batch constructors
+        // are exercised in `task.rs`.)
         let collect = Task::sync_batch(
             move |items: &[Box<dyn Value>],
                   ctx: Arc<TaskContext>|
@@ -2078,9 +2079,10 @@ mod tests {
             Ok(Box::pin(stream) as ValueStream)
         });
 
-        // Raw `sync_batch` rather than `sync_batch_typed`: the typed variant's
-        // `borrow_item` helper mis-downcasts real batch items (pre-existing,
-        // unrelated to this test).
+        // Raw `sync_batch` rather than `sync_batch_typed`: this test only needs
+        // the item count and the context, so there is nothing to downcast and
+        // nothing to gain from the typed variant. (The typed batch constructors
+        // are exercised in `task.rs`.)
         let seen_batch_c = Arc::clone(&seen_batch);
         let collect = Task::sync_batch(
             move |items: &[Box<dyn Value>],
