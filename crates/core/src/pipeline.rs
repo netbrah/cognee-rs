@@ -1108,6 +1108,12 @@ struct ProvenanceInputs<'a> {
     user_label: Option<String>,
     input_node_set: Option<String>,
     input_content_hash: Option<String>,
+    /// 1-based position of the *emitting* task in the pipeline, written to
+    /// `DataPoint.topological_rank`. Python derives this from a deduplicated
+    /// task sequence (`run_tasks_base.py:181-190`); Rust pipelines are static
+    /// linear arrays, so `first_index + 1` is already the deduplicated
+    /// 1-based position and no `task_sequence` equivalent is needed.
+    task_rank: i32,
 }
 
 impl<'a> ProvenanceInputs<'a> {
@@ -1118,6 +1124,7 @@ impl<'a> ProvenanceInputs<'a> {
             user_label: self.user_label.as_deref(),
             node_set: self.input_node_set.as_deref(),
             content_hash: self.input_content_hash.as_deref(),
+            task_rank: Some(self.task_rank),
         }
     }
 }
@@ -1252,6 +1259,12 @@ fn execute_from<'a>(
             user_label: user_label_owned,
             input_node_set: crate::provenance::extract_node_set_from_value(input.as_ref()),
             input_content_hash: crate::provenance::extract_content_hash_from_value(input.as_ref()),
+            // `first_index` is the 0-based static position of *this* task, so
+            // `+ 1` is the 1-based rank Python stamps. Note that
+            // `prov_inputs` is later handed to `process_iter` /
+            // `process_stream` alongside `first_index + 1` — that argument is
+            // the *next* task's index and must not be reused for the rank.
+            task_rank: (first_index + 1) as i32,
         };
 
         // Keep a handle to the original input only for enrichment tasks, so a

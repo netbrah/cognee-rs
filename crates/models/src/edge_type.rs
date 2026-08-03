@@ -109,7 +109,9 @@ impl EdgeType {
                 updated_at: now,
                 ontology_valid: false,
                 version: 1,
-                topological_rank: None,
+                // `0` is Python's "unset" sentinel — see
+                // `DataPoint::default_topological_rank`.
+                topological_rank: Some(0),
                 metadata,
                 data_type: "EdgeType".to_string(),
                 belongs_to_set: dataset_id.map(|ds_id| vec![serde_json::json!(ds_id.to_string())]),

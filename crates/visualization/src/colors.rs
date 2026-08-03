@@ -1,9 +1,11 @@
 //! Color mapping logic for the visualization.
 //!
-//! Mirrors the two Python functions from
-//! `cognee/modules/visualization/cognee_network_visualization.py`:
-//!   * the static `color_map` dict (lines 27–47)
-//!   * `_generate_provenance_colors()` (lines 11–19)
+//! Mirrors the color tables and helpers from
+//! `cognee/modules/visualization/preprocessor.py`:
+//!   * `_TYPE_COLOR_MAP` (lines 102–119), `_ONTOLOGY_VALID_COLOR` /
+//!     `_UNKNOWN_TYPE_COLOR` (lines 125–126)
+//!   * `_MEMORY_NODESET_COLORS` (lines 134–138)
+//!   * `generate_provenance_colors()` (lines 170–182)
 //!
 //! Provenance color values are generated via the golden-angle HSL hue rotation
 //! used by Python. We port Python's `colorsys.hls_to_rgb` exactly so the
@@ -11,32 +13,76 @@
 
 use std::collections::BTreeMap;
 
+use serde_json::Value;
+
+/// Fill used for ontology-grounded nodes (Python `_ONTOLOGY_VALID_COLOR`,
+/// `preprocessor.py:125`).
+///
+/// Deliberately *not* the old `#D8D8D8` gray, which was indistinguishable from
+/// [`UNKNOWN_TYPE_COLOR`] — ontology matches visually disappeared into untyped
+/// nodes (see the Python comment at `preprocessor.py:122-124`).
+pub(crate) const ONTOLOGY_VALID_COLOR: &str = "#FF5CA8";
+
+/// Fallback fill for nodes whose `type` is present but not in the type map
+/// (Python `_UNKNOWN_TYPE_COLOR`, `preprocessor.py:126`).
+pub(crate) const UNKNOWN_TYPE_COLOR: &str = "#DBD8D8";
+
+/// Fill used when the `type` key is entirely absent, i.e. Python's
+/// `node_info.get("type", "default")` hitting the literal `"default"` entry of
+/// `_TYPE_COLOR_MAP` (`preprocessor.py:118`).
+pub(crate) const DEFAULT_TYPE_COLOR: &str = "#7c3aed";
+
+/// Stable colors for the node sets produced by the self-improvement bridge,
+/// pinned so they stay recognizable across graphs instead of following the
+/// deterministic hue rotation. Port of Python `_MEMORY_NODESET_COLORS`
+/// (`preprocessor.py:134-138`).
+pub(crate) const MEMORY_NODESET_COLORS: [(&str, &str); 3] = [
+    ("session_learnings", "#FFC53D"),        // distilled lessons (gold)
+    ("user_sessions_from_cache", "#00C2AA"), // persisted session Q&A (teal)
+    ("agent_trace_feedbacks", "#FF7A59"),    // persisted agent trace feedback (coral)
+];
+
 /// Look up the static node-type → color mapping.
 ///
-/// If `ontology_valid` is true, the "ontology" override color is used,
-/// regardless of node type.  Unknown types fall back to `#DBD8D8`; the
-/// literal `"default"` type maps to `#7c3aed`. Kept byte-for-byte in sync with
-/// Python's `_TYPE_COLOR_MAP` in
-/// `cognee/modules/visualization/preprocessor.py`.
-pub(crate) fn type_color(node_type: Option<&str>, ontology_valid: bool) -> &'static str {
+/// Port of `preprocessor.py:1242-1246`:
+/// `_TYPE_COLOR_MAP.get(node_info.get("type", "default"), _UNKNOWN_TYPE_COLOR)`
+/// with the `ontology_valid is True` override applied afterwards.
+///
+/// The `node_type` argument is the raw `type` property *as JSON*, so the three
+/// cases Python distinguishes are preserved exactly:
+///   * `None` — the key is absent → the `"default"` entry ([`DEFAULT_TYPE_COLOR`]);
+///   * a string in the table → its pinned color;
+///   * anything else (`null`, a number, an unrecognised string) →
+///     [`UNKNOWN_TYPE_COLOR`], because those values are simply missing keys in
+///     Python's dict lookup.
+pub(crate) fn type_color(node_type: Option<&Value>, ontology_valid: bool) -> &'static str {
     if ontology_valid {
-        return "#D8D8D8";
+        return ONTOLOGY_VALID_COLOR;
     }
-    match node_type.unwrap_or("default") {
-        "TextDocument" => "#A550FF",
-        "DocumentChunk" => "#0DFF00",
-        "Entity" => "#6510F4",
-        "EntityType" => "#D5C2FF",
-        "TextSummary" => "#FFB454",
-        "GlobalContextSummary" => "#00C2FF",
-        "TableRow" => "#A550FF",
-        "TableType" => "#6510F4",
-        "ColumnValue" => "#747470",
-        "SchemaTable" => "#A550FF",
-        "DatabaseSchema" => "#6510F4",
-        "SchemaRelationship" => "#323332",
-        "default" => "#7c3aed",
-        _ => "#DBD8D8",
+    match node_type {
+        // Key absent → Python's `.get("type", "default")` default sentinel.
+        None => DEFAULT_TYPE_COLOR,
+        Some(Value::String(name)) => match name.as_str() {
+            "TextDocument" => "#A550FF",
+            "DocumentChunk" => "#0DFF00",
+            "Entity" => "#6510F4",
+            "EntityType" => "#D5C2FF",
+            "TextSummary" => "#FFB454",
+            "GlobalContextSummary" => "#00C2FF",
+            // NodeSet container nodes (e.g. the "session_learnings" grouping)
+            // used to fall through to the gray unknown-type fallback.
+            "NodeSet" => "#94A3B8",
+            "TableRow" => "#A550FF",
+            "TableType" => "#6510F4",
+            "ColumnValue" => "#747470",
+            "SchemaTable" => "#A550FF",
+            "DatabaseSchema" => "#6510F4",
+            "SchemaRelationship" => "#323332",
+            "default" => DEFAULT_TYPE_COLOR,
+            _ => UNKNOWN_TYPE_COLOR,
+        },
+        // `null`, numbers, arrays, … are not keys of the Python dict either.
+        Some(_) => UNKNOWN_TYPE_COLOR,
     }
 }
 
@@ -128,35 +174,66 @@ where
 mod tests {
     use super::*;
 
+    /// Shorthand for the common `type_color(Some(&json!("Entity")), …)` call.
+    fn color_of(node_type: &str, ontology_valid: bool) -> &'static str {
+        type_color(Some(&Value::String(node_type.to_string())), ontology_valid)
+    }
+
     #[test]
     fn type_color_known_types() {
-        // Values mirror Python's `_TYPE_COLOR_MAP` (preprocessor.py).
-        assert_eq!(type_color(Some("TextDocument"), false), "#A550FF");
-        assert_eq!(type_color(Some("DocumentChunk"), false), "#0DFF00");
-        assert_eq!(type_color(Some("Entity"), false), "#6510F4");
-        assert_eq!(type_color(Some("EntityType"), false), "#D5C2FF");
-        assert_eq!(type_color(Some("TextSummary"), false), "#FFB454");
-        assert_eq!(type_color(Some("GlobalContextSummary"), false), "#00C2FF");
-        assert_eq!(type_color(Some("TableRow"), false), "#A550FF");
-        assert_eq!(type_color(Some("TableType"), false), "#6510F4");
-        assert_eq!(type_color(Some("ColumnValue"), false), "#747470");
-        assert_eq!(type_color(Some("SchemaTable"), false), "#A550FF");
-        assert_eq!(type_color(Some("DatabaseSchema"), false), "#6510F4");
-        assert_eq!(type_color(Some("SchemaRelationship"), false), "#323332");
+        // Values mirror Python's `_TYPE_COLOR_MAP` (preprocessor.py:102-119).
+        assert_eq!(color_of("TextDocument", false), "#A550FF");
+        assert_eq!(color_of("DocumentChunk", false), "#0DFF00");
+        assert_eq!(color_of("Entity", false), "#6510F4");
+        assert_eq!(color_of("EntityType", false), "#D5C2FF");
+        assert_eq!(color_of("TextSummary", false), "#FFB454");
+        assert_eq!(color_of("GlobalContextSummary", false), "#00C2FF");
+        assert_eq!(color_of("NodeSet", false), "#94A3B8");
+        assert_eq!(color_of("TableRow", false), "#A550FF");
+        assert_eq!(color_of("TableType", false), "#6510F4");
+        assert_eq!(color_of("ColumnValue", false), "#747470");
+        assert_eq!(color_of("SchemaTable", false), "#A550FF");
+        assert_eq!(color_of("DatabaseSchema", false), "#6510F4");
+        assert_eq!(color_of("SchemaRelationship", false), "#323332");
     }
 
     #[test]
     fn type_color_fallbacks() {
-        assert_eq!(type_color(Some("Unknown"), false), "#DBD8D8");
-        assert_eq!(type_color(Some("default"), false), "#7c3aed");
+        assert_eq!(color_of("Unknown", false), "#DBD8D8");
+        assert_eq!(color_of("default", false), "#7c3aed");
+        // Key absent → Python's `.get("type", "default")` sentinel.
         assert_eq!(type_color(None, false), "#7c3aed");
     }
 
     #[test]
+    fn type_color_null_and_non_string_types_are_unknown_not_default() {
+        // Python looks up `node_info.get("type", "default")`: the "default"
+        // entry is only reachable when the key is missing entirely, so a
+        // present-but-null / numeric type is an unknown key.
+        assert_eq!(type_color(Some(&Value::Null), false), "#DBD8D8");
+        assert_eq!(type_color(Some(&Value::from(7)), false), "#DBD8D8");
+    }
+
+    #[test]
     fn type_color_ontology_valid_override() {
-        assert_eq!(type_color(Some("Entity"), true), "#D8D8D8");
-        assert_eq!(type_color(Some("Unknown"), true), "#D8D8D8");
-        assert_eq!(type_color(None, true), "#D8D8D8");
+        // `_ONTOLOGY_VALID_COLOR` is #FF5CA8 — the old #D8D8D8 gray was
+        // indistinguishable from the #DBD8D8 unknown-type fallback.
+        assert_eq!(color_of("Entity", true), "#FF5CA8");
+        assert_eq!(color_of("Unknown", true), "#FF5CA8");
+        assert_eq!(type_color(None, true), "#FF5CA8");
+        assert_ne!(ONTOLOGY_VALID_COLOR, UNKNOWN_TYPE_COLOR);
+    }
+
+    #[test]
+    fn memory_nodeset_colors_match_python() {
+        assert_eq!(
+            MEMORY_NODESET_COLORS,
+            [
+                ("session_learnings", "#FFC53D"),
+                ("user_sessions_from_cache", "#00C2AA"),
+                ("agent_trace_feedbacks", "#FF7A59"),
+            ]
+        );
     }
 
     #[test]

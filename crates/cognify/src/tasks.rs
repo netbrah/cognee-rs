@@ -2088,7 +2088,13 @@ struct DltTableMeta {
 /// Only sets each field if it is currently `None`, so earlier (more specific)
 /// stamps are never overwritten.  Mirrors the Python
 /// `run_tasks_base.py` post-task provenance stamping.
-fn stamp_provenance(dp: &mut DataPoint, pipeline: &str, task: &str, user: Option<&str>) {
+///
+/// `rank` is the 1-based position of the emitting task in
+/// [`build_cognify_pipeline`] (one of the `*_TASK_RANK` constants below).
+/// It is written to `DataPoint.topological_rank` only while that field is
+/// still unset — `None` or the `Some(0)` Python sentinel — matching
+/// `run_tasks_base.py:69-75`. Pass `0` to skip the rank write entirely.
+fn stamp_provenance(dp: &mut DataPoint, pipeline: &str, task: &str, user: Option<&str>, rank: i32) {
     if dp.source_pipeline.is_none() {
         dp.source_pipeline = Some(pipeline.to_string());
     }
@@ -2097,6 +2103,9 @@ fn stamp_provenance(dp: &mut DataPoint, pipeline: &str, task: &str, user: Option
     }
     if dp.source_user.is_none() {
         dp.source_user = user.map(String::from);
+    }
+    if rank > 0 && matches!(dp.topological_rank, None | Some(0)) {
+        dp.topological_rank = Some(rank);
     }
 }
 
@@ -3283,6 +3292,33 @@ pub const EXTRACT_GRAPH_TASK_NAME: &str = "extract_graph_from_data";
 pub const SUMMARIZE_TEXT_TASK_NAME: &str = "summarize_text";
 pub const ADD_DATA_POINTS_TASK_NAME: &str = "add_data_points";
 
+/// 1-based position of `classify_documents` in [`build_cognify_pipeline`].
+///
+/// These `*_TASK_RANK` constants are written to
+/// `DataPoint.topological_rank` by the in-body [`stamp_provenance`] calls
+/// and **must stay in lockstep with the task order in
+/// [`build_cognify_pipeline`]** (classify → chunks → graph → summarize →
+/// add_data_points). The convenience [`cognify`] function bypasses
+/// `cognee_core::execute()` entirely, so for that path these constants are
+/// the *only* source of the rank — reordering the builder without updating
+/// them silently corrupts the ranks. Pipeline-driven runs additionally get
+/// `first_index + 1` from the executor, which agrees with these values.
+///
+/// Python parity: `run_tasks_base.py:69-75` / `:181-190`.
+pub const CLASSIFY_DOCUMENTS_TASK_RANK: i32 = 1;
+/// 1-based position of `extract_chunks_from_documents`; see
+/// [`CLASSIFY_DOCUMENTS_TASK_RANK`] for the lockstep requirement.
+pub const EXTRACT_CHUNKS_TASK_RANK: i32 = 2;
+/// 1-based position of `extract_graph_from_data`; see
+/// [`CLASSIFY_DOCUMENTS_TASK_RANK`] for the lockstep requirement.
+pub const EXTRACT_GRAPH_TASK_RANK: i32 = 3;
+/// 1-based position of `summarize_text`; see
+/// [`CLASSIFY_DOCUMENTS_TASK_RANK`] for the lockstep requirement.
+pub const SUMMARIZE_TEXT_TASK_RANK: i32 = 4;
+/// 1-based position of `add_data_points`; see
+/// [`CLASSIFY_DOCUMENTS_TASK_RANK`] for the lockstep requirement.
+pub const ADD_DATA_POINTS_TASK_RANK: i32 = 5;
+
 /// Pipeline name carried by cognify task stamps (locked Decision 14 of
 /// LIB-06). Used by the per-task in-body stamping below so the test in
 /// `crates/cognify/tests/provenance_e2e.rs` sees `source_pipeline =
@@ -3316,6 +3352,7 @@ pub fn make_classify_documents_task() -> TypedTask<CognifyInput, ClassifiedDocum
                 COGNIFY_PIPELINE_STAMP_NAME,
                 CLASSIFY_DOCUMENTS_TASK_NAME,
                 user_label.as_deref(),
+                CLASSIFY_DOCUMENTS_TASK_RANK,
             );
         }
         Ok(Box::new(classified))
@@ -3359,6 +3396,7 @@ pub fn make_extract_chunks_task(
                     COGNIFY_PIPELINE_STAMP_NAME,
                     EXTRACT_CHUNKS_TASK_NAME,
                     user_label.as_deref(),
+                    EXTRACT_CHUNKS_TASK_RANK,
                 );
             }
             // Documents carried forward keep their earlier stamp from
@@ -3370,6 +3408,7 @@ pub fn make_extract_chunks_task(
                     COGNIFY_PIPELINE_STAMP_NAME,
                     EXTRACT_CHUNKS_TASK_NAME,
                     user_label.as_deref(),
+                    EXTRACT_CHUNKS_TASK_RANK,
                 );
             }
             Ok(Box::new(extracted))
@@ -3418,12 +3457,14 @@ pub fn make_extract_graph_task(
                     COGNIFY_PIPELINE_STAMP_NAME,
                     EXTRACT_GRAPH_TASK_NAME,
                     user_label.as_deref(),
+                    EXTRACT_GRAPH_TASK_RANK,
                 );
                 stamp_provenance(
                     &mut pair.entity_type.base,
                     COGNIFY_PIPELINE_STAMP_NAME,
                     EXTRACT_GRAPH_TASK_NAME,
                     user_label.as_deref(),
+                    EXTRACT_GRAPH_TASK_RANK,
                 );
             }
             // Chunks/documents carried forward — idempotent re-stamp keeps
@@ -3434,6 +3475,7 @@ pub fn make_extract_graph_task(
                     COGNIFY_PIPELINE_STAMP_NAME,
                     EXTRACT_GRAPH_TASK_NAME,
                     user_label.as_deref(),
+                    EXTRACT_GRAPH_TASK_RANK,
                 );
             }
             for doc in &mut graph_data.documents {
@@ -3442,6 +3484,7 @@ pub fn make_extract_graph_task(
                     COGNIFY_PIPELINE_STAMP_NAME,
                     EXTRACT_GRAPH_TASK_NAME,
                     user_label.as_deref(),
+                    EXTRACT_GRAPH_TASK_RANK,
                 );
             }
             Ok(Box::new(graph_data))
@@ -3473,6 +3516,7 @@ pub fn make_summarize_text_task(
                     COGNIFY_PIPELINE_STAMP_NAME,
                     SUMMARIZE_TEXT_TASK_NAME,
                     user_label.as_deref(),
+                    SUMMARIZE_TEXT_TASK_RANK,
                 );
             }
             // Idempotent re-stamp of carried-forward DataPoints — only
@@ -3483,6 +3527,7 @@ pub fn make_summarize_text_task(
                     COGNIFY_PIPELINE_STAMP_NAME,
                     SUMMARIZE_TEXT_TASK_NAME,
                     user_label.as_deref(),
+                    SUMMARIZE_TEXT_TASK_RANK,
                 );
             }
             for doc in &mut summarized.documents {
@@ -3491,6 +3536,7 @@ pub fn make_summarize_text_task(
                     COGNIFY_PIPELINE_STAMP_NAME,
                     SUMMARIZE_TEXT_TASK_NAME,
                     user_label.as_deref(),
+                    SUMMARIZE_TEXT_TASK_RANK,
                 );
             }
             for pair in &mut summarized.entities {
@@ -3499,12 +3545,14 @@ pub fn make_summarize_text_task(
                     COGNIFY_PIPELINE_STAMP_NAME,
                     SUMMARIZE_TEXT_TASK_NAME,
                     user_label.as_deref(),
+                    SUMMARIZE_TEXT_TASK_RANK,
                 );
                 stamp_provenance(
                     &mut pair.entity_type.base,
                     COGNIFY_PIPELINE_STAMP_NAME,
                     SUMMARIZE_TEXT_TASK_NAME,
                     user_label.as_deref(),
+                    SUMMARIZE_TEXT_TASK_RANK,
                 );
             }
             Ok(Box::new(summarized))
@@ -3546,6 +3594,7 @@ pub fn make_add_data_points_task(
                     COGNIFY_PIPELINE_STAMP_NAME,
                     ADD_DATA_POINTS_TASK_NAME,
                     user_label.as_deref(),
+                    ADD_DATA_POINTS_TASK_RANK,
                 );
             }
             for pair in &mut result.entities {
@@ -3554,12 +3603,14 @@ pub fn make_add_data_points_task(
                     COGNIFY_PIPELINE_STAMP_NAME,
                     ADD_DATA_POINTS_TASK_NAME,
                     user_label.as_deref(),
+                    ADD_DATA_POINTS_TASK_RANK,
                 );
                 stamp_provenance(
                     &mut pair.entity_type.base,
                     COGNIFY_PIPELINE_STAMP_NAME,
                     ADD_DATA_POINTS_TASK_NAME,
                     user_label.as_deref(),
+                    ADD_DATA_POINTS_TASK_RANK,
                 );
             }
             for summary in &mut result.summaries {
@@ -3568,6 +3619,7 @@ pub fn make_add_data_points_task(
                     COGNIFY_PIPELINE_STAMP_NAME,
                     ADD_DATA_POINTS_TASK_NAME,
                     user_label.as_deref(),
+                    ADD_DATA_POINTS_TASK_RANK,
                 );
             }
             for edge_type in &mut result.edge_types {
@@ -3576,6 +3628,7 @@ pub fn make_add_data_points_task(
                     COGNIFY_PIPELINE_STAMP_NAME,
                     ADD_DATA_POINTS_TASK_NAME,
                     user_label.as_deref(),
+                    ADD_DATA_POINTS_TASK_RANK,
                 );
             }
             for doc in &mut result.documents_for_dlt {
@@ -3584,6 +3637,7 @@ pub fn make_add_data_points_task(
                     COGNIFY_PIPELINE_STAMP_NAME,
                     ADD_DATA_POINTS_TASK_NAME,
                     user_label.as_deref(),
+                    ADD_DATA_POINTS_TASK_RANK,
                 );
             }
             Ok(Box::new(result))

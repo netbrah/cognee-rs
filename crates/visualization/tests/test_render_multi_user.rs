@@ -15,8 +15,10 @@ use cognee_visualization::render_multi_user;
 
 /// Extract a top-level `var <name> = <json>;` payload from the rendered HTML.
 ///
-/// The graph template inlines the seven payloads as JS variable assignments
-/// terminated by `;` at end-of-line. We find the marker, then scan forward
+/// The vendored `views/story_view.js` chunk declares the six graph payloads as
+/// `var <name> = __TOKEN__;` at its top (`story_view.js:4-9`); the orchestrator
+/// substitutes each token with JSON. `var nodes = ` / `var links = ` are unique
+/// across the whole assembled document. We find the marker, then scan forward
 /// counting `[`/`]` (or `{`/`}`) until balanced, mirroring the cross-SDK
 /// harness's regex extractor without pulling in a regex dep.
 fn extract_var(html: &str, name: &str) -> serde_json::Value {
@@ -93,8 +95,8 @@ async fn aggregates_two_users_with_three_nodes_each() {
 
     let html = render_multi_user(&pairs).await.expect("render");
 
-    // The d3 template inlines node JSON via `__NODES_DATA__`. Three nodes per
-    // user means each label appears at least three times.
+    // The vendored story view inlines node JSON via `__NODES_DATA__`. Three
+    // nodes per user means each label appears at least three times.
     let alice_count = html.matches("alice@example.com").count();
     let bob_count = html.matches("bob@example.com").count();
     assert!(
@@ -145,7 +147,7 @@ async fn tags_each_node_with_owning_user_label() {
 async fn dedupe_overlapping_nodes_first_write_wins() {
     // Two pairs share the node id "shared" by content; assert exactly one entry
     // survives, with `source_user` taken from the first pair (mirror Python
-    // `cognee_network_visualization.py:142`).
+    // `cognee_network_visualization.py:211`).
     let alice = MockGraphDB::new();
     alice
         .add_node_raw(serde_json::json!({
@@ -207,7 +209,7 @@ async fn dedupe_overlapping_nodes_first_write_wins() {
 #[tokio::test]
 async fn dedupe_edges_by_source_target_relation() {
     // Both pairs declare the same edge (a -[knows]-> b). Assert the rendered
-    // output contains exactly one link entry (mirror Python L150-155).
+    // output contains exactly one link entry (mirror Python `cognee_network_visualization.py:221-225`).
     let alice = MockGraphDB::new();
     alice
         .add_node_raw(serde_json::json!({"id": "a", "type": "Entity"}))

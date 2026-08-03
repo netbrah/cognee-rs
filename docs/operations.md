@@ -113,7 +113,7 @@ These live in the [`cognee`](../crates/lib/) `api` module (and `DatasetManager`)
 | **delete** | Cascading removal of data/datasets across relational → graph → vector → file storage (with dry-run preview). | [`cognee-delete`](../crates/delete/) `DeleteService` |
 | **update** | Re-ingest changed data and re-cognify the affected subset. | `api::update` |
 | **prune** | Reset system or all state (`prune_system` / `prune_data`). | `api::prune` |
-| **visualize** | Render the graph to a self-contained d3.js HTML file. | [`cognee-visualization`](../crates/visualization/) |
+| **visualize** | Render the graph to a single-file d3.js HTML page (Graph / Schema / Memory / Semantic tabs + inspector). | [`cognee-visualization`](../crates/visualization/) |
 
 ## Operation → interface map
 

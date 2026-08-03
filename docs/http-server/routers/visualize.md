@@ -1,6 +1,6 @@
 # Router: visualize
 
-The `/api/v1/visualize` router serves single-file HTML knowledge-graph visualizations rendered by the existing `cognee-visualization` crate (a force-directed d3.js graph viewer). `GET /` renders the graph for one of the caller's datasets; `POST /multi` aggregates several users' datasets into a combined visualization (superuser-only). Both endpoints return `text/html` directly — they do **not** return JSON. This is the only router in the API that returns HTML as its happy-path response.
+The `/api/v1/visualize` router serves single-file HTML knowledge-graph visualizations rendered by the existing `cognee-visualization` crate (a d3.js viewer with Graph / Schema / Memory / Semantic tabs). `GET /` renders the graph for one of the caller's datasets; `POST /multi` aggregates several users' datasets into a combined visualization (superuser-only). Both endpoints return `text/html` directly — they do **not** return JSON. This is the only router in the API that returns HTML as its happy-path response.
 
 Companion docs: [../architecture.md](../architecture.md), [../auth.md](../auth.md), [../tenants.md](../tenants.md), [../observability.md](../observability.md).
 
@@ -37,7 +37,7 @@ Companion docs: [../architecture.md](../architecture.md), [../auth.md](../auth.m
   3. Render: `cognee_visualization::render(state.lib.graph_db()).await?` returns `String`.
   4. Wrap in `axum::response::Html(html)` → emits `Content-Type: text/html; charset=utf-8` automatically.
 - **Validation rules**: `dataset_id` must be a valid UUID v4/v5; that's enforced at the extractor level.
-- **Rate / size limits**: response size is unbounded in principle. Large graphs (>100 K nodes) produce HTML that exceeds reasonable browser memory; the visualization crate's `serialize_graph` truncates at the data-model level (currently no cap — flag in §6).
+- **Rate / size limits**: response size is unbounded in principle. Large graphs (>100 K nodes) produce HTML that exceeds reasonable browser memory; the visualization crate's `preprocessor` would be the place to truncate at the data-model level (currently no cap — flag in §6).
 - **Permission gate**: `read` on the requested dataset, resolved via `PermissionsRepository::user_can(user.id, dataset_id, "read")` (see [../tenants.md §5](../tenants.md#5-permission-resolution)). Failure surfaces as a `PermissionDeniedError` which Python folds into the 409 catch-all; we match.
 - **OpenAPI**: tag `["v1", "visualize"]`. The `200` response is declared with `content: { "text/html": { schema: { type: "string", format: "html" } } }` so OpenAPI clients render it correctly. Per Python, `response_model=None` ([`get_visualize_router.py:27`](https://github.com/topoteretes/cognee/blob/main/cognee/api/v1/users/routers/get_visualize_router.py#L27)) — the returned content is intentionally non-JSON.
 - **Telemetry**: span name `cognee.api.visualize`. Attributes:
@@ -73,7 +73,7 @@ Companion docs: [../architecture.md](../architecture.md), [../auth.md](../auth.m
      - `target_user = state.lib.users().get(pair.user_id).await?`
      - `dataset = state.lib.datasets().get_authorized([pair.dataset_id], "read", &target_user).await?` — resolve permission against the *target* user, not the caller (matches Python's [`get_visualize_router.py:122-125`](https://github.com/topoteretes/cognee/blob/main/cognee/api/v1/users/routers/get_visualize_router.py#L122-L125)).
      - Collect `(target_user, dataset)` into a vector.
-  3. Render: `cognee_visualization::render_multi_user(&pairs).await?` — returns combined HTML. **This function does not yet exist in the Rust visualization crate**; see §3 for the implementation task.
+  3. Render: `cognee_visualization::render_multi_user(&pairs).await?` — returns combined HTML. See §3 for its dedup semantics.
   4. Wrap in `axum::response::Html`.
 - **Validation rules**: each pair's `user_id` and `dataset_id` must be valid UUIDs (extractor-level). No length cap on the array, but practical limit ~50 pairs (above that the d3 layout becomes unusable — flag in §6).
 - **Rate / size limits**: default body limit. Output HTML scales linearly with total node count.
@@ -89,7 +89,7 @@ Companion docs: [../architecture.md](../architecture.md), [../auth.md](../auth.m
 
 ## 3. Cross-cutting behavior
 
-### 3.1 The `cognee-visualization` crate — what exists and what's missing
+### 3.1 The `cognee-visualization` crate — public surface
 
 The crate is implemented at [`crates/visualization/`](../../../crates/visualization/) and exposes:
 
@@ -97,34 +97,12 @@ The crate is implemented at [`crates/visualization/`](../../../crates/visualizat
 |---|---|---|
 | `pub async fn visualize(graph_db, output_path)` | Implemented | Writes HTML to a path; returns the path. Used by the CLI. |
 | `pub async fn render(graph_db)` | Implemented | Returns the HTML string without filesystem side effects. **This is what the GET handler uses.** |
-| `pub async fn render_multi_user(pairs)` | **Not yet implemented** | Aggregates multiple `(User, Dataset)` pairs into one visualization with color-by-user. **Must be added before the POST handler can land.** |
+| `pub async fn render_multi_user(pairs)` | Implemented | Aggregates multiple `(User, Arc<dyn GraphDBTrait>)` pairs into one visualization, stamping `source_user` so the renderer can colour-code by user. **This is what the POST handler uses.** |
 
-The HTML pipeline (`html.rs`, `serialize.rs`, `paths.rs`) is otherwise complete — the only missing piece is the multi-user aggregation. Implementation outline:
-
-```rust
-// crates/visualization/src/lib.rs (new)
-pub async fn render_multi_user(
-    pairs: &[(User, Arc<dyn GraphDBTrait>)],
-) -> Result<String, VisualizationError> {
-    let mut all_nodes = Vec::new();
-    let mut all_edges = Vec::new();
-    for (user, gdb) in pairs {
-        let (nodes, edges) = gdb.get_graph_data().await?;
-        // Tag each node with the owner's user-id so the d3 renderer can
-        // color-code by user (the existing template supports a `user_id`
-        // node attribute).
-        for mut n in nodes {
-            n.attributes.insert("user_id".into(), user.id.to_string().into());
-            all_nodes.push(n);
-        }
-        all_edges.extend(edges);
-    }
-    let serialized = serialize::serialize_graph(all_nodes, all_edges);
-    html::build_html(&serialized, /* color_by_user = */ Some(true))
-}
-```
-
-The exact signature is up to the implementer; the HTTP handler imports it as opaque.
+The HTML pipeline is complete: `preprocessor` derives the payload, `html.rs` substitutes it into the
+vendored frontend assets, `paths.rs` resolves the output location. Multi-user aggregation dedupes
+nodes first-write-wins by stringified id and edges by `(source, target, relation)`, and only fills
+`source_user` when the node does not already carry one.
 
 ### 3.2 Tenant context
 

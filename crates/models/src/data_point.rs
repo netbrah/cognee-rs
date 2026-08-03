@@ -28,6 +28,17 @@ fn default_version() -> i32 {
     1
 }
 
+/// Default value for `topological_rank` (used by serde).
+///
+/// Python parity: `DataPoint.topological_rank: int | None = 0`
+/// (`cognee/infrastructure/engine/models/DataPoint.py:65`) — `0` is the
+/// "unset" sentinel, not a real rank. A named serde default (rather than
+/// bare `#[serde(default)]`) means a stored `properties` blob missing the
+/// key deserializes to `Some(0)` instead of failing / becoming `None`.
+fn default_topological_rank() -> Option<i32> {
+    Some(0)
+}
+
 /// Base model for all storage-layer entities.
 ///
 /// Provides:
@@ -59,7 +70,18 @@ pub struct DataPoint {
     #[serde(default = "default_version")]
     pub version: i32,
 
-    /// Topological rank for graph traversal optimization
+    /// Topological rank for graph traversal optimization: the 1-based
+    /// position of the pipeline task that emitted this DataPoint.
+    ///
+    /// Written by the pipeline executor (see
+    /// `cognee_core::provenance::stamp_tree`) only when still unset —
+    /// `None` or `Some(0)` — mirroring Python's
+    /// `run_tasks_base.py::_stamp_provenance` guard
+    /// (`if current_rank is None or current_rank == 0`).
+    ///
+    /// Emitted unconditionally (no `skip_serializing_if`): Python always
+    /// writes the key, and the visualization JS reads it off every node.
+    #[serde(default = "default_topological_rank")]
     pub topological_rank: Option<i32>,
 
     /// Flexible metadata storage (e.g., index_fields, custom attributes)
@@ -121,7 +143,7 @@ impl DataPoint {
             updated_at: now,
             ontology_valid: false,
             version: 1,
-            topological_rank: None,
+            topological_rank: Some(0),
             metadata: HashMap::new(),
             data_type: data_type.into(),
             belongs_to_set: dataset_id.map(|id| vec![serde_json::json!(id.to_string())]),
@@ -148,7 +170,7 @@ impl DataPoint {
             updated_at: now,
             ontology_valid: false,
             version: 1,
-            topological_rank: None,
+            topological_rank: Some(0),
             metadata,
             data_type: data_type.into(),
             belongs_to_set: dataset_id.map(|id| vec![serde_json::json!(id.to_string())]),
@@ -277,6 +299,51 @@ mod tests {
 
         let parsed: DataPoint = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.importance_weight, Some(0.9));
+    }
+
+    #[test]
+    fn topological_rank_defaults_to_zero_sentinel_on_construction() {
+        // Python parity: `DataPoint.topological_rank: int | None = 0`.
+        assert_eq!(DataPoint::new("Entity", None).topological_rank, Some(0));
+        assert_eq!(
+            DataPoint::with_metadata("Entity", None, HashMap::new()).topological_rank,
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn topological_rank_default_on_missing_field() {
+        // Simulate a persisted `properties` blob written before the field
+        // existed: deserialization must succeed and yield the `0` sentinel
+        // rather than erroring on a missing required field.
+        let json = json!({
+            "id": Uuid::new_v4().to_string(),
+            "created_at": 1_i64,
+            "updated_at": 1_i64,
+            "ontology_valid": false,
+            "metadata": {},
+            "type": "Entity",
+            "belongs_to_set": null,
+        });
+        let dp: DataPoint = serde_json::from_value(json).unwrap();
+        assert_eq!(dp.topological_rank, Some(0));
+    }
+
+    #[test]
+    fn topological_rank_serializes_as_zero_not_null() {
+        let dp = DataPoint::new("Entity", None);
+        let json = serde_json::to_string(&dp).unwrap();
+        assert!(
+            json.contains(r#""topological_rank":0"#),
+            "fresh DataPoint must emit the `0` sentinel, not null: {json}"
+        );
+
+        let mut ranked = DataPoint::new("Entity", None);
+        ranked.topological_rank = Some(3);
+        let json = serde_json::to_string(&ranked).unwrap();
+        assert!(json.contains(r#""topological_rank":3"#));
+        let parsed: DataPoint = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.topological_rank, Some(3));
     }
 
     #[test]

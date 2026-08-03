@@ -47,6 +47,10 @@ pub(crate) fn pre_stamp_extraction(
         user_label,
         node_set: None,
         content_hash: None,
+        // This helper is only reachable from the extract-graph task, so the
+        // rank is fixed. Must stay in lockstep with
+        // [`crate::tasks::build_cognify_pipeline`]'s task order.
+        task_rank: Some(crate::tasks::EXTRACT_GRAPH_TASK_RANK),
     };
     stamp_tree(target, &ctx, visited);
 }
