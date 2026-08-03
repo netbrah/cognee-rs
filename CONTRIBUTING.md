@@ -134,8 +134,32 @@ brings them back:
   Pass `--xcframework` to drop it.
 
 Local databases and data stores (`cognee.db`, `.data_storage/`, `.cognee_system/`) are never
-removed — they can hold a developer's own knowledge graph. Docker layers from the
-`e2e-cross-sdk/` harness are separate — use `docker system prune`.
+removed — they can hold a developer's own knowledge graph.
+
+For Docker, `--docker` removes **only the images this repo builds** — today just the
+~5 GB `cognee-e2e-cross-sdk` image from the `e2e-cross-sdk/` harness. It is not part of
+`--all` because rebuilding it recompiles both SDKs from scratch, and it is a no-op when
+docker is absent or the daemon is down.
+
+Everything else Docker holds is left alone on purpose. A dev machine typically also carries
+unrelated images (kind node images, other services' `:local` tags) and a BuildKit cache
+shared across every project, so `clean_all.sh` prints the daemon-wide reclaimable total for
+information and never runs `docker system prune` itself. Two details worth knowing if you
+extend `DOCKER_IMAGES`: removal is by `repo:tag` rather than image ID, because several tags
+routinely share one ID and `docker rmi <id>` would delete all of them; and the freed total
+counts each image once no matter how many tags point at it.
+
+### Which profile settings drive the size
+
+Debug info is the dominant term, and it reaches further than the Rust artifacts: cargo derives
+the `OPT_LEVEL`/`DEBUG` env vars it passes to build scripts from the profile, and the `cmake`
+crate maps those onto the `CMAKE_BUILD_TYPE` used for lbug's bundled Ladybug C++ tree. Setting
+`opt-level >= 1` **and** `debug = 0` together takes that tree from 2.9 GiB to 213 MiB; either
+one alone does nothing for it (`debug = "line-tables-only"` counts as "wants debug info").
+Both binding workspaces set the pair in `[profile.dev]` — a debug build of
+`ts/cognee-ts-neon` went from 12.1 GiB to 3.3 GiB. See
+[docs/build/lbug-rebuilds.md](docs/build/lbug-rebuilds.md) for the full table, and use
+`CARGO_PROFILE_DEV_DEBUG=2 cargo build` when you do need full debug info.
 
 ## Language bindings
 
