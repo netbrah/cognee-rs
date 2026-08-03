@@ -241,11 +241,11 @@ pub type AsyncStreamBatchFn = Arc<
 /// The pipeline executor detects which kind the next task is and routes
 /// accordingly.
 ///
-/// **Batch variants are dispatched on a different path** and receive none of six
-/// executor services: retries, per-task watcher events, provenance stamping,
-/// rate limiting, progress-subtoken completion and cancellation checks. (This is
-/// a divergence from Python, which routes every task through `handle_task`
-/// regardless of batching.) See
+/// **Batch variants are dispatched on a different path** and forgo three
+/// executor services: retries, per-task watcher events, and provenance stamping
+/// of their own output. (This is a divergence from Python, which routes every
+/// task through `handle_task` regardless of batching.) Rate limiting, progress
+/// and cancellation are applied on both paths. See
 /// [Batch dispatch bypasses executor services](crate::pipeline#batch-dispatch-bypasses-executor-services).
 pub enum Task {
     Sync(SyncFn),
@@ -352,10 +352,10 @@ impl Task {
 
     /// Create a [`Task::SyncBatch`] from a raw closure.
     ///
-    /// **No executor services:** a batch-dispatched task gets no retries, no
-    /// per-task watcher events, no provenance stamping, no rate-limiter
-    /// acquisition, no progress-subtoken completion and no cancellation check,
-    /// so it must handle its own error semantics. Full rationale:
+    /// **Reduced executor services:** a batch-dispatched task gets no retries,
+    /// no per-task watcher events, and no provenance stamping of its own output,
+    /// so it must handle its own error semantics. Rate limiting, progress and
+    /// cancellation *are* applied. Full rationale:
     /// [Batch dispatch bypasses executor services](crate::pipeline#batch-dispatch-bypasses-executor-services).
     pub fn sync_batch<F>(f: F) -> Self
     where
@@ -369,10 +369,10 @@ impl Task {
 
     /// Create a [`Task::AsyncBatch`] from a raw closure returning a [`BoxFuture`].
     ///
-    /// **No executor services:** a batch-dispatched task gets no retries, no
-    /// per-task watcher events, no provenance stamping, no rate-limiter
-    /// acquisition, no progress-subtoken completion and no cancellation check,
-    /// so it must handle its own error semantics. Full rationale:
+    /// **Reduced executor services:** a batch-dispatched task gets no retries,
+    /// no per-task watcher events, and no provenance stamping of its own output,
+    /// so it must handle its own error semantics. Rate limiting, progress and
+    /// cancellation *are* applied. Full rationale:
     /// [Batch dispatch bypasses executor services](crate::pipeline#batch-dispatch-bypasses-executor-services).
     pub fn async_batch<F>(f: F) -> Self
     where
@@ -389,10 +389,10 @@ impl Task {
 
     /// Create a [`Task::SyncIterBatch`] from a raw closure returning a [`ValueIter`].
     ///
-    /// **No executor services:** a batch-dispatched task gets no retries, no
-    /// per-task watcher events, no provenance stamping, no rate-limiter
-    /// acquisition, no progress-subtoken completion and no cancellation check,
-    /// so it must handle its own error semantics. Full rationale:
+    /// **Reduced executor services:** a batch-dispatched task gets no retries,
+    /// no per-task watcher events, and no provenance stamping of its own output,
+    /// so it must handle its own error semantics. Rate limiting, progress and
+    /// cancellation *are* applied. Full rationale:
     /// [Batch dispatch bypasses executor services](crate::pipeline#batch-dispatch-bypasses-executor-services).
     pub fn sync_iter_batch<F>(f: F) -> Self
     where
@@ -406,10 +406,10 @@ impl Task {
 
     /// Create a [`Task::AsyncStreamBatch`] from a raw closure returning a [`ValueStream`].
     ///
-    /// **No executor services:** a batch-dispatched task gets no retries, no
-    /// per-task watcher events, no provenance stamping, no rate-limiter
-    /// acquisition, no progress-subtoken completion and no cancellation check,
-    /// so it must handle its own error semantics. Full rationale:
+    /// **Reduced executor services:** a batch-dispatched task gets no retries,
+    /// no per-task watcher events, and no provenance stamping of its own output,
+    /// so it must handle its own error semantics. Rate limiting, progress and
+    /// cancellation *are* applied. Full rationale:
     /// [Batch dispatch bypasses executor services](crate::pipeline#batch-dispatch-bypasses-executor-services).
     pub fn async_stream_batch<F>(f: F) -> Self
     where
@@ -541,10 +541,10 @@ impl Task {
 
     /// Create a [`Task::SyncBatch`] from a typed closure receiving `&[&I]`.
     ///
-    /// **No executor services:** a batch-dispatched task gets no retries, no
-    /// per-task watcher events, no provenance stamping, no rate-limiter
-    /// acquisition, no progress-subtoken completion and no cancellation check,
-    /// so it must handle its own error semantics. Full rationale:
+    /// **Reduced executor services:** a batch-dispatched task gets no retries,
+    /// no per-task watcher events, and no provenance stamping of its own output,
+    /// so it must handle its own error semantics. Rate limiting, progress and
+    /// cancellation *are* applied. Full rationale:
     /// [Batch dispatch bypasses executor services](crate::pipeline#batch-dispatch-bypasses-executor-services).
     ///
     /// ```rust,ignore
@@ -569,10 +569,10 @@ impl Task {
 
     /// Create a [`Task::AsyncBatch`] from a typed closure returning a `'static` future.
     ///
-    /// **No executor services:** a batch-dispatched task gets no retries, no
-    /// per-task watcher events, no provenance stamping, no rate-limiter
-    /// acquisition, no progress-subtoken completion and no cancellation check,
-    /// so it must handle its own error semantics. Full rationale:
+    /// **Reduced executor services:** a batch-dispatched task gets no retries,
+    /// no per-task watcher events, and no provenance stamping of its own output,
+    /// so it must handle its own error semantics. Rate limiting, progress and
+    /// cancellation *are* applied. Full rationale:
     /// [Batch dispatch bypasses executor services](crate::pipeline#batch-dispatch-bypasses-executor-services).
     ///
     /// Data needed inside the async block must be copied/cloned before it:
@@ -606,10 +606,10 @@ impl Task {
 
     /// Create a [`Task::SyncIterBatch`] from a typed closure returning a concrete iterator.
     ///
-    /// **No executor services:** a batch-dispatched task gets no retries, no
-    /// per-task watcher events, no provenance stamping, no rate-limiter
-    /// acquisition, no progress-subtoken completion and no cancellation check,
-    /// so it must handle its own error semantics. Full rationale:
+    /// **Reduced executor services:** a batch-dispatched task gets no retries,
+    /// no per-task watcher events, and no provenance stamping of its own output,
+    /// so it must handle its own error semantics. Rate limiting, progress and
+    /// cancellation *are* applied. Full rationale:
     /// [Batch dispatch bypasses executor services](crate::pipeline#batch-dispatch-bypasses-executor-services).
     pub fn sync_iter_batch_typed<I, O, F, Iter>(f: F) -> Self
     where
@@ -629,10 +629,10 @@ impl Task {
 
     /// Create a [`Task::AsyncStreamBatch`] from a typed closure returning a concrete stream.
     ///
-    /// **No executor services:** a batch-dispatched task gets no retries, no
-    /// per-task watcher events, no provenance stamping, no rate-limiter
-    /// acquisition, no progress-subtoken completion and no cancellation check,
-    /// so it must handle its own error semantics. Full rationale:
+    /// **Reduced executor services:** a batch-dispatched task gets no retries,
+    /// no per-task watcher events, and no provenance stamping of its own output,
+    /// so it must handle its own error semantics. Rate limiting, progress and
+    /// cancellation *are* applied. Full rationale:
     /// [Batch dispatch bypasses executor services](crate::pipeline#batch-dispatch-bypasses-executor-services).
     pub fn async_stream_batch_typed<I, O, F, S>(f: F) -> Self
     where
@@ -913,11 +913,10 @@ impl TaskInfo {
     /// this limiter before calling the task. `None` inherits the pipeline-level
     /// limiter.
     ///
-    /// **Batch calls are not throttled today.** If this task is a `*Batch`
-    /// variant, `dispatch_batch` invokes it directly without acquiring the
-    /// limiter — the effective limiter is threaded only into `call_with_retry` —
-    /// so setting this on a batch task currently has no effect. See
-    /// [Batch dispatch bypasses executor services](crate::pipeline#batch-dispatch-bypasses-executor-services).
+    /// Batch tasks are throttled too: `dispatch_batch` acquires the same
+    /// effective limiter once per batch call, a batch being one external
+    /// request. Note the difference in granularity — a single-value task
+    /// acquires once per *retry attempt*, a batch task once per *batch*.
     pub fn with_rate_limiter(mut self, rl: Arc<dyn RateLimiter>) -> Self {
         self.rate_limiter = Some(rl);
         self
@@ -1079,10 +1078,10 @@ impl<I: Value, O: Value> TypedTask<I, O> {
 
     /// Create a [`TypedTask::SyncBatch`] from a typed closure `&[&I] → Result<Box<O>, TaskError>`.
     ///
-    /// **No executor services:** a batch-dispatched task gets no retries, no
-    /// per-task watcher events, no provenance stamping, no rate-limiter
-    /// acquisition, no progress-subtoken completion and no cancellation check,
-    /// so it must handle its own error semantics. Full rationale:
+    /// **Reduced executor services:** a batch-dispatched task gets no retries,
+    /// no per-task watcher events, and no provenance stamping of its own output,
+    /// so it must handle its own error semantics. Rate limiting, progress and
+    /// cancellation *are* applied. Full rationale:
     /// [Batch dispatch bypasses executor services](crate::pipeline#batch-dispatch-bypasses-executor-services).
     pub fn sync_batch<F>(f: F) -> Self
     where
@@ -1096,10 +1095,10 @@ impl<I: Value, O: Value> TypedTask<I, O> {
 
     /// Create a [`TypedTask::AsyncBatch`] from a typed closure returning a `'static` future.
     ///
-    /// **No executor services:** a batch-dispatched task gets no retries, no
-    /// per-task watcher events, no provenance stamping, no rate-limiter
-    /// acquisition, no progress-subtoken completion and no cancellation check,
-    /// so it must handle its own error semantics. Full rationale:
+    /// **Reduced executor services:** a batch-dispatched task gets no retries,
+    /// no per-task watcher events, and no provenance stamping of its own output,
+    /// so it must handle its own error semantics. Rate limiting, progress and
+    /// cancellation *are* applied. Full rationale:
     /// [Batch dispatch bypasses executor services](crate::pipeline#batch-dispatch-bypasses-executor-services).
     pub fn async_batch<F>(f: F) -> Self
     where
@@ -1116,10 +1115,10 @@ impl<I: Value, O: Value> TypedTask<I, O> {
 
     /// Create a [`TypedTask::SyncIterBatch`] from a typed closure returning a concrete iterator.
     ///
-    /// **No executor services:** a batch-dispatched task gets no retries, no
-    /// per-task watcher events, no provenance stamping, no rate-limiter
-    /// acquisition, no progress-subtoken completion and no cancellation check,
-    /// so it must handle its own error semantics. Full rationale:
+    /// **Reduced executor services:** a batch-dispatched task gets no retries,
+    /// no per-task watcher events, and no provenance stamping of its own output,
+    /// so it must handle its own error semantics. Rate limiting, progress and
+    /// cancellation *are* applied. Full rationale:
     /// [Batch dispatch bypasses executor services](crate::pipeline#batch-dispatch-bypasses-executor-services).
     pub fn sync_iter_batch<F, Iter>(f: F) -> Self
     where
@@ -1137,10 +1136,10 @@ impl<I: Value, O: Value> TypedTask<I, O> {
 
     /// Create a [`TypedTask::AsyncStreamBatch`] from a typed closure returning a concrete stream.
     ///
-    /// **No executor services:** a batch-dispatched task gets no retries, no
-    /// per-task watcher events, no provenance stamping, no rate-limiter
-    /// acquisition, no progress-subtoken completion and no cancellation check,
-    /// so it must handle its own error semantics. Full rationale:
+    /// **Reduced executor services:** a batch-dispatched task gets no retries,
+    /// no per-task watcher events, and no provenance stamping of its own output,
+    /// so it must handle its own error semantics. Rate limiting, progress and
+    /// cancellation *are* applied. Full rationale:
     /// [Batch dispatch bypasses executor services](crate::pipeline#batch-dispatch-bypasses-executor-services).
     pub fn async_stream_batch<F, S>(f: F) -> Self
     where
