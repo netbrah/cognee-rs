@@ -3407,4 +3407,91 @@ mod tests {
         let v = (*outputs[0]).as_any().downcast_ref::<i32>().unwrap();
         assert_eq!(*v, 15);
     }
+
+    // ── Retention characteristics of the per-item context ────────────────────
+
+    /// A payload that records when it is dropped, so a test can observe
+    /// whether the executor is still holding the pipeline input.
+    struct TrackedPayload {
+        _bytes: Vec<u8>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for TrackedPayload {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Pinning `current_data` per item necessarily keeps the pipeline input
+    /// alive for the whole task chain, even once no task needs it any more.
+    ///
+    /// This is deliberate and matches the reference implementation: Python
+    /// builds one `PipelineContext(data_item=data_item, ...)` per item in
+    /// `run_tasks.py` and holds it across the entire per-item run, so
+    /// `ctx.data_item` is reachable from the last task there too.
+    ///
+    /// The cost is one extra live copy of the input value per in-flight item
+    /// (so × `concurrency`). It matters for pipelines whose *input value*
+    /// owns a large buffer rather than a reference to one — e.g.
+    /// `DataInput::Binary { data: Vec<u8>, .. }`, which the bindings marshal
+    /// into. Such pipelines should stream rather than materialise the payload
+    /// in the input value; the executor cannot release it early without
+    /// giving up the documented `current_data` semantics.
+    #[tokio::test]
+    async fn per_item_context_keeps_the_input_alive_for_the_whole_chain() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Task 0 consumes the payload and returns something small, so nothing
+        // downstream carries the payload forward. The only remaining strong
+        // reference is the one the per-item context holds.
+        let consume = TypedTask::<TrackedPayload, i32>::sync(|p: &TrackedPayload, _ctx| {
+            Ok(Box::new(p._bytes.len() as i32))
+        });
+
+        // Task 1 observes whether the payload is still alive.
+        let seen = Arc::new(std::sync::Mutex::new(None::<bool>));
+        let seen_in_task = Arc::clone(&seen);
+        let dropped_in_task = Arc::clone(&dropped);
+        let observe = TypedTask::<i32, i32>::sync(move |n: &i32, ctx| {
+            let already_dropped = dropped_in_task.load(std::sync::atomic::Ordering::SeqCst);
+            // lock poison is unrecoverable
+            *seen_in_task.lock().unwrap() = Some(already_dropped);
+            // The value is not merely alive, it is reachable as the original item.
+            let cd = ctx
+                .pipeline()
+                .current_data
+                .clone()
+                .expect("current_data is pinned per item by execute_one_item");
+            assert!(
+                (*cd).as_any().downcast_ref::<TrackedPayload>().is_some(),
+                "current_data should still be the original TrackedPayload"
+            );
+            Ok(Box::new(*n))
+        });
+
+        let pipeline = PipelineBuilder::new_with_task("retention", consume)
+            .add_task(observe)
+            .with_name("retention")
+            .build();
+
+        let input: Arc<dyn Value> = Arc::new(TrackedPayload {
+            _bytes: vec![0_u8; 4096],
+            dropped: Arc::clone(&dropped),
+        });
+
+        let ctx = stub_ctx_with_pipeline("retention").await;
+        let watcher = NoopWatcher;
+        execute(&pipeline, vec![input], ctx, &watcher)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(false),
+            "the input must still be alive while a later task runs — that is \
+             what pinning current_data per item means"
+        );
+    }
 }

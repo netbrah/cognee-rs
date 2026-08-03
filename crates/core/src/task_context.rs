@@ -65,6 +65,26 @@ pub struct PipelineContext {
     /// An out-of-tree task that read `current_data` expecting its own input must
     /// switch to its input argument. Tasks that need the originating item — the
     /// reason this field exists — now get it at any depth in the chain.
+    ///
+    /// # Lifetime cost
+    ///
+    /// Pinning the value necessarily keeps it reachable until the item's chain
+    /// finishes. This is an `Arc` clone, so nothing is duplicated — but the
+    /// allocation is released at the end of `execute_one_item` rather than when
+    /// the first task returns, as it was before. With
+    /// [`Pipeline::with_concurrency`](crate::pipeline::Pipeline::with_concurrency)
+    /// above 1, that longer window makes overlap between in-flight items more
+    /// likely (the default is 1).
+    ///
+    /// It is only a concern for pipelines whose *input value* owns a large
+    /// buffer instead of a handle to one — `cognee_models::DataInput::Binary`,
+    /// which the bindings marshal into, is the case to watch. Those pipelines
+    /// should stream the payload rather than materialise it in the input value;
+    /// the executor cannot release it early without giving up the semantics
+    /// documented above. Python has the same characteristic, for the same
+    /// reason: its per-item `PipelineContext` holds `data_item` for the whole
+    /// run. Pinned by
+    /// `per_item_context_keeps_the_input_alive_for_the_whole_chain`.
     pub current_data: Option<Arc<dyn Value>>,
     /// Random per-invocation run id. Set by [`crate::pipeline::execute`] when
     /// it creates `PipelineRunInfo`. Used by tasks (via

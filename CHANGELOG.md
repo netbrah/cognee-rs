@@ -35,6 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   argument instead. A task that wanted the originating data item (the field's
   documented purpose) now gets it at any depth in the chain.
 
+  Pinning the value also keeps it reachable for the whole chain. This is an
+  `Arc` clone — nothing is duplicated — but the allocation is now released when
+  the item finishes rather than when its first task returns. Only pipelines
+  whose input value *owns* a large buffer are affected (`DataInput::Binary` is
+  the one to watch); those should stream the payload instead of materialising it
+  in the input value. Python behaves the same way, holding `data_item` on its
+  per-item context for the duration of the run.
+
 ## [0.2.0](https://github.com/topoteretes/cognee-rs/compare/v0.1.3...v0.2.0) - 2026-07-30
 
 ### Breaking changes
