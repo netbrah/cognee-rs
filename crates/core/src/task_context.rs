@@ -40,8 +40,51 @@ pub struct PipelineContext {
     pub tenant_id: Option<Uuid>,
     /// Dataset being processed.
     pub dataset_id: Option<Uuid>,
-    /// The data item currently being processed.
-    /// Set per-item by the executor before calling a task.
+    /// The data item currently being processed — the **original** value that
+    /// entered the pipeline for this item, not the upstream task's output.
+    ///
+    /// Set once per data item by the executor (`execute_one_item`) and
+    /// inherited unchanged by every task in the chain (including batch tasks).
+    /// Mirrors Python's `PipelineContext.data_item`, which is likewise built
+    /// once per item and never rebound per task.
+    ///
+    /// # Behavioural change (for custom [`crate::task::Task`] implementations)
+    ///
+    /// The meaning of this field **changed**, silently for callers — the type is
+    /// unchanged, so nothing fails to compile:
+    ///
+    /// - **Before:** rebound by the executor before *every* single-value task
+    ///   call, so at task *k* it held the output of task *k-1* — i.e. "this
+    ///   task's own input", which the task already receives as its argument.
+    ///   Batch-dispatched tasks were handed the run-level context, where the
+    ///   field was `None`.
+    /// - **Now:** pinned once per data item to the value that entered the
+    ///   pipeline, and never rebound. Batch tasks inherit that same item value
+    ///   instead of seeing `None`.
+    ///
+    /// An out-of-tree task that read `current_data` expecting its own input must
+    /// switch to its input argument. Tasks that need the originating item — the
+    /// reason this field exists — now get it at any depth in the chain.
+    ///
+    /// # Lifetime cost
+    ///
+    /// Pinning the value necessarily keeps it reachable until the item's chain
+    /// finishes. This is an `Arc` clone, so nothing is duplicated — but the
+    /// allocation is released at the end of `execute_one_item` rather than when
+    /// the first task returns, as it was before. With
+    /// [`Pipeline::with_concurrency`](crate::pipeline::Pipeline::with_concurrency)
+    /// above 1, that longer window makes overlap between in-flight items more
+    /// likely (the default is 1).
+    ///
+    /// It is only a concern for pipelines whose *input value* owns a large
+    /// buffer instead of a handle to one — `cognee_models::DataInput::Binary`,
+    /// which the bindings marshal into, is the case to watch. Those pipelines
+    /// should stream the payload rather than materialise it in the input value;
+    /// the executor cannot release it early without giving up the semantics
+    /// documented above. Python has the same characteristic, for the same
+    /// reason: its per-item `PipelineContext` holds `data_item` for the whole
+    /// run. Pinned by
+    /// `per_item_context_keeps_the_input_alive_for_the_whole_chain`.
     pub current_data: Option<Arc<dyn Value>>,
     /// Random per-invocation run id. Set by [`crate::pipeline::execute`] when
     /// it creates `PipelineRunInfo`. Used by tasks (via
@@ -75,6 +118,29 @@ impl PipelineContext {
         self.user_email
             .clone()
             .or_else(|| self.user_id.map(|id| id.to_string()))
+    }
+
+    /// Minimal in-crate test fixture: a named run with a random `pipeline_id`,
+    /// every optional identity field unset, and a fresh provenance visited-set.
+    ///
+    /// Exists so tests stop hand-writing the nine-field struct literal — there
+    /// are already ~10 such copies across this crate's tests, each of which has
+    /// to be touched whenever a field is added. New tests should use this and
+    /// mutate the two or three fields they actually care about. `#[cfg(test)]`
+    /// keeps it out of the public API surface.
+    #[cfg(test)]
+    pub(crate) fn for_test(pipeline_name: impl Into<String>) -> Self {
+        Self {
+            pipeline_id: Uuid::new_v4(),
+            pipeline_name: pipeline_name.into(),
+            user_id: None,
+            tenant_id: None,
+            dataset_id: None,
+            current_data: None,
+            run_id: None,
+            user_email: None,
+            provenance_visited: Arc::new(Mutex::new(HashSet::new())),
+        }
     }
 }
 /// Runtime dependencies and control tokens for a single pipeline task.
@@ -239,8 +305,6 @@ pub struct TaskContextBuilder {
     database: Option<Arc<DatabaseConnection>>,
     graph_db: Option<Arc<dyn GraphDBTrait>>,
     vector_db: Option<Arc<dyn VectorDB>>,
-    /// If set, the cancellation pair is created from an external handle.
-    cancellation: Option<(CancellationHandle, CancellationToken)>,
     progress: Option<ProgressToken>,
     pipeline_ctx: Option<PipelineContext>,
     exec_status: Option<Arc<dyn ExecStatusManager>>,
@@ -303,6 +367,12 @@ impl TaskContextBuilder {
 
     /// Build the context. Returns `(CancellationHandle, TaskContext)` so the
     /// caller keeps the handle while the task receives the token.
+    ///
+    /// The cancellation pair is always minted here. A builder field for
+    /// injecting an externally-created pair used to exist but had no setter and
+    /// was therefore unreachable, so it was removed deliberately; add a public
+    /// setter if a caller ever needs to cancel a run from outside the builder
+    /// (e.g. an HTTP cancel endpoint holding the handle).
     pub fn build(self) -> Result<(CancellationHandle, TaskContext), CoreError> {
         let thread_pool = self.thread_pool.ok_or(CoreError::MissingContextField {
             field: "thread_pool",
@@ -317,7 +387,7 @@ impl TaskContextBuilder {
             .vector_db
             .ok_or(CoreError::MissingContextField { field: "vector_db" })?;
 
-        let (handle, token) = self.cancellation.unwrap_or_else(cancellation_pair);
+        let (handle, token) = cancellation_pair();
 
         let ctx = TaskContext {
             thread_pool,

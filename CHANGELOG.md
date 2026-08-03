@@ -16,6 +16,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
      **[BREAKING]** bullet); migration prose like the entries below is always
      hand-written and always needs this manual reposition. -->
 
+### Breaking changes
+
+- **`cognee-core`: `PipelineContext::current_data` changed meaning.** It is now
+  pinned, once per data item, to the value that *entered* the pipeline, and is
+  never rebound as that item flows through the task chain. Previously the
+  executor overwrote it before every single-value task call, so a task at
+  position *k* saw the output of task *k-1* — that is, its own input, which it
+  already receives as an argument. Batch-dispatched (`*Batch`) tasks previously
+  got the run-level context, where the field was `None`; they now inherit the
+  same item value as every other task. This matches Python cognee, where
+  `PipelineContext(data_item=…)` is built once per data item in `run_tasks.py`
+  and never rebound per task.
+
+  The field's type is unchanged, so **this does not break compilation** — only
+  behaviour, and only for custom `Task` implementations. An out-of-tree task that
+  read `ctx.pipeline().current_data` expecting *its own* input must read its input
+  argument instead. A task that wanted the originating data item (the field's
+  documented purpose) now gets it at any depth in the chain.
+
+  Pinning the value also keeps it reachable for the whole chain. This is an
+  `Arc` clone — nothing is duplicated — but the allocation is now released when
+  the item finishes rather than when its first task returns. Only pipelines
+  whose input value *owns* a large buffer are affected (`DataInput::Binary` is
+  the one to watch); those should stream the payload instead of materialising it
+  in the input value. Python behaves the same way, holding `data_item` on its
+  per-item context for the duration of the run.
+
 ## [0.2.0](https://github.com/topoteretes/cognee-rs/compare/v0.1.3...v0.2.0) - 2026-07-30
 
 ### Breaking changes

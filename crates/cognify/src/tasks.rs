@@ -50,7 +50,7 @@ use cognee_vector::{VectorDB, VectorPoint};
 use serde::Serialize;
 use serde_json::json;
 use tokio::sync::Semaphore;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use url::Url;
 use uuid::Uuid;
 
@@ -1158,6 +1158,29 @@ pub async fn add_data_points(
             &structural_edges,
         )
         .await?;
+    } else if db.is_some() {
+        // A relational backend *is* configured, so the ledger row could have been
+        // written — the missing `user_id` is a genuine config inconsistency, not a
+        // deployment shape. Python degrades silently here
+        // (`add_data_points.py:123`); we make it loud.
+        warn!(
+            dataset_id = %input.dataset_id,
+            "Skipping provenance ledger write: a relational database is configured but \
+             user_id is None. Nodes and edges were written to the graph without a \
+             rollback/ownership record, so rollback and ownership tracking will not \
+             cover them."
+        );
+    } else {
+        // No relational backend at all: the ledger is not applicable to this
+        // deployment (embedded / unauthenticated use, where `db` and `user_id` are
+        // legitimately `None` in the public `cognify()` signature). Not a
+        // data-integrity problem, so this must not be a WARN — it would fire once
+        // per data item and flag every normal ingest.
+        debug!(
+            dataset_id = %input.dataset_id,
+            "No relational database configured; provenance ledger write not applicable. \
+             Nodes and edges are in the graph with no rollback/ownership record."
+        );
     }
 
     Ok(CognifyResult {

@@ -1,3 +1,66 @@
+//! Pipeline definition and the depth-first task executor.
+//!
+//! [`Pipeline`] (or the type-checked [`PipelineBuilder`]) describes an ordered
+//! chain of [`TaskInfo`]s; [`execute`] runs that chain over one or more input
+//! values, fanning out per data item and recursing through the chain with
+//! `execute_from`.
+//!
+//! # Batch dispatch bypasses executor services
+//!
+//! There are two dispatch paths through the executor, and they are **not**
+//! equivalent.
+//!
+//! Single-value tasks go through `execute_from` → `call_with_retry` and receive
+//! the executor's full set of services.
+//!
+//! When an upstream task yields an iterator or a stream, the executor
+//! accumulates its items into a buffer (sized by [`TaskInfo::with_batch_size`])
+//! and hands the buffer to `dispatch_batch`. If the consuming task is one of the
+//! `*Batch` [`Task`] variants, `dispatch_batch` calls it **directly** with the
+//! accumulated slice, skipping `call_with_retry` entirely. Such a task gets
+//! **none** of the following six services:
+//!
+//! 1. **Retries.** The configured [`RetryPolicy`] is never consulted; the batch
+//!    call is made exactly once and the first error fails the item.
+//! 2. **Per-task watcher events.** No `on_task` / `on_task_started` /
+//!    `on_task_completed` is emitted for the batch task, so it is invisible both
+//!    to watcher observers and to per-task status tracking.
+//! 3. **Provenance stamping.** The executor does not walk the batch task's
+//!    output with `stamp_tree_dyn`. (Items *inside* the incoming slice were
+//!    already stamped eagerly by the upstream `process_iter` / `process_stream`,
+//!    but anything the batch task newly creates stays unstamped unless the task
+//!    stamps it itself.)
+//! 4. **Rate limiting.** Neither [`Pipeline::with_rate_limiter`] nor
+//!    [`TaskInfo::with_rate_limiter`] is acquired — the effective limiter is
+//!    threaded only into `call_with_retry`. Batch calls are unthrottled.
+//! 5. **Progress-subtoken completion.** The per-task progress subtoken is only
+//!    completed by `execute_from`, so a batch task's slice of the progress bar
+//!    never advances. The task cannot compensate from inside, either: it is
+//!    handed the run-level [`TaskContext`], whose `progress` is the *root* token,
+//!    and [`ProgressToken::split`] has already zeroed the root's width — so
+//!    `ctx.progress.set(..)` from a batch task is a silent no-op.
+//! 6. **Cancellation observation.** The executor's only cancellation check sits
+//!    at the top of `execute_from`, *after* the empty-tasks base case. The batch
+//!    branch of `dispatch_batch` never checks, and neither do the `process_iter`
+//!    / `process_stream` accumulation loops — so a batch task can still be
+//!    entered, and further batches still accumulated, after the run has been
+//!    cancelled.
+//!
+//! What a batch task *does* get is the pre-accumulated slice and the run-level
+//! context; it is expected to handle its own error semantics.
+//!
+//! This is a **divergence from Python cognee**, where every task goes through
+//! `handle_task` and receives stamping, telemetry and spans regardless of
+//! batching (there, `batch_size` only controls how many items are gathered into
+//! the list handed to the task).
+//!
+//! Only the `*Batch` variants take this path. A **non-batch** task reached from
+//! `dispatch_batch` is executed one buffered item at a time through
+//! `execute_from`, so it keeps every service listed above.
+//!
+//! [`ProgressToken::split`]: crate::progress::ProgressToken::split
+//! [`TaskContext`]: crate::task_context::TaskContext
+
 // Mutex lock().unwrap() and invariant-guarded expect() are acceptable in this
 // pipeline runtime — lock poisoning is unrecoverable and the invariants are
 // upheld by construction.
@@ -127,10 +190,12 @@ pub struct Pipeline {
     /// `Pipeline` struct shape is stable across feature flips. The
     /// snapshot is only consumed when the `telemetry` feature is on.
     pub telemetry_settings: Option<serde_json::Map<String, serde_json::Value>>,
-    /// Pipeline-wide proactive rate limiter applied to every task call (both
-    /// single-value via `call_with_retry` and batch via `dispatch_batch`).
-    /// Individual tasks may override it via [`TaskInfo::rate_limiter`].
-    /// `None` means no throttling.
+    /// Pipeline-wide proactive rate limiter applied to every **single-value**
+    /// task call, via `call_with_retry`. Individual tasks may override it via
+    /// [`TaskInfo::rate_limiter`]. `None` means no throttling.
+    ///
+    /// Batch-dispatched (`*Batch`) task calls are **not** throttled — see
+    /// [`Pipeline::with_rate_limiter`].
     pub rate_limiter: Option<Arc<dyn RateLimiter>>,
 }
 
@@ -165,6 +230,18 @@ impl Pipeline {
         self
     }
 
+    /// Set the pipeline-wide default for how many items are accumulated from an
+    /// upstream iterator / stream before they are dispatched to the consuming
+    /// task. Individual tasks override it via [`TaskInfo::with_batch_size`].
+    ///
+    /// This sizes the accumulation buffer for **every** kind of consuming task,
+    /// not only `*Batch` variants — see [`TaskInfo::with_batch_size`] for what
+    /// that means for a non-batch consumer.
+    ///
+    /// When the consumer *is* a `*Batch` variant it is dispatched off the
+    /// executor's service path (no retries, watcher events, provenance stamping,
+    /// rate limiting, progress completion or cancellation checks); see
+    /// [Batch dispatch bypasses executor services](crate::pipeline#batch-dispatch-bypasses-executor-services).
     pub fn with_batch_size(mut self, size: usize) -> Self {
         assert!(size > 0, "batch_size must be > 0");
         self.batch_size = size;
@@ -192,10 +269,15 @@ impl Pipeline {
     /// Set a pipeline-wide proactive rate limiter. Individual tasks may override
     /// it via [`TaskInfo::with_rate_limiter`].
     ///
-    /// The limiter is acquired inside `call_with_retry` once per attempt (so
-    /// each retry is a fresh acquisition) and once per batch call in
-    /// `dispatch_batch`. Use this for LLM API quota throttling or per-host
-    /// crawl-rate control.
+    /// The limiter is acquired inside `call_with_retry`, once per attempt, so
+    /// each retry is a fresh acquisition. Use this for LLM API quota throttling
+    /// or per-host crawl-rate control.
+    ///
+    /// **Batch calls are not throttled today.** `dispatch_batch` invokes a
+    /// `*Batch` task directly without acquiring the limiter — the effective
+    /// limiter is threaded only into `call_with_retry` — so a pipeline whose LLM
+    /// work happens in a batch task gets no throttling from this setting. See
+    /// [Batch dispatch bypasses executor services](crate::pipeline#batch-dispatch-bypasses-executor-services).
     ///
     /// See [`crate::rate_limiter`] for the distinction between this,
     /// [`Pipeline::with_concurrency`] (item parallelism), and [`RetryPolicy`]
@@ -344,7 +426,15 @@ impl<I: Value, O: Value> PipelineBuilder<I, O> {
         self
     }
 
-    /// Set the default batch size (items accumulated before dispatching to a batch task).
+    /// Set the default number of items accumulated from an upstream iterator /
+    /// stream before they are dispatched to the consuming task.
+    ///
+    /// This sizes the accumulation buffer whatever kind the consuming task is,
+    /// not only for `*Batch` variants — see [`TaskInfo::with_batch_size`].
+    ///
+    /// When the consumer *is* a `*Batch` variant it is dispatched off the
+    /// executor's service path; see
+    /// [Batch dispatch bypasses executor services](crate::pipeline#batch-dispatch-bypasses-executor-services).
     pub fn with_batch_size(mut self, size: usize) -> Self {
         assert!(size > 0, "batch_size must be > 0");
         self.batch_size = size;
@@ -924,7 +1014,15 @@ async fn execute_one_item<'a>(
         .as_ref()
         .and_then(|f| f(Arc::clone(&input)));
 
-    let result = execute_from(&pipeline.tasks, input, 0, env).await;
+    // Pin `PipelineContext::current_data` to the **original** data item for the
+    // whole task chain (Python parity: `PipelineContext(data_item=data_item)` is
+    // built once per item in `run_tasks.py` and never rebound per task). Every
+    // dispatch site below — `execute_from`, `dispatch_batch`, `process_iter` /
+    // `process_stream` — inherits it through this per-item `ExecEnv`.
+    let item_ctx = ctx.with_current_data(Arc::clone(&input));
+    let item_env = env.with_ctx(&item_ctx);
+
+    let result = execute_from(&pipeline.tasks, input, 0, &item_env).await;
 
     // Best-effort status marking — don't shadow the pipeline result.
     if let Some(data_id) = &data_id {
@@ -1041,6 +1139,33 @@ struct ExecEnv<'a> {
     task_subtokens: &'a [ProgressToken],
     /// Pipeline-wide rate limiter; per-task limiters override it.
     rate_limiter: Option<&'a Arc<dyn RateLimiter>>,
+}
+
+impl<'a> ExecEnv<'a> {
+    /// Re-borrow this env against a different [`TaskContext`], keeping every
+    /// other (run-constant) field. Used by [`execute_one_item`] to install the
+    /// per-item context that carries `PipelineContext::current_data`.
+    ///
+    /// The returned env has the shorter lifetime `'b` of the borrowed context;
+    /// all other `&'a` fields shrink to `'b` by covariance.
+    fn with_ctx<'b>(&self, ctx: &'b Arc<TaskContext>) -> ExecEnv<'b>
+    where
+        'a: 'b,
+    {
+        ExecEnv {
+            policy: self.policy,
+            default_batch_size: self.default_batch_size,
+            pipeline_id: self.pipeline_id,
+            pipeline_name: self.pipeline_name,
+            total_tasks: self.total_tasks,
+            ctx,
+            watcher: self.watcher,
+            data_id_fn: self.data_id_fn,
+            run_info: self.run_info,
+            task_subtokens: self.task_subtokens,
+            rate_limiter: self.rate_limiter,
+        }
+    }
 }
 /// Depth-first pipeline executor.
 ///
@@ -1212,11 +1337,17 @@ fn execute_from<'a>(
 /// - Otherwise execute each item individually through `execute_from`, collecting
 ///   all outputs.
 ///
-/// **Design note:** batch-dispatched tasks bypass [`call_with_retry`] — there
-/// are no retries, no per-task watcher events, and no provenance stamping.
-/// Batch tasks receive pre-accumulated slices and are expected to handle their
-/// own error semantics. Only single-value tasks executed via [`execute_from`]
-/// get the full retry / watcher / provenance treatment.
+/// **Design note:** batch-dispatched tasks bypass [`call_with_retry`], and with
+/// it *six* executor services — there are no retries, no per-task watcher
+/// events, no provenance stamping, no rate-limiter acquisition, no
+/// progress-subtoken completion, and no cancellation check. Batch tasks receive
+/// pre-accumulated slices and are expected to handle their own error semantics.
+/// Only single-value tasks executed via [`execute_from`] get the full treatment.
+///
+/// This doc comment is the code-side summary; the authoritative version, with
+/// the reasoning for each of the six, is the module documentation:
+/// [Batch dispatch bypasses executor services](crate::pipeline#batch-dispatch-bypasses-executor-services).
+/// Keep the two in sync.
 fn dispatch_batch<'a>(
     batch: Vec<Box<dyn Value>>,
     tail: &'a [TaskInfo],
@@ -1411,10 +1542,12 @@ async fn call_with_retry(
     let max_attempts = env.policy.max_attempts();
     let mut last_error: Option<TaskError> = None;
 
-    // Inject the task-specific progress subtoken and current data.
+    // Inject the task-specific progress subtoken. `current_data` is *not* set
+    // here: it is pinned to the original data item once per item in
+    // `execute_one_item` (Python's `ctx.data_item`), so overwriting it with this
+    // task's input would make it mean "previous task's output" instead.
     let subtoken = env.task_subtokens[task_index].clone();
-    let scoped_ctx = env.ctx.with_progress(subtoken);
-    let task_ctx = scoped_ctx.with_current_data(input.clone());
+    let task_ctx = env.ctx.with_progress(subtoken);
 
     // Resolve identity once (outside the retry loop) — per locked
     // decision 7, task lifecycle events fire once per task, not per
@@ -1728,6 +1861,26 @@ mod tests {
         })
     }
 
+    /// Like [`stub_ctx`], but with a `PipelineContext` attached so tasks can call
+    /// `ctx.pipeline()`. Uses the shared
+    /// [`PipelineContext::for_test`](crate::task_context::PipelineContext::for_test)
+    /// fixture rather than another hand-written struct literal.
+    async fn stub_ctx_with_pipeline(pipeline_name: &str) -> Arc<TaskContext> {
+        let pipeline_ctx = crate::task_context::PipelineContext::for_test(pipeline_name);
+        let ctx = stub_ctx().await;
+        Arc::new(TaskContext {
+            thread_pool: Arc::clone(&ctx.thread_pool),
+            database: Arc::clone(&ctx.database),
+            graph_db: Arc::clone(&ctx.graph_db),
+            vector_db: Arc::clone(&ctx.vector_db),
+            cancellation: ctx.cancellation.clone(),
+            progress: ctx.progress.clone(),
+            pipeline_ctx: Some(pipeline_ctx),
+            exec_status: Arc::clone(&ctx.exec_status),
+            pipeline_watcher: None,
+        })
+    }
+
     #[test]
     fn pipeline_run_info_elapsed_seconds_returns_none_before_completion() {
         let info = PipelineRunInfo {
@@ -1805,6 +1958,329 @@ mod tests {
         let result = (*outputs[0]).as_any().downcast_ref::<i32>().unwrap();
         assert_eq!(*result, 42);
         assert_eq!(counter.load(Ordering::SeqCst), 3);
+    }
+
+    /// Read `ctx.pipeline().current_data` as an `i32`, panicking if absent.
+    ///
+    /// Shared by every `current_data_*` test below. Panicking (rather than
+    /// returning `Option`) is deliberate: if a refactor threads the root `env`
+    /// into a dispatch site, `current_data` becomes `None`, and these tests must
+    /// then fail loudly instead of silently skipping their assertion.
+    fn observed_current_data(ctx: &Arc<TaskContext>) -> i32 {
+        ctx.pipeline()
+            .current_data
+            .as_ref()
+            .and_then(|v| (**v).as_any().downcast_ref::<i32>().copied())
+            .expect("current_data is pinned per item by execute_one_item")
+    }
+
+    /// `PipelineContext::current_data` must hold the **original** value that
+    /// entered the pipeline for this item, not the upstream task's output —
+    /// Python's `ctx.data_item` semantics. See `execute_one_item`.
+    #[tokio::test]
+    async fn current_data_is_the_original_item_not_the_previous_output() {
+        use std::sync::Mutex;
+
+        // Records what each task observed in `ctx.pipeline().current_data`.
+        let seen: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let record = |seen: Arc<Mutex<Vec<i32>>>| {
+            Task::sync_typed(
+                move |x: &i32, ctx: Arc<TaskContext>| -> Result<Box<i32>, TaskError> {
+                    seen.lock().unwrap().push(observed_current_data(&ctx));
+                    Ok(Box::new(*x + 1))
+                },
+            )
+        };
+
+        // Task 0 rewrites the value so a stale `current_data` would be visible
+        // to tasks 1 and 2 as `700` / `701` rather than the original `7`.
+        let rewrite = Task::sync_typed(|x: &i32, _ctx| -> Result<Box<i32>, TaskError> {
+            Ok(Box::new(*x * 100))
+        });
+
+        let pipeline = Pipeline::new("current_data pipeline")
+            .with_task(rewrite)
+            .with_task(record(Arc::clone(&seen)))
+            .with_task(record(Arc::clone(&seen)));
+
+        let ctx = stub_ctx_with_pipeline("test").await;
+
+        let inputs: Vec<Arc<dyn Value>> = vec![Arc::new(7_i32)];
+        let outputs = execute(&pipeline, inputs, ctx, &NoopWatcher).await.unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![7, 7],
+            "tasks at index 1 and 2 must both see the original pipeline input"
+        );
+    }
+
+    /// Batch tasks are dispatched via `dispatch_batch` with the per-item env, so
+    /// they inherit the same `current_data` as single-value tasks.
+    #[tokio::test]
+    async fn current_data_is_inherited_by_batch_tasks() {
+        use std::sync::Mutex;
+
+        let seen: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = Arc::clone(&seen);
+
+        // Fan the single input out into three items so the next task is reached
+        // through `process_iter` → `dispatch_batch`.
+        let fan_out = Task::sync_iter_typed(|x: &i32, _ctx| {
+            let x = *x;
+            Ok((0..3).map(move |i| Box::new(x + i)))
+        });
+        // Raw `sync_batch` rather than `sync_batch_typed`: this test only needs
+        // the item count and the context, so there is nothing to downcast and
+        // nothing to gain from the typed variant. (The typed batch constructors
+        // are exercised in `task.rs`.)
+        let collect = Task::sync_batch(
+            move |items: &[Box<dyn Value>],
+                  ctx: Arc<TaskContext>|
+                  -> Result<Arc<dyn Value>, TaskError> {
+                seen_clone.lock().unwrap().push(observed_current_data(&ctx));
+                Ok(Arc::new(items.len() as i32) as Arc<dyn Value>)
+            },
+        );
+
+        let pipeline = Pipeline::new("batch current_data pipeline")
+            .with_task(fan_out)
+            .with_task(collect);
+
+        let ctx = stub_ctx_with_pipeline("test").await;
+        let inputs: Vec<Arc<dyn Value>> = vec![Arc::new(7_i32)];
+        execute(&pipeline, inputs, ctx, &NoopWatcher).await.unwrap();
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![7],
+            "the batch task must see the original pipeline input, not None"
+        );
+    }
+
+    /// The `process_stream` path must preserve `current_data` too: both the
+    /// batch task it dispatches to and the tail task after it see the original
+    /// pipeline input, never a streamed item and never `None`.
+    #[tokio::test]
+    async fn current_data_survives_process_stream_dispatch() {
+        use std::sync::Mutex;
+
+        let seen_batch: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_tail: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
+
+        // Stream out three values *different from* the pipeline input, so a
+        // `current_data` sourced from the streamed item would read 70/71/72.
+        let fan_out = Task::async_stream(|input: Arc<dyn Value>, _ctx| {
+            let x = *(*input).as_any().downcast_ref::<i32>().expect("i32 input");
+            let stream =
+                futures::stream::iter(0..3).map(move |i| Box::new(x * 10 + i) as Box<dyn Value>);
+            Ok(Box::pin(stream) as ValueStream)
+        });
+
+        // Raw `sync_batch` rather than `sync_batch_typed`: this test only needs
+        // the item count and the context, so there is nothing to downcast and
+        // nothing to gain from the typed variant. (The typed batch constructors
+        // are exercised in `task.rs`.)
+        let seen_batch_c = Arc::clone(&seen_batch);
+        let collect = Task::sync_batch(
+            move |items: &[Box<dyn Value>],
+                  ctx: Arc<TaskContext>|
+                  -> Result<Arc<dyn Value>, TaskError> {
+                seen_batch_c
+                    .lock()
+                    .unwrap()
+                    .push(observed_current_data(&ctx));
+                Ok(Arc::new(items.len() as i32) as Arc<dyn Value>)
+            },
+        );
+
+        let seen_tail_c = Arc::clone(&seen_tail);
+        let tail = Task::sync_typed(
+            move |n: &i32, ctx: Arc<TaskContext>| -> Result<Box<i32>, TaskError> {
+                seen_tail_c
+                    .lock()
+                    .unwrap()
+                    .push(observed_current_data(&ctx));
+                Ok(Box::new(*n))
+            },
+        );
+
+        let pipeline = Pipeline::new("stream current_data pipeline")
+            .with_task(fan_out)
+            .with_task(collect)
+            .with_task(tail);
+
+        let ctx = stub_ctx_with_pipeline("test").await;
+        let inputs: Vec<Arc<dyn Value>> = vec![Arc::new(7_i32)];
+        execute(&pipeline, inputs, ctx, &NoopWatcher).await.unwrap();
+
+        assert_eq!(
+            *seen_batch.lock().unwrap(),
+            vec![7],
+            "a batch task fed by process_stream must see the original pipeline input"
+        );
+        assert_eq!(
+            *seen_tail.lock().unwrap(),
+            vec![7],
+            "the task after the batch must still see the original pipeline input"
+        );
+    }
+
+    /// With `concurrency > 1`, several items are in flight against the *same*
+    /// task objects. Each task invocation must see **its own** item's original
+    /// input — never another item's. This is the case that would misattribute
+    /// provenance / ownership across documents.
+    #[tokio::test]
+    async fn current_data_is_isolated_per_item_under_concurrency() {
+        use std::sync::Mutex;
+
+        const ITEMS: i32 = 6;
+
+        // Records (this task's input, observed current_data) pairs.
+        let pairs: Arc<Mutex<Vec<(i32, i32)>>> = Arc::new(Mutex::new(Vec::new()));
+
+        // Rewrite the value *and* await, so the items genuinely interleave: the
+        // sleeps are in reverse order, so completion order differs from start
+        // order and a shared context would cross items over.
+        let rewrite = Task::async_fn(|input: Arc<dyn Value>, _ctx| {
+            let x = *(*input).as_any().downcast_ref::<i32>().expect("i32 input");
+            Box::pin(async move {
+                sleep(Duration::from_millis((ITEMS + 1 - x) as u64 * 5)).await;
+                Ok(Arc::new(x * 100) as Arc<dyn Value>)
+            })
+        });
+
+        let pairs_c = Arc::clone(&pairs);
+        let record = Task::sync_typed(
+            move |x: &i32, ctx: Arc<TaskContext>| -> Result<Box<i32>, TaskError> {
+                pairs_c
+                    .lock()
+                    .unwrap()
+                    .push((*x, observed_current_data(&ctx)));
+                Ok(Box::new(*x))
+            },
+        );
+
+        let pipeline = Pipeline::new("per-item current_data pipeline")
+            .with_concurrency(4)
+            .with_task(rewrite)
+            .with_task(record);
+
+        let ctx = stub_ctx_with_pipeline("test").await;
+        let inputs: Vec<Arc<dyn Value>> =
+            (1..=ITEMS).map(|i| Arc::new(i) as Arc<dyn Value>).collect();
+        execute(&pipeline, inputs, ctx, &NoopWatcher).await.unwrap();
+
+        let recorded = pairs.lock().unwrap().clone();
+        assert_eq!(
+            recorded.len(),
+            ITEMS as usize,
+            "every item must be recorded"
+        );
+        for (task_input, observed) in &recorded {
+            assert_eq!(
+                *task_input,
+                observed * 100,
+                "task saw current_data={observed} while processing {task_input}: \
+                 that is a different item's original input"
+            );
+        }
+
+        // And every original input was observed exactly once.
+        let mut observed: Vec<i32> = recorded.iter().map(|(_, o)| *o).collect();
+        observed.sort_unstable();
+        assert_eq!(observed, (1..=ITEMS).collect::<Vec<_>>());
+    }
+
+    /// The enrichment re-dispatch path (`PassthroughSentinel` on a
+    /// `with_enriches()` task) forwards the original input through a second
+    /// `execute_from` call; that call must keep the per-item `current_data`.
+    #[tokio::test]
+    async fn current_data_survives_enrichment_passthrough() {
+        use std::sync::Mutex;
+
+        let seen: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
+
+        // Rewrite first, so `current_data` (7) is distinguishable from the value
+        // the passthrough forwards (700).
+        let rewrite = Task::sync_typed(|x: &i32, _ctx| -> Result<Box<i32>, TaskError> {
+            Ok(Box::new(*x * 100))
+        });
+
+        let enrich = TaskInfo::new(Task::Sync(Arc::new(|_input: Arc<dyn Value>, _ctx| {
+            Ok(Arc::new(crate::sentinels::PassthroughSentinel) as Arc<dyn Value>)
+        })))
+        .with_enriches();
+
+        let seen_c = Arc::clone(&seen);
+        let record = Task::sync_typed(
+            move |x: &i32, ctx: Arc<TaskContext>| -> Result<Box<i32>, TaskError> {
+                seen_c.lock().unwrap().push(observed_current_data(&ctx));
+                Ok(Box::new(*x))
+            },
+        );
+
+        let pipeline = Pipeline::new("enrichment current_data pipeline")
+            .with_task(rewrite)
+            .with_task(enrich)
+            .with_task(record);
+
+        let ctx = stub_ctx_with_pipeline("test").await;
+        let inputs: Vec<Arc<dyn Value>> = vec![Arc::new(7_i32)];
+        let outputs = execute(&pipeline, inputs, ctx, &NoopWatcher).await.unwrap();
+
+        // Sanity: the passthrough really did forward the rewritten value.
+        assert_eq!(*(*outputs[0]).as_any().downcast_ref::<i32>().unwrap(), 700);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![7],
+            "the task after an enrichment passthrough must see the original input"
+        );
+    }
+
+    /// `Task::parallel` hands each sub-task `Arc::clone(&ctx)`, so every sub-task
+    /// must observe the same per-item `current_data`.
+    #[tokio::test]
+    async fn current_data_is_visible_to_parallel_subtasks() {
+        use std::sync::Mutex;
+
+        let seen: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let rewrite = Task::sync_typed(|x: &i32, _ctx| -> Result<Box<i32>, TaskError> {
+            Ok(Box::new(*x * 100))
+        });
+
+        let record = |seen: Arc<Mutex<Vec<i32>>>| {
+            Task::sync_typed(
+                move |x: &i32, ctx: Arc<TaskContext>| -> Result<Box<i32>, TaskError> {
+                    seen.lock().unwrap().push(observed_current_data(&ctx));
+                    Ok(Box::new(*x))
+                },
+            )
+        };
+
+        let par = TaskInfo::parallel(vec![
+            TaskInfo::new(record(Arc::clone(&seen))),
+            TaskInfo::new(record(Arc::clone(&seen))),
+        ]);
+
+        let pipeline = Pipeline::new("parallel current_data pipeline")
+            .with_task(rewrite)
+            .with_task(par);
+
+        let ctx = stub_ctx_with_pipeline("test").await;
+        let inputs: Vec<Arc<dyn Value>> = vec![Arc::new(7_i32)];
+        execute(&pipeline, inputs, ctx, &NoopWatcher).await.unwrap();
+
+        let mut observed = seen.lock().unwrap().clone();
+        observed.sort_unstable();
+        assert_eq!(
+            observed,
+            vec![7, 7],
+            "both parallel sub-tasks must see the original pipeline input"
+        );
     }
 
     #[tokio::test]
@@ -2932,5 +3408,92 @@ mod tests {
 
         let v = (*outputs[0]).as_any().downcast_ref::<i32>().unwrap();
         assert_eq!(*v, 15);
+    }
+
+    // ── Retention characteristics of the per-item context ────────────────────
+
+    /// A payload that records when it is dropped, so a test can observe
+    /// whether the executor is still holding the pipeline input.
+    struct TrackedPayload {
+        _bytes: Vec<u8>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for TrackedPayload {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Pinning `current_data` per item necessarily keeps the pipeline input
+    /// alive for the whole task chain, even once no task needs it any more.
+    ///
+    /// This is deliberate and matches the reference implementation: Python
+    /// builds one `PipelineContext(data_item=data_item, ...)` per item in
+    /// `run_tasks.py` and holds it across the entire per-item run, so
+    /// `ctx.data_item` is reachable from the last task there too.
+    ///
+    /// The cost is one extra live copy of the input value per in-flight item
+    /// (so × `concurrency`). It matters for pipelines whose *input value*
+    /// owns a large buffer rather than a reference to one — e.g.
+    /// `DataInput::Binary { data: Vec<u8>, .. }`, which the bindings marshal
+    /// into. Such pipelines should stream rather than materialise the payload
+    /// in the input value; the executor cannot release it early without
+    /// giving up the documented `current_data` semantics.
+    #[tokio::test]
+    async fn per_item_context_keeps_the_input_alive_for_the_whole_chain() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Task 0 consumes the payload and returns something small, so nothing
+        // downstream carries the payload forward. The only remaining strong
+        // reference is the one the per-item context holds.
+        let consume = TypedTask::<TrackedPayload, i32>::sync(|p: &TrackedPayload, _ctx| {
+            Ok(Box::new(p._bytes.len() as i32))
+        });
+
+        // Task 1 observes whether the payload is still alive.
+        let seen = Arc::new(std::sync::Mutex::new(None::<bool>));
+        let seen_in_task = Arc::clone(&seen);
+        let dropped_in_task = Arc::clone(&dropped);
+        let observe = TypedTask::<i32, i32>::sync(move |n: &i32, ctx| {
+            let already_dropped = dropped_in_task.load(std::sync::atomic::Ordering::SeqCst);
+            // lock poison is unrecoverable
+            *seen_in_task.lock().unwrap() = Some(already_dropped);
+            // The value is not merely alive, it is reachable as the original item.
+            let cd = ctx
+                .pipeline()
+                .current_data
+                .clone()
+                .expect("current_data is pinned per item by execute_one_item");
+            assert!(
+                (*cd).as_any().downcast_ref::<TrackedPayload>().is_some(),
+                "current_data should still be the original TrackedPayload"
+            );
+            Ok(Box::new(*n))
+        });
+
+        let pipeline = PipelineBuilder::new_with_task("retention", consume)
+            .add_task(observe)
+            .with_name("retention")
+            .build();
+
+        let input: Arc<dyn Value> = Arc::new(TrackedPayload {
+            _bytes: vec![0_u8; 4096],
+            dropped: Arc::clone(&dropped),
+        });
+
+        let ctx = stub_ctx_with_pipeline("retention").await;
+        let watcher = NoopWatcher;
+        execute(&pipeline, vec![input], ctx, &watcher)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(false),
+            "the input must still be alive while a later task runs — that is \
+             what pinning current_data per item means"
+        );
     }
 }

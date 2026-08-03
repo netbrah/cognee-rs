@@ -240,6 +240,13 @@ pub type AsyncStreamBatchFn = Arc<
 /// `&[Box<dyn Value>]` slice of items accumulated up to the task's `batch_size`.
 /// The pipeline executor detects which kind the next task is and routes
 /// accordingly.
+///
+/// **Batch variants are dispatched on a different path** and receive none of six
+/// executor services: retries, per-task watcher events, provenance stamping,
+/// rate limiting, progress-subtoken completion and cancellation checks. (This is
+/// a divergence from Python, which routes every task through `handle_task`
+/// regardless of batching.) See
+/// [Batch dispatch bypasses executor services](crate::pipeline#batch-dispatch-bypasses-executor-services).
 pub enum Task {
     Sync(SyncFn),
     Async(AsyncFn),
@@ -344,6 +351,12 @@ impl Task {
     // ── Raw batch constructors (type-erased &[Box<dyn Value>] in) ─────────────
 
     /// Create a [`Task::SyncBatch`] from a raw closure.
+    ///
+    /// **No executor services:** a batch-dispatched task gets no retries, no
+    /// per-task watcher events, no provenance stamping, no rate-limiter
+    /// acquisition, no progress-subtoken completion and no cancellation check,
+    /// so it must handle its own error semantics. Full rationale:
+    /// [Batch dispatch bypasses executor services](crate::pipeline#batch-dispatch-bypasses-executor-services).
     pub fn sync_batch<F>(f: F) -> Self
     where
         F: for<'a> Fn(&'a [Box<dyn Value>], Arc<TaskContext>) -> Result<Arc<dyn Value>, TaskError>
@@ -355,6 +368,12 @@ impl Task {
     }
 
     /// Create a [`Task::AsyncBatch`] from a raw closure returning a [`BoxFuture`].
+    ///
+    /// **No executor services:** a batch-dispatched task gets no retries, no
+    /// per-task watcher events, no provenance stamping, no rate-limiter
+    /// acquisition, no progress-subtoken completion and no cancellation check,
+    /// so it must handle its own error semantics. Full rationale:
+    /// [Batch dispatch bypasses executor services](crate::pipeline#batch-dispatch-bypasses-executor-services).
     pub fn async_batch<F>(f: F) -> Self
     where
         F: for<'a> Fn(
@@ -369,6 +388,12 @@ impl Task {
     }
 
     /// Create a [`Task::SyncIterBatch`] from a raw closure returning a [`ValueIter`].
+    ///
+    /// **No executor services:** a batch-dispatched task gets no retries, no
+    /// per-task watcher events, no provenance stamping, no rate-limiter
+    /// acquisition, no progress-subtoken completion and no cancellation check,
+    /// so it must handle its own error semantics. Full rationale:
+    /// [Batch dispatch bypasses executor services](crate::pipeline#batch-dispatch-bypasses-executor-services).
     pub fn sync_iter_batch<F>(f: F) -> Self
     where
         F: for<'a> Fn(&'a [Box<dyn Value>], Arc<TaskContext>) -> Result<ValueIter, TaskError>
@@ -380,6 +405,12 @@ impl Task {
     }
 
     /// Create a [`Task::AsyncStreamBatch`] from a raw closure returning a [`ValueStream`].
+    ///
+    /// **No executor services:** a batch-dispatched task gets no retries, no
+    /// per-task watcher events, no provenance stamping, no rate-limiter
+    /// acquisition, no progress-subtoken completion and no cancellation check,
+    /// so it must handle its own error semantics. Full rationale:
+    /// [Batch dispatch bypasses executor services](crate::pipeline#batch-dispatch-bypasses-executor-services).
     pub fn async_stream_batch<F>(f: F) -> Self
     where
         F: for<'a> Fn(&'a [Box<dyn Value>], Arc<TaskContext>) -> Result<ValueStream, TaskError>
@@ -510,6 +541,12 @@ impl Task {
 
     /// Create a [`Task::SyncBatch`] from a typed closure receiving `&[&I]`.
     ///
+    /// **No executor services:** a batch-dispatched task gets no retries, no
+    /// per-task watcher events, no provenance stamping, no rate-limiter
+    /// acquisition, no progress-subtoken completion and no cancellation check,
+    /// so it must handle its own error semantics. Full rationale:
+    /// [Batch dispatch bypasses executor services](crate::pipeline#batch-dispatch-bypasses-executor-services).
+    ///
     /// ```rust,ignore
     /// Task::sync_batch_typed(|chunks: &[&DocumentChunk], ctx| {
     ///     Ok(Box::new(embed_all(chunks)))
@@ -531,6 +568,12 @@ impl Task {
     }
 
     /// Create a [`Task::AsyncBatch`] from a typed closure returning a `'static` future.
+    ///
+    /// **No executor services:** a batch-dispatched task gets no retries, no
+    /// per-task watcher events, no provenance stamping, no rate-limiter
+    /// acquisition, no progress-subtoken completion and no cancellation check,
+    /// so it must handle its own error semantics. Full rationale:
+    /// [Batch dispatch bypasses executor services](crate::pipeline#batch-dispatch-bypasses-executor-services).
     ///
     /// Data needed inside the async block must be copied/cloned before it:
     ///
@@ -562,6 +605,12 @@ impl Task {
     }
 
     /// Create a [`Task::SyncIterBatch`] from a typed closure returning a concrete iterator.
+    ///
+    /// **No executor services:** a batch-dispatched task gets no retries, no
+    /// per-task watcher events, no provenance stamping, no rate-limiter
+    /// acquisition, no progress-subtoken completion and no cancellation check,
+    /// so it must handle its own error semantics. Full rationale:
+    /// [Batch dispatch bypasses executor services](crate::pipeline#batch-dispatch-bypasses-executor-services).
     pub fn sync_iter_batch_typed<I, O, F, Iter>(f: F) -> Self
     where
         I: Value,
@@ -579,6 +628,12 @@ impl Task {
     }
 
     /// Create a [`Task::AsyncStreamBatch`] from a typed closure returning a concrete stream.
+    ///
+    /// **No executor services:** a batch-dispatched task gets no retries, no
+    /// per-task watcher events, no provenance stamping, no rate-limiter
+    /// acquisition, no progress-subtoken completion and no cancellation check,
+    /// so it must handle its own error semantics. Full rationale:
+    /// [Batch dispatch bypasses executor services](crate::pipeline#batch-dispatch-bypasses-executor-services).
     pub fn async_stream_batch_typed<I, O, F, S>(f: F) -> Self
     where
         I: Value,
@@ -615,10 +670,33 @@ impl Task {
 
     /// Borrow-downcast a `Box<dyn Value>` item to `&I`.
     ///
-    /// Used inside typed batch constructors to downcast each slice element.
-    fn borrow_item<I: Value>(item: &dyn Value) -> &I {
+    /// Used inside typed batch constructors to downcast each element of the
+    /// `&[Box<dyn Value>]` slice the executor hands to a batch task.
+    ///
+    /// Takes `&Box<dyn Value>` rather than `&dyn Value` on purpose: the deref
+    /// to the inner trait object has to happen *here*, because every caller
+    /// iterates a `&[Box<dyn Value>]` and so holds a `&Box<dyn Value>`. With a
+    /// `&dyn Value` parameter that reference silently unsize-coerces to a
+    /// trait object pointing at the *`Box`* — which implements `Value` itself
+    /// via the blanket impl — and the downcast then tests the `Box`'s type
+    /// instead of its contents, returning `None` for every well-formed batch.
+    /// Centralising the deref makes that mistake unrepresentable at the call
+    /// sites. Compare [`Self::borrow_input`], which does the same for `Arc`.
+    ///
+    /// Panics on type mismatch — a mismatch means the pipeline was assembled
+    /// with incompatible task types (programming error).
+    #[allow(
+        clippy::borrowed_box,
+        reason = "the &Box is load-bearing: it forces the deref to the inner \
+                  dyn Value to happen here rather than at each call site, where \
+                  omitting it silently downcasts the Box instead of its contents"
+    )]
+    fn borrow_item<I: Value>(item: &Box<dyn Value>) -> &I {
         let type_name = std::any::type_name::<I>();
-        item.as_any()
+        // Explicit deref through Box to reach the inner `dyn Value`, then call
+        // `as_any` via vtable dispatch — see the note above.
+        (**item)
+            .as_any()
             .downcast_ref::<I>()
             .unwrap_or_else(|| panic!("Batch item type mismatch: expected {type_name}"))
     }
@@ -728,6 +806,9 @@ pub struct TaskInfo {
     pub name: Option<String>,
     /// Overrides the pipeline-level `batch_size` for this task.
     /// `None` → inherit `pipeline.batch_size`.
+    ///
+    /// Read by the executor for every kind of task, not only `*Batch` variants —
+    /// see [`TaskInfo::with_batch_size`].
     pub batch_size: Option<usize>,
     /// Template for a human-readable result summary recorded as a tracing span
     /// attribute when the `telemetry` feature is enabled.
@@ -771,6 +852,27 @@ impl TaskInfo {
         self
     }
 
+    /// Override how many items the executor accumulates from an upstream
+    /// iterator / stream before dispatching them to **this** task.
+    ///
+    /// This applies whatever kind this task is — not only to `*Batch` variants.
+    /// The executor reads the *consuming* task's `batch_size` unconditionally to
+    /// size its accumulation buffer:
+    ///
+    /// - a `*Batch` variant then receives the whole buffer as one slice;
+    /// - a non-batch variant receives the buffered items one at a time, after the
+    ///   buffer has filled.
+    ///
+    /// So setting this on a non-batch task is **not** a no-op: it changes how many
+    /// upstream items are held in memory at once, and therefore peak memory —
+    /// which matters on the edge targets this port serves.
+    ///
+    /// `None` (the default) inherits
+    /// [`Pipeline::with_batch_size`](crate::pipeline::Pipeline::with_batch_size).
+    ///
+    /// When this task *is* a `*Batch` variant it is additionally dispatched off
+    /// the executor's service path; see
+    /// [Batch dispatch bypasses executor services](crate::pipeline#batch-dispatch-bypasses-executor-services).
     pub fn with_batch_size(mut self, size: usize) -> Self {
         assert!(size > 0, "batch_size must be > 0");
         self.batch_size = Some(size);
@@ -807,9 +909,15 @@ impl TaskInfo {
 
     /// Set a per-task rate limiter, overriding the pipeline-level one.
     ///
-    /// When set, every attempt inside `call_with_retry` (and every batch call
-    /// in `dispatch_batch`) acquires a token from this limiter before calling
-    /// the task. `None` inherits the pipeline-level limiter.
+    /// When set, every attempt inside `call_with_retry` acquires a token from
+    /// this limiter before calling the task. `None` inherits the pipeline-level
+    /// limiter.
+    ///
+    /// **Batch calls are not throttled today.** If this task is a `*Batch`
+    /// variant, `dispatch_batch` invokes it directly without acquiring the
+    /// limiter — the effective limiter is threaded only into `call_with_retry` —
+    /// so setting this on a batch task currently has no effect. See
+    /// [Batch dispatch bypasses executor services](crate::pipeline#batch-dispatch-bypasses-executor-services).
     pub fn with_rate_limiter(mut self, rl: Arc<dyn RateLimiter>) -> Self {
         self.rate_limiter = Some(rl);
         self
@@ -970,6 +1078,12 @@ impl<I: Value, O: Value> TypedTask<I, O> {
     }
 
     /// Create a [`TypedTask::SyncBatch`] from a typed closure `&[&I] → Result<Box<O>, TaskError>`.
+    ///
+    /// **No executor services:** a batch-dispatched task gets no retries, no
+    /// per-task watcher events, no provenance stamping, no rate-limiter
+    /// acquisition, no progress-subtoken completion and no cancellation check,
+    /// so it must handle its own error semantics. Full rationale:
+    /// [Batch dispatch bypasses executor services](crate::pipeline#batch-dispatch-bypasses-executor-services).
     pub fn sync_batch<F>(f: F) -> Self
     where
         F: for<'a> Fn(&'a [&'a I], Arc<TaskContext>) -> Result<Box<O>, TaskError>
@@ -981,6 +1095,12 @@ impl<I: Value, O: Value> TypedTask<I, O> {
     }
 
     /// Create a [`TypedTask::AsyncBatch`] from a typed closure returning a `'static` future.
+    ///
+    /// **No executor services:** a batch-dispatched task gets no retries, no
+    /// per-task watcher events, no provenance stamping, no rate-limiter
+    /// acquisition, no progress-subtoken completion and no cancellation check,
+    /// so it must handle its own error semantics. Full rationale:
+    /// [Batch dispatch bypasses executor services](crate::pipeline#batch-dispatch-bypasses-executor-services).
     pub fn async_batch<F>(f: F) -> Self
     where
         F: for<'a> Fn(
@@ -995,6 +1115,12 @@ impl<I: Value, O: Value> TypedTask<I, O> {
     }
 
     /// Create a [`TypedTask::SyncIterBatch`] from a typed closure returning a concrete iterator.
+    ///
+    /// **No executor services:** a batch-dispatched task gets no retries, no
+    /// per-task watcher events, no provenance stamping, no rate-limiter
+    /// acquisition, no progress-subtoken completion and no cancellation check,
+    /// so it must handle its own error semantics. Full rationale:
+    /// [Batch dispatch bypasses executor services](crate::pipeline#batch-dispatch-bypasses-executor-services).
     pub fn sync_iter_batch<F, Iter>(f: F) -> Self
     where
         F: for<'a> Fn(&'a [&'a I], Arc<TaskContext>) -> Result<Iter, TaskError>
@@ -1010,6 +1136,12 @@ impl<I: Value, O: Value> TypedTask<I, O> {
     }
 
     /// Create a [`TypedTask::AsyncStreamBatch`] from a typed closure returning a concrete stream.
+    ///
+    /// **No executor services:** a batch-dispatched task gets no retries, no
+    /// per-task watcher events, no provenance stamping, no rate-limiter
+    /// acquisition, no progress-subtoken completion and no cancellation check,
+    /// so it must handle its own error semantics. Full rationale:
+    /// [Batch dispatch bypasses executor services](crate::pipeline#batch-dispatch-bypasses-executor-services).
     pub fn async_stream_batch<F, S>(f: F) -> Self
     where
         F: for<'a> Fn(&'a [&'a I], Arc<TaskContext>) -> Result<S, TaskError>
@@ -1339,5 +1471,136 @@ mod tests {
             assert!(labels.contains("Generator"));
             assert!(labels.contains("Async Generator"));
         }
+    }
+
+    // ── Typed batch constructors must observe their own items ────────────────
+    //
+    // Regression guard for `Task::borrow_item`, which downcast the
+    // `Box<dyn Value>` wrapper instead of its contents and therefore panicked
+    // with "Batch item type mismatch" on every non-empty batch — taking all
+    // four `*_batch_typed` constructors, and the four `TypedTask::*_batch`
+    // constructors that delegate to them, down with it.
+    //
+    // The defect survived because the pre-existing batch tests only assert
+    // `python_task_type()` labels and never read the slice. Every test below
+    // fails against the unfixed helper.
+
+    fn boxed_ints(values: &[i32]) -> Vec<Box<dyn Value>> {
+        values
+            .iter()
+            .map(|v| Box::new(*v) as Box<dyn Value>)
+            .collect()
+    }
+
+    /// Deref through the `Arc` before `as_any` — see `Task::borrow_input`.
+    fn arc_as_i32(value: &Arc<dyn Value>) -> i32 {
+        *(**value).as_any().downcast_ref::<i32>().unwrap()
+    }
+
+    /// Deref through the `Box` before `as_any` — the same hazard this fix is
+    /// about. Takes the box by value because that is what iter/stream outputs
+    /// yield; `&Box<dyn Value>` would be the shape `borrow_item` needs, but
+    /// here it would only earn a `clippy::borrowed_box` warning.
+    fn boxed_as_i32(value: Box<dyn Value>) -> i32 {
+        *(*value).as_any().downcast_ref::<i32>().unwrap()
+    }
+
+    #[tokio::test]
+    async fn sync_batch_typed_reads_its_items() {
+        let task = Task::sync_batch_typed(|items: &[&i32], _ctx| {
+            Ok(Box::new(items.iter().map(|v| **v).sum::<i32>()))
+        });
+        let batch = boxed_ints(&[1, 2, 4]);
+
+        let result = match task.call_batch(&batch, stub_ctx().await) {
+            TaskCall::Sync(r) => r.unwrap(),
+            _ => panic!("sync_batch should produce the Sync variant"),
+        };
+
+        assert_eq!(arc_as_i32(&result), 7);
+    }
+
+    #[tokio::test]
+    async fn async_batch_typed_reads_its_items() {
+        let task = Task::async_batch_typed(|items: &[&i32], _ctx| {
+            let sum: i32 = items.iter().map(|v| **v).sum();
+            Box::pin(async move { Ok(Box::new(sum)) })
+        });
+        let batch = boxed_ints(&[3, 5]);
+
+        let result = match task.call_batch(&batch, stub_ctx().await) {
+            TaskCall::Async(fut) => fut.await.unwrap(),
+            _ => panic!("async_batch should produce the Async variant"),
+        };
+
+        assert_eq!(arc_as_i32(&result), 8);
+    }
+
+    #[tokio::test]
+    async fn sync_iter_batch_typed_reads_its_items() {
+        let task = Task::sync_iter_batch_typed(|items: &[&i32], _ctx| {
+            let doubled: Vec<Box<i32>> = items.iter().map(|v| Box::new(**v * 2)).collect();
+            Ok(doubled.into_iter())
+        });
+        let batch = boxed_ints(&[1, 2, 3]);
+
+        let iter = match task.call_batch(&batch, stub_ctx().await) {
+            TaskCall::SyncIter(r) => r.unwrap(),
+            _ => panic!("sync_iter_batch should produce the SyncIter variant"),
+        };
+
+        let out: Vec<i32> = iter.map(boxed_as_i32).collect();
+        assert_eq!(out, vec![2, 4, 6]);
+    }
+
+    #[tokio::test]
+    async fn async_stream_batch_typed_reads_its_items() {
+        let task = Task::async_stream_batch_typed(|items: &[&i32], _ctx| {
+            let tripled: Vec<Box<i32>> = items.iter().map(|v| Box::new(**v * 3)).collect();
+            Ok(futures::stream::iter(tripled))
+        });
+        let batch = boxed_ints(&[1, 2]);
+
+        let stream = match task.call_batch(&batch, stub_ctx().await) {
+            TaskCall::AsyncStream(r) => r.unwrap(),
+            _ => panic!("async_stream_batch should produce the AsyncStream variant"),
+        };
+
+        let out: Vec<i32> = stream.map(boxed_as_i32).collect().await;
+        assert_eq!(out, vec![3, 6]);
+    }
+
+    #[tokio::test]
+    async fn typed_task_batch_reads_its_items_through_the_from_impl() {
+        // `TypedTask::sync_batch` erases via `From<TypedTask<I, O>> for Task`,
+        // which routes through `sync_batch_typed` and hence `borrow_item`.
+        let typed: TypedTask<i32, i32> = TypedTask::sync_batch(|items: &[&i32], _ctx| {
+            Ok(Box::new(items.iter().map(|v| **v).max().unwrap_or(0)))
+        });
+        let task = Task::from(typed);
+        let batch = boxed_ints(&[7, 42, 13]);
+
+        let result = match task.call_batch(&batch, stub_ctx().await) {
+            TaskCall::Sync(r) => r.unwrap(),
+            _ => panic!("sync_batch should produce the Sync variant"),
+        };
+
+        assert_eq!(arc_as_i32(&result), 42);
+    }
+
+    #[tokio::test]
+    async fn batch_typed_still_panics_on_a_genuine_type_mismatch() {
+        // The deref fix must not weaken the mismatch guard: a batch whose
+        // items really are the wrong type still has to panic.
+        let task = Task::sync_batch_typed(|items: &[&i32], _ctx| Ok(Box::new(items.len() as i32)));
+        let batch: Vec<Box<dyn Value>> = vec![Box::new("not an i32".to_string())];
+        let ctx = stub_ctx().await;
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            task.call_batch(&batch, ctx);
+        }))
+        .is_err();
+
+        assert!(panicked, "a genuinely mismatched batch item must panic");
     }
 }
