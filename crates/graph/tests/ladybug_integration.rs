@@ -57,6 +57,7 @@ ladybug_test!(test_get_edges);
 ladybug_test!(test_get_neighbors);
 ladybug_test!(test_get_connections);
 ladybug_test!(test_get_graph_data);
+ladybug_test!(test_get_graph_data_surfaces_created_at);
 ladybug_test!(test_get_graph_metrics);
 ladybug_test!(test_get_filtered_graph_data);
 ladybug_test!(test_get_nodeset_subgraph_or);

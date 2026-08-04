@@ -776,3 +776,105 @@ fn schema_data_is_passed_through() {
     let result = preprocess(vec![], vec![], Some(schema.clone()));
     assert_eq!(result.schema_data, Some(schema));
 }
+
+/// The Schema tab's field selection must surface *database* properties, not the
+/// renderer's own derived keys.
+///
+/// Python's `extract_type_schema_fields` orders equally-prevalent non-preferred
+/// fields by `Counter.most_common()`, whose tie-break is first-seen key order —
+/// i.e. the order the keys appear while iterating each node dict. In Python that
+/// order is "database properties (JSON-blob order), then the keys `preprocess()`
+/// appends", so a `document_id` at 100% coverage always beats the `degree`
+/// stamped afterwards.
+///
+/// Rust reproduces the *grouping* by inserting the adapter's properties before
+/// any derived key, which only holds when `serde_json::Map` is insertion-ordered.
+/// Without the `preserve_order` feature declared in this crate's `Cargo.toml`,
+/// `Map` is a `BTreeMap`, every key is globally alphabetical, and `degree` /
+/// `importance` displace `document_id` / `version` on the type card. The two
+/// expected lists below are the Python-observed ones.
+#[test]
+fn type_card_fields_prefer_database_properties_over_derived_keys() {
+    // Only `chunk_index` / `document_id` (chunk) and `version` (document) are
+    // non-preferred, non-excluded database properties, so the remaining slots
+    // are exactly where a derived key could wrongly win.
+    let result = preprocess(
+        vec![
+            node(
+                "chunk-1",
+                json!({
+                    "type": "DocumentChunk",
+                    "name": "alice.md#0",
+                    "text": "Alice knows Bob.",
+                    "chunk_index": 0,
+                    "document_id": "doc-1",
+                    "source_task": "extract_chunks_from_documents",
+                    "source_pipeline": "cognify_pipeline",
+                    "topological_rank": 2,
+                }),
+            ),
+            node(
+                "doc-1",
+                json!({
+                    "type": "TextDocument",
+                    "name": "alice.md",
+                    "version": 1,
+                    "source_task": "resolve_data_directories",
+                    "source_pipeline": "cognify_pipeline",
+                    "topological_rank": 1,
+                }),
+            ),
+        ],
+        vec![edge("doc-1", "chunk-1", "contains", json!({}))],
+        None,
+    );
+
+    let card_fields = |type_name: &str| -> Vec<String> {
+        result.schema_graph["nodes"]
+            .as_array()
+            .expect("schema graph nodes array")
+            .iter()
+            .find(|node| node["id"] == json!(format!("type:{type_name}")))
+            .unwrap_or_else(|| panic!("no type card for {type_name}"))["fields"]
+            .as_array()
+            .expect("fields array")
+            .iter()
+            .map(|field| {
+                field["name"]
+                    .as_str()
+                    .expect("field name is a string")
+                    .to_string()
+            })
+            .collect()
+    };
+
+    assert_eq!(
+        card_fields("DocumentChunk"),
+        [
+            "count",
+            // `preferred_fields`, in the whitelist's own order.
+            "source_task",
+            "source_pipeline",
+            "topological_rank",
+            // …then the database properties. `degree` sorts between these two
+            // alphabetically, which is exactly what must not happen.
+            "chunk_index",
+            "document_id",
+        ],
+        "DocumentChunk type card must read like Python's"
+    );
+    assert_eq!(
+        card_fields("TextDocument"),
+        [
+            "count",
+            "source_task",
+            "source_pipeline",
+            "topological_rank",
+            // The document's single remaining database property…
+            "version",
+            // …and only then the first derived key, as Python has it.
+            "is_memory_learning",
+        ],
+        "TextDocument type card must read like Python's"
+    );
+}

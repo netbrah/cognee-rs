@@ -306,6 +306,88 @@ async fn render_contains_d3_script_tag_and_all_four_tabs() {
     }
 }
 
+/// Pull the compact JSON literal a vendored chunk assigns to `prefix`.
+///
+/// `safe_json_embed` emits single-line JSON, so the payload is the remainder of
+/// the declaration line minus the trailing `;`.
+fn embedded_json(html: &str, prefix: &str) -> serde_json::Value {
+    let line = html
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with(prefix))
+        .unwrap_or_else(|| panic!("no line starting with `{prefix}`"));
+    let literal = line[prefix.len()..].trim().trim_end_matches(';');
+    serde_json::from_str(literal)
+        .unwrap_or_else(|e| panic!("`{prefix}` payload is not valid JSON: {e}\n{literal}"))
+}
+
+/// Regression: a payload that *contains* a token name must not be rewritten.
+///
+/// `no_token_placeholders_leak` cannot catch this — its fixtures carry no token
+/// text, so nothing is there to be corrupted. Sequential `String::replace` over
+/// the whole document rewrote the `__SCHEMA_GRAPH_DATA__` / `__MEMORY_DATA__`
+/// literals *inside* the already-embedded node JSON, which broke the JSON (
+/// `expected ',' or '}'`) and blanked every tab. This crate's own
+/// `assets/README.md` quotes those token names, so cognifying this repository
+/// was enough to trigger it.
+#[tokio::test]
+async fn payload_containing_token_names_survives_verbatim() {
+    // Two tokens that are substituted *after* `__NODES_DATA__`, plus one from
+    // the JS-chunk phase for good measure.
+    const TEXT: &str = "the tokens __SCHEMA_GRAPH_DATA__, __MEMORY_DATA__ and \
+                        __SEMANTIC_LAYOUT_JS__ are documented in assets/README.md";
+
+    let db = MockGraphDB::new();
+    db.add_node_raw(serde_json::json!({
+        "id": "readme",
+        "type": "DocumentChunk",
+        "name": "assets/README.md",
+        "text": TEXT,
+        "chunk_index": 0,
+    }))
+    .await
+    .expect("add readme chunk");
+    db.add_node_raw(serde_json::json!({"id": "e", "type": "Entity", "name": "Token"}))
+        .await
+        .expect("add entity");
+    db.add_edge("readme", "e", "contains", None)
+        .await
+        .expect("add edge");
+
+    let html = render(&db).await.expect("render token-quoting graph");
+
+    // 1) The node payload must still be parseable JSON…
+    let nodes = embedded_json(&html, "var nodes = ");
+    // …and the text must have survived byte-for-byte.
+    let readme = nodes
+        .as_array()
+        .expect("nodes payload is an array")
+        .iter()
+        .find(|node| node["id"] == "readme")
+        .expect("readme node in payload");
+    assert_eq!(
+        readme["text"].as_str(),
+        Some(TEXT),
+        "node text was rewritten by a later token substitution"
+    );
+
+    // 2) The tokens that follow `__NODES_DATA__` must still have been filled in
+    //    their own slots — the fix must not stop substituting, only stop
+    //    re-scanning.
+    assert!(
+        embedded_json(&html, "const memoryMap = ").is_object(),
+        "`__MEMORY_DATA__` slot did not resolve to a JSON object"
+    );
+    assert!(
+        embedded_json(&html, "const schemaGraphData = ").is_object(),
+        "`__SCHEMA_GRAPH_DATA__` slot did not resolve to a JSON object"
+    );
+    assert!(
+        html.contains("window._semanticPositions = null;"),
+        "`__SEMANTIC_LAYOUT_JS__` slot did not resolve"
+    );
+}
+
 /// Sanity check on the hand-rolled scanner itself: it must catch a real token and
 /// must not fire on lowercase `__dunder__` text or single-underscore names.
 #[test]

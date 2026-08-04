@@ -110,9 +110,18 @@ pub(crate) fn py_str(value: &Value) -> String {
 
 /// Turn a graph-adapter property map into a JSON object.
 ///
-/// Keys are inserted in sorted order so the emitted JSON is byte-stable even
-/// when `serde_json` is built with `preserve_order` (the source `HashMap` has
-/// no deterministic iteration order, unlike the Python dict this ports).
+/// Keys are inserted in sorted order because `cognee_graph::NodeData` is a
+/// `HashMap` with a randomly seeded hasher: iterating it directly would make the
+/// emitted JSON — and, through `Counter`-style tie-breaks, the Schema tab's field
+/// selection — differ between two runs over the same graph. Python iterates a
+/// `dict` and therefore sees the adapter's own (model-field) order; that residual
+/// divergence is documented on
+/// `schema_graph::extract_type_schema_fields`.
+///
+/// What *is* load-bearing and preserved: these keys land in the object **before**
+/// [`preprocess`] stamps its derived ones (`stage`, `degree`, `importance`, …), so
+/// with `serde_json/preserve_order` enabled a database property always outranks a
+/// renderer internal on a type card, exactly as in Python.
 fn props_to_object(props: HashMap<std::borrow::Cow<'static, str>, Value>) -> Map<String, Value> {
     let mut entries: Vec<(String, Value)> = props
         .into_iter()

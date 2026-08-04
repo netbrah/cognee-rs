@@ -22,7 +22,7 @@ Parity mapping:
 | --- | --- | --- |
 | **Graph** | `views/story_view.js` | Full. Canvas renderer with Story / Flow / Force layouts, quadtree hit-testing, minimap, label budget, density layers, search and hover. The Flow layout keys off the preprocessor's `visual_rank` (the runtime-stamped `topological_rank` when present, otherwise a stage-order fallback). |
 | **Schema** | `views/schema_view.js` + `views/inspector.js` | Full. Ontology diagram of node types in canonical pipeline order, labelled relationship curves, edge-type cards, and a side-panel inspector with type → instance drill-down. Fed by the preprocessor's derived type-schema graph, so it works without any caller-supplied schema. |
-| **Memory** | `views/memory_map.js` | Renders. Deterministic column map: documents (with ordered chunk cells) → entity-type groups → summaries → global context. The timeline rail and retrieval overlay are inert because `__SEARCH_EVENTS__` is empty (see Deferred). |
+| **Memory** | `views/memory_map.js` | Renders. Deterministic column map: documents (with ordered chunk cells) → entity-type groups → summaries → global context, plus the run timeline the preprocessor gap-clusters from each node's `t_created`. Only the *search-retrieval* half of the timeline rail (and the recall overlay) is inert, because `__SEARCH_EVENTS__` is empty (see Deferred). |
 | **Semantic** | `views/semantic_map.js` | Empty state only. See Deferred. |
 
 ## The 20 tokens
@@ -102,8 +102,13 @@ not fully self-contained and degrades offline / on air-gapped edge devices.
   its own best-effort `_semantic_payload` raises, so it is a legal, upstream
   test-passing configuration.
 - **Session events** — `__SEARCH_EVENTS__` is the literal `[]`. There is no Rust
-  counterpart to Python's `visualization/session_events.py`, so the Memory
-  timeline rail and the Semantic recall overlay have nothing to display.
+  counterpart to Python's `visualization/session_events.py`, so the Semantic
+  recall overlay has nothing to display and the Memory timeline rail shows only
+  its run events (`memory_map.js:464-471` concatenates the two sources). The run
+  events themselves are *not* deferred: they are gap-clustered from each node's
+  `t_created`, which the graph adapters surface as the `DataPoint`'s epoch-ms
+  `created_at` (`crates/graph/tests/common/mod.rs::
+  test_get_graph_data_surfaces_created_at` pins that contract).
 - **Subgraph bounding** — Python's `subgraph_data.py` (bounded per-dataset
   subgraph extraction) is not ported; Rust always renders the whole graph
   returned by `get_graph_data()`.

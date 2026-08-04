@@ -30,8 +30,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde_json::{Map, Value, json};
 
-use super::link_relation;
 use super::operations_catalog::{Effect, OPERATIONS, Operation};
+use super::{ENTITY_TYPE_RELATION, link_relation, py_str};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -62,10 +62,6 @@ pub const SCHEMA_MAX_ENTITY_TYPES: usize = 12;
 /// (`preprocessor.py:42`).
 pub const OTHER_ENTITY_TYPES_LABEL: &str = "Other entities";
 
-/// Relationship name of the `Entity -> EntityType` edge used to resolve the
-/// semantic type of extracted entities (`preprocessor.py:471`).
-pub const ENTITY_TYPE_RELATION: &str = "is_a";
-
 /// Internal graph taxonomy types that must not appear as separate type groups
 /// in the schema view (`preprocessor.py:50`).
 ///
@@ -84,45 +80,21 @@ fn is_internal(type_name: &str) -> bool {
 }
 
 // ── Python-semantics helpers ─────────────────────────────────────────────────
+//
+// Python's `str()` and truthiness rules live once, in [`super`]. Two copies of
+// either would have to be hand-synced, and a parity fix applied to only one
+// would silently make the Schema view and the Memory/Story views disagree about
+// the same property — so the two adapters below delegate rather than reimplement.
 
-/// Python truthiness for an optional JSON value.
-///
-/// Reproduces the `x or y` / `if x:` chains the Python source relies on:
-/// `None`, `false`, `0`, `""`, `[]` and `{}` are falsy, everything else truthy.
+/// Python truthiness for an *optional* JSON value — [`super::is_truthy`] with a
+/// missing key folded in as falsy (Python's `node.get(k)` yields `None`).
 fn py_truthy(value: Option<&Value>) -> bool {
-    match value {
-        None | Some(Value::Null) => false,
-        Some(Value::Bool(flag)) => *flag,
-        Some(Value::Number(number)) => number.as_f64().is_none_or(|float| float != 0.0),
-        Some(Value::String(text)) => !text.is_empty(),
-        Some(Value::Array(items)) => !items.is_empty(),
-        Some(Value::Object(map)) => !map.is_empty(),
-    }
+    value.is_some_and(super::is_truthy)
 }
 
 /// Return `value` when it is Python-truthy, so `a or b` chains read naturally.
 fn truthy(value: Option<&Value>) -> Option<&Value> {
-    match value {
-        Some(inner) if py_truthy(Some(inner)) => Some(inner),
-        _ => None,
-    }
-}
-
-/// Python `str(value)` for the scalar shapes the preprocessor emits.
-///
-/// Booleans render as `True`/`False` and `None` as `None`, matching CPython, so
-/// column-type labels built from raw graph properties read identically. Arrays
-/// and objects fall back to compact JSON rather than Python's `repr` — a
-/// deliberate (and practically unreachable) divergence, since only scalar
-/// properties ever reach a `str()` call in the ported code.
-fn py_str(value: &Value) -> String {
-    match value {
-        Value::Null => "None".to_string(),
-        Value::Bool(true) => "True".to_string(),
-        Value::Bool(false) => "False".to_string(),
-        Value::String(text) => text.clone(),
-        other => other.to_string(),
-    }
+    value.filter(|inner| super::is_truthy(inner))
 }
 
 /// Python `round()` — half-way values round to the **even** neighbour.
@@ -346,12 +318,14 @@ fn field_from_column(column: &Value) -> Option<Value> {
 /// properties when no columns are declared.
 ///
 /// Parity note: for the **object**-shaped `columns` payload Python emits fields
-/// in the payload's own key order. `serde_json::Map` only preserves insertion
-/// order when the `preserve_order` feature is enabled — it is in workspace
-/// builds (via `cognee-database`) but not when this crate is built alone, where
-/// the map is key-sorted and the emitted field order can therefore differ from
-/// Python's. The array-shaped payload (what DLT actually writes) is unaffected,
-/// as is every field's name/type/required content.
+/// in the payload's own key order, which requires an insertion-ordered
+/// `serde_json::Map`. That is why this crate declares
+/// `serde_json/preserve_order` itself (`Cargo.toml`) instead of relying on
+/// feature unification to leak it in from `cognee-database` — a `-p
+/// cognee-visualization` build used to key-sort the payload and emit a different
+/// field order than the shipped workspace binary. The array-shaped payload (what
+/// DLT actually writes) is unaffected either way, as is every field's
+/// name/type/required content.
 pub fn extract_schema_fields(node: &Value) -> Vec<Value> {
     let mut fields: Vec<Value> = Vec::new();
     let columns = coerce_json_value(node.get("columns"));
@@ -507,13 +481,32 @@ fn schema_value_type(value: &Value) -> &'static str {
 /// ordered by the `preferred_fields` whitelist and then by descending
 /// prevalence, each labelled `"<value type> <coverage>%"`.
 ///
-/// Parity note: Python's `Counter` tie-break is the order in which the keys were
-/// first seen while iterating the node dicts. `serde_json::Map` is insertion
-/// ordered only when the `preserve_order` feature is enabled (it is, in
-/// workspace builds, via `cognee-database`) and key-sorted otherwise, so the
-/// tie-break between two equally-prevalent non-preferred fields can differ from
-/// Python. Counts, coverage, `required` and the preferred-field ordering are
-/// unaffected.
+/// Parity note — the tie-break, which is observable on every type card. Python's
+/// `Counter.most_common()` breaks ties by the order in which the keys were first
+/// seen while iterating the node dicts, and Python's node dict is
+/// "adapter properties first, then the keys `preprocess()` appends". Two
+/// consequences, in decreasing order of severity:
+///
+/// 1. **Derived keys must never outrank adapter properties.** They do not,
+///    because `super::props_to_object` inserts the adapter's properties before
+///    `preprocess()` stamps `degree`/`importance`/`stage`/… — but only while
+///    `serde_json::Map` is insertion ordered. This crate therefore declares
+///    `serde_json/preserve_order` in its own `Cargo.toml`; without it `Map` is a
+///    `BTreeMap`, *every* key is globally alphabetical, and a `DocumentChunk`
+///    card reads `…, chunk_index, degree` where Python reads
+///    `…, chunk_index, document_id`. `tests/preprocessor_test.rs::
+///    type_card_fields_prefer_database_properties_over_derived_keys` pins this.
+/// 2. **Ties *between* adapter properties are still ordered differently.**
+///    Python sees them in `json.dumps()` (model-field) order; Rust sees them
+///    key-sorted, because `super::props_to_object` must impose *some* order on
+///    a `cognee_graph::NodeData`, which is a `HashMap` with a randomly seeded
+///    hasher. Closing this gap needs an order-preserving `NodeData` across the
+///    workspace, so it is a known, bounded divergence rather than a fixed one: it
+///    can only reshuffle equally-prevalent non-preferred properties among
+///    themselves.
+///
+/// Counts, coverage, `required` and the preferred-field ordering are unaffected
+/// by either.
 fn extract_type_schema_fields(type_nodes: &[&Value]) -> Vec<Value> {
     const PREFERRED_FIELDS: [&str; 8] = [
         "source_task",

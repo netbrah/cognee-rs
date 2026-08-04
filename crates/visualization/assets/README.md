@@ -44,6 +44,13 @@ done
 #   cargo test -p cognee-visualization
 ```
 
+`cargo test -p cognee-visualization` is enough on its own: the crate declares
+every feature its output ordering depends on (notably `serde_json/preserve_order`)
+in its own `Cargo.toml`, so the `-p` build renders the same bytes as the
+workspace binary. It used to inherit `preserve_order` from `cognee-database` by
+feature unification, which made the `-p` build emit a different Schema tab than
+the shipped one.
+
 The orchestrator that stitches these together — the `__TOKEN__` substitutions —
 lives in [`../src/html.rs`](../src/html.rs) and is the *only* Rust code that
 should know about these filenames. `crates/visualization/tests/html_test.rs`

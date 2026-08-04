@@ -206,6 +206,90 @@ async fn dedupe_overlapping_nodes_first_write_wins() {
     );
 }
 
+/// Python's guard is `if not node_info.get("source_user")`, i.e. *truthiness*:
+/// every falsy value is "unlabelled" and gets overwritten with the owning user's
+/// label. A present-but-falsy `source_user` that is left alone stays out of the
+/// `userColors` map, so the node is never coloured in the colour-by-user overlay.
+#[tokio::test]
+async fn falsy_source_user_is_overwritten_with_the_owning_label() {
+    let db = MockGraphDB::new();
+    // Every falsy JSON shape Python's `not` accepts, plus the absent key.
+    for (id, falsy) in [
+        ("empty-string", serde_json::json!("")),
+        ("zero", serde_json::json!(0)),
+        ("zero-float", serde_json::json!(0.0)),
+        ("false", serde_json::json!(false)),
+        ("null", serde_json::Value::Null),
+        ("empty-array", serde_json::json!([])),
+        ("empty-object", serde_json::json!({})),
+    ] {
+        db.add_node_raw(serde_json::json!({
+            "id": id,
+            "type": "Entity",
+            "name": id,
+            "source_user": falsy,
+        }))
+        .await
+        .expect("add falsy node");
+    }
+    db.add_node_raw(serde_json::json!({"id": "absent", "type": "Entity", "name": "absent"}))
+        .await
+        .expect("add node without source_user");
+    // A truthy label must be preserved, not clobbered.
+    db.add_node_raw(serde_json::json!({
+        "id": "already-tagged",
+        "type": "Entity",
+        "name": "already-tagged",
+        "source_user": "carol@example.com",
+    }))
+    .await
+    .expect("add pre-tagged node");
+
+    let pairs: Vec<(String, Arc<dyn GraphDBTrait>)> =
+        vec![("alice@example.com".to_string(), Arc::new(db))];
+    let html = render_multi_user(&pairs).await.expect("render");
+
+    let nodes_json = extract_var(&html, "nodes");
+    let nodes = nodes_json.as_array().expect("nodes is an array");
+    let by_id = |id: &str| {
+        nodes
+            .iter()
+            .find(|node| node.get("id").and_then(|v| v.as_str()) == Some(id))
+            .unwrap_or_else(|| panic!("node {id} present"))
+            .get("source_user")
+            .cloned()
+    };
+
+    for id in [
+        "empty-string",
+        "zero",
+        "zero-float",
+        "false",
+        "null",
+        "empty-array",
+        "empty-object",
+        "absent",
+    ] {
+        assert_eq!(
+            by_id(id),
+            Some(serde_json::json!("alice@example.com")),
+            "falsy/absent source_user on `{id}` must be replaced by the owning label"
+        );
+    }
+    assert_eq!(
+        by_id("already-tagged"),
+        Some(serde_json::json!("carol@example.com")),
+        "a truthy source_user must survive untouched"
+    );
+
+    // The colour map is keyed off the emitted `source_user`, so the owning label
+    // must have earned a palette entry.
+    assert!(
+        html.contains("alice@example.com"),
+        "owning label missing from the rendered payload"
+    );
+}
+
 #[tokio::test]
 async fn dedupe_edges_by_source_target_relation() {
     // Both pairs declare the same edge (a -[knows]-> b). Assert the rendered

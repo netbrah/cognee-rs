@@ -24,6 +24,35 @@ pub type EdgeData = (
     HashMap<Cow<'static, str>, serde_json::Value>,
 );
 
+/// Parse a `created_at` / `updated_at` property into a UTC timestamp for the
+/// adapters' dedicated audit columns.
+///
+/// [`cognee_models::DataPoint`] declares both as `i64` **milliseconds since the
+/// epoch** (matching Python's
+/// `DataPoint.created_at: int = int(datetime.now(timezone.utc).timestamp() * 1000)`),
+/// so the epoch-ms form is the one every real write carries. RFC 3339 strings are
+/// accepted too because hand-rolled node structs — the plain `#[derive(Serialize)]`
+/// structs used by tests and pre-`DataPoint` call sites — emit
+/// `Utc::now().to_rfc3339()`.
+///
+/// Returns `None` when the value is missing or is neither shape, letting the
+/// caller substitute the write time.
+#[cfg(any(feature = "ladybug", feature = "postgres"))]
+pub(crate) fn parse_audit_timestamp(
+    value: Option<&serde_json::Value>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    match value? {
+        // `as_i64` never matches a JSON bool, so `true` cannot become a date.
+        serde_json::Value::Number(number) => {
+            chrono::DateTime::from_timestamp_millis(number.as_i64()?)
+        }
+        serde_json::Value::String(text) => chrono::DateTime::parse_from_rfc3339(text)
+            .ok()
+            .map(|parsed| parsed.with_timezone(&chrono::Utc)),
+        _ => None,
+    }
+}
+
 /// Structured graph edge for easier construction
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphEdge {
@@ -93,5 +122,51 @@ impl From<GraphEdge> for EdgeData {
 impl From<EdgeData> for GraphEdge {
     fn from(edge: EdgeData) -> Self {
         GraphEdge::from_edge_data(edge)
+    }
+}
+
+#[cfg(all(test, any(feature = "ladybug", feature = "postgres")))]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test code — panics are acceptable failures"
+)]
+mod tests {
+    use super::parse_audit_timestamp;
+    use serde_json::json;
+
+    /// Regression: both adapters only tried `as_str().and_then(parse_rfc3339)`,
+    /// so every `DataPoint`-shaped write (epoch-ms `i64`) silently fell back to
+    /// `Utc::now()` and the stored creation time was the write time.
+    #[test]
+    fn epoch_millis_are_accepted() {
+        let parsed = parse_audit_timestamp(Some(&json!(1_768_164_683_000_i64)))
+            .expect("epoch-ms integers must parse");
+        assert_eq!(parsed.timestamp_millis(), 1_768_164_683_000);
+    }
+
+    #[test]
+    fn rfc3339_strings_are_still_accepted() {
+        let parsed = parse_audit_timestamp(Some(&json!("2026-01-11T20:51:23+00:00")))
+            .expect("RFC 3339 strings must keep parsing");
+        assert_eq!(parsed.timestamp_millis(), 1_768_164_683_000);
+    }
+
+    #[test]
+    fn other_shapes_yield_none_so_the_caller_substitutes_now() {
+        for value in [
+            json!(null),
+            // `true` must not become the epoch + 1 ms.
+            json!(true),
+            json!("not a date"),
+            json!(1.5),
+            json!([]),
+        ] {
+            assert!(
+                parse_audit_timestamp(Some(&value)).is_none(),
+                "unexpectedly parsed {value}"
+            );
+        }
+        assert!(parse_audit_timestamp(None).is_none());
     }
 }

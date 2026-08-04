@@ -167,11 +167,15 @@ pub async fn render_multi_user(
             // Mirror Python's `if not node_info.get("source_user"): node_info["source_user"] = user_label`
             // — preserve any pre-existing `source_user` on the node so the
             // owning user's value (if already tagged) survives.
-            let needs_label = match node_info.get("source_user") {
-                Some(serde_json::Value::String(s)) if !s.is_empty() => false,
-                Some(serde_json::Value::Null) | None => true,
-                _ => false,
-            };
+            //
+            // `not x` is Python *truthiness*, so `""`, `0`, `false`, `[]` and
+            // `{}` are all "unlabelled" and must be overwritten just like a
+            // missing key. Getting this wrong left the node's `source_user`
+            // falsy, kept it out of the `userColors` map and left it uncoloured
+            // in the colour-by-user overlay.
+            let needs_label = !node_info
+                .get("source_user")
+                .is_some_and(preprocessor::is_truthy);
             if needs_label {
                 node_info.insert(
                     Cow::Borrowed("source_user"),

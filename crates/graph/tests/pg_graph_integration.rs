@@ -63,6 +63,7 @@ pggraph_test!(test_get_edges);
 pggraph_test!(test_get_neighbors);
 pggraph_test!(test_get_connections);
 pggraph_test!(test_get_graph_data);
+pggraph_test!(test_get_graph_data_surfaces_created_at);
 pggraph_test!(test_get_graph_metrics);
 pggraph_test!(test_get_filtered_graph_data);
 pggraph_test!(test_get_nodeset_subgraph_or);

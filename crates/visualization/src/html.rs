@@ -18,6 +18,24 @@
 //! one line emitted for `__SEMANTIC_LAYOUT_JS__`. Substituting data first would
 //! leave every one of those tokens unresolved in the output.
 //!
+//! # …but each phase is a single left-to-right pass
+//!
+//! Within a phase the substitution must **never re-scan what it just wrote**.
+//! Python gets this for free because `str.replace` is applied to a fresh
+//! template string per token and the payloads land in disjoint slots; a naive
+//! Rust translation (twelve chained `String::replace` calls) does not: the
+//! eleventh call happily rewrites a `__SEARCH_EVENTS__` that the first call
+//! embedded *inside the JSON node data*. That is not hypothetical — a node whose
+//! text quotes this crate's own `assets/README.md` carries the literal token
+//! names, and rewriting them mid-JSON produced `expected ',' or '}'` and a blank
+//! page in every tab.
+//!
+//! [`substitute_once`] therefore walks its input once, copying spans and
+//! appending replacements into a pre-sized `String`. Injected content sits past
+//! the cursor's write position and is never examined again, so a payload may
+//! contain any token name verbatim. It also replaces 20 whole-document copies
+//! with one (tens of MB per render on a large graph).
+//!
 //! Every data token is substituted **unconditionally with a JSON fallback**
 //! (`null`, `{}`, `[]`). A leaked `__TOKEN__` is a hard failure — it renders as
 //! literal garbage inside a `<script>` block and breaks the page — which is why
@@ -49,6 +67,8 @@
 //! With the first two `null`, `views/semantic_map.js` shows its empty state and
 //! the Semantic tab is inert; the Graph, Schema and Memory tabs are fully
 //! functional.
+
+use std::borrow::Cow;
 
 use serde_json::json;
 
@@ -99,51 +119,83 @@ fn safe_json_embed<T: serde::Serialize>(value: &T) -> Result<String, Visualizati
     Ok(raw.replace("</", "<\\/"))
 }
 
+/// Replace every `(token, value)` pair in `source` in **one** left-to-right
+/// pass, so no injected value is ever re-scanned for a later token.
+///
+/// Every token is `__NAME__`, which lets the scan skip ahead on the two-byte
+/// `__` sentinel instead of running one `find` per token per position. Both
+/// bytes around a candidate are ASCII `_`, so every offset used to re-slice
+/// `source` is a UTF-8 boundary.
+///
+/// A token absent from `source` is silently skipped (Python's `str.replace` is
+/// equally forgiving); a token appearing more than once is replaced every time.
+fn substitute_once(source: &str, replacements: &[(&str, Cow<'_, str>)]) -> String {
+    debug_assert!(
+        replacements
+            .iter()
+            .all(|(token, _)| token.starts_with("__") && token.len() > 2),
+        "every token must be a non-empty `__NAME__`, or the scan below cannot advance"
+    );
+
+    // The payloads dwarf the template, so a hint of "template + everything we
+    // are about to inject" keeps this to a single allocation in practice.
+    let injected: usize = replacements.iter().map(|(_, value)| value.len()).sum();
+    let mut out = String::with_capacity(source.len() + injected);
+
+    let mut copied = 0; // everything before this byte is already in `out`
+    let mut scan = 0; // where to look for the next candidate token
+    while let Some(offset) = source[scan..].find("__") {
+        let at = scan + offset;
+        match replacements
+            .iter()
+            .find(|(token, _)| source[at..].starts_with(*token))
+        {
+            Some((token, value)) => {
+                out.push_str(&source[copied..at]);
+                out.push_str(value);
+                copied = at + token.len();
+                scan = copied;
+            }
+            // Not a token (`__proto__`, a `___TOKEN__` typo, …). Step one byte
+            // so a token starting at `at + 1` is still found.
+            None => scan = at + 1,
+        }
+    }
+    out.push_str(&source[copied..]);
+    out
+}
+
 /// Assemble the final HTML from the vendored shell + the preprocessed graph.
 ///
 /// Substitutes all 20 `__TOKEN__` placeholders — the eight JS chunks first, then
 /// the twelve data payloads — mirroring
 /// `cognee_network_visualization.py:136-168` step for step. See the module docs
-/// for why the order matters and which three payloads are deferred.
+/// for why the phase order matters, why each phase is a single pass, and which
+/// three payloads are deferred.
 pub(crate) fn build_html(pre: &PreprocessedGraph) -> Result<String, VisualizationError> {
-    let mut html = HTML_TEMPLATE.to_string();
-
     // 1) JS chunks: ordered so the first script block (ui_chrome + schema) runs
     //    before the main story-view IIFE in the second block. Substituted first
     //    so the data tokens *inside* these chunks get resolved below.
-    html = html.replace("__UI_CHROME_JS__", UI_CHROME_JS);
-    html = html.replace("__SCHEMA_VIEW_JS__", SCHEMA_VIEW_JS);
-    html = html.replace("__STORY_VIEW_JS__", STORY_VIEW_JS);
-    html = html.replace("__PIPELINE_LAYOUT_JS__", PIPELINE_LAYOUT_JS);
-    html = html.replace("__INSPECTOR_JS__", INSPECTOR_JS);
-    html = html.replace("__MEMORY_VIEW_JS__", MEMORY_VIEW_JS);
-    html = html.replace("__SEMANTIC_LAYOUT_JS__", SEMANTIC_LAYOUT_JS);
-    html = html.replace("__SEMANTIC_VIEW_JS__", SEMANTIC_VIEW_JS);
-
-    // 2) Data tokens: substituted last so JSON-embedded `__SCHEMA_GRAPH_DATA__`
-    //    and friends inside the JS chunks above are reached.
-    html = html.replace("__NODES_DATA__", &safe_json_embed(&pre.nodes)?);
-    html = html.replace("__LINKS_DATA__", &safe_json_embed(&pre.links)?);
-    html = html.replace("__TASK_COLORS__", &safe_json_embed(&pre.color_maps.task)?);
-    html = html.replace(
-        "__PIPELINE_COLORS__",
-        &safe_json_embed(&pre.color_maps.pipeline)?,
+    let html = substitute_once(
+        HTML_TEMPLATE,
+        &[
+            ("__UI_CHROME_JS__", Cow::Borrowed(UI_CHROME_JS)),
+            ("__SCHEMA_VIEW_JS__", Cow::Borrowed(SCHEMA_VIEW_JS)),
+            ("__STORY_VIEW_JS__", Cow::Borrowed(STORY_VIEW_JS)),
+            ("__PIPELINE_LAYOUT_JS__", Cow::Borrowed(PIPELINE_LAYOUT_JS)),
+            ("__INSPECTOR_JS__", Cow::Borrowed(INSPECTOR_JS)),
+            ("__MEMORY_VIEW_JS__", Cow::Borrowed(MEMORY_VIEW_JS)),
+            ("__SEMANTIC_LAYOUT_JS__", Cow::Borrowed(SEMANTIC_LAYOUT_JS)),
+            ("__SEMANTIC_VIEW_JS__", Cow::Borrowed(SEMANTIC_VIEW_JS)),
+        ],
     );
-    html = html.replace(
-        "__NODESET_COLORS__",
-        &safe_json_embed(&pre.color_maps.node_set)?,
-    );
-    html = html.replace("__USER_COLORS__", &safe_json_embed(&pre.color_maps.user)?);
 
     // Caller-supplied opaque passthrough; the literal `null` when absent —
     // `schema_view.js:22` reads it as `const schemaData = null`.
-    html = html.replace(
-        "__SCHEMA_DATA__",
-        &match pre.schema_data.as_ref() {
-            Some(v) => safe_json_embed(v)?,
-            None => "null".to_string(),
-        },
-    );
+    let schema_data = match pre.schema_data.as_ref() {
+        Some(value) => safe_json_embed(value)?,
+        None => "null".to_string(),
+    };
 
     // Preprocessor-derived type graph; `{"nodes": [], "links": []}` when the
     // preprocessor produced nothing usable (mirrors Python's
@@ -152,14 +204,11 @@ pub(crate) fn build_html(pre: &PreprocessedGraph) -> Result<String, Visualizatio
         serde_json::Value::Object(map) => map.is_empty(),
         _ => true,
     };
-    html = html.replace(
-        "__SCHEMA_GRAPH_DATA__",
-        &if schema_graph_is_empty {
-            safe_json_embed(&json!({"nodes": [], "links": []}))?
-        } else {
-            safe_json_embed(&pre.schema_graph)?
-        },
-    );
+    let schema_graph = if schema_graph_is_empty {
+        safe_json_embed(&json!({"nodes": [], "links": []}))?
+    } else {
+        safe_json_embed(&pre.schema_graph)?
+    };
 
     // Unconditional JSON-fallback substitutions: a leaked `__MEMORY_DATA__` /
     // `__SEARCH_EVENTS__` token would break the page and fail the
@@ -168,24 +217,50 @@ pub(crate) fn build_html(pre: &PreprocessedGraph) -> Result<String, Visualizatio
         serde_json::Value::Object(map) => map.is_empty(),
         _ => true,
     };
-    html = html.replace(
-        "__MEMORY_DATA__",
-        &if memory_is_empty {
-            safe_json_embed(&json!({}))?
-        } else {
-            safe_json_embed(&pre.memory_map)?
-        },
-    );
-    // Deferred: no session-event source in Rust yet (see module docs).
-    html = html.replace("__SEARCH_EVENTS__", "[]");
+    let memory_data = if memory_is_empty {
+        safe_json_embed(&json!({}))?
+    } else {
+        safe_json_embed(&pre.memory_map)?
+    };
 
-    // Deferred: no readable stored embeddings, hence no projection or
-    // clustering. `null` is the same state Python reaches when its best-effort
-    // `_semantic_payload` raises; `semantic_map.js` renders an empty state.
-    html = html.replace("__SEMANTIC_POSITIONS__", "null");
-    html = html.replace("__SEMANTIC_CLUSTERS__", "null");
-
-    Ok(html)
+    // 2) Data tokens: substituted last so JSON-embedded `__SCHEMA_GRAPH_DATA__`
+    //    and friends inside the JS chunks above are reached. Listed in Python's
+    //    order for reviewability — with a single pass the *within-phase* order is
+    //    no longer load-bearing, which is the point.
+    Ok(substitute_once(
+        &html,
+        &[
+            ("__NODES_DATA__", Cow::Owned(safe_json_embed(&pre.nodes)?)),
+            ("__LINKS_DATA__", Cow::Owned(safe_json_embed(&pre.links)?)),
+            (
+                "__TASK_COLORS__",
+                Cow::Owned(safe_json_embed(&pre.color_maps.task)?),
+            ),
+            (
+                "__PIPELINE_COLORS__",
+                Cow::Owned(safe_json_embed(&pre.color_maps.pipeline)?),
+            ),
+            (
+                "__NODESET_COLORS__",
+                Cow::Owned(safe_json_embed(&pre.color_maps.node_set)?),
+            ),
+            (
+                "__USER_COLORS__",
+                Cow::Owned(safe_json_embed(&pre.color_maps.user)?),
+            ),
+            ("__SCHEMA_DATA__", Cow::Owned(schema_data)),
+            ("__SCHEMA_GRAPH_DATA__", Cow::Owned(schema_graph)),
+            ("__MEMORY_DATA__", Cow::Owned(memory_data)),
+            // Deferred: no session-event source in Rust yet (see module docs).
+            ("__SEARCH_EVENTS__", Cow::Borrowed("[]")),
+            // Deferred: no readable stored embeddings, hence no projection or
+            // clustering. `null` is the same state Python reaches when its
+            // best-effort `_semantic_payload` raises; `semantic_map.js` renders
+            // an empty state.
+            ("__SEMANTIC_POSITIONS__", Cow::Borrowed("null")),
+            ("__SEMANTIC_CLUSTERS__", Cow::Borrowed("null")),
+        ],
+    ))
 }
 
 #[cfg(test)]
@@ -271,6 +346,39 @@ mod tests {
         let out = safe_json_embed(&v).expect("json encode");
         assert!(out.contains("<\\/script>"));
         assert!(!out.contains("</script>"));
+    }
+
+    /// The whole point of the single pass: an injected value that happens to
+    /// contain a *later* token's literal name must survive untouched.
+    #[test]
+    fn substitute_once_never_rescans_injected_values() {
+        let out = substitute_once(
+            "a=__FIRST__ b=__SECOND__",
+            &[
+                ("__FIRST__", Cow::Borrowed("\"quotes __SECOND__ verbatim\"")),
+                ("__SECOND__", Cow::Borrowed("[]")),
+            ],
+        );
+        assert_eq!(out, "a=\"quotes __SECOND__ verbatim\" b=[]");
+    }
+
+    /// `__`-prefixed non-tokens must not shift the scan past a real token, and
+    /// an absent token is a no-op rather than an error.
+    #[test]
+    fn substitute_once_handles_near_misses_and_repeats() {
+        let out = substitute_once(
+            "___X__ __proto__ __X__ __X__ __ABSENT__x",
+            &[("__X__", Cow::Borrowed("!"))],
+        );
+        // `___X__` contains `__X__` starting one byte in, so it becomes `_!`.
+        assert_eq!(out, "_! __proto__ ! ! __ABSENT__x");
+    }
+
+    /// Multi-byte characters around a token must not be split.
+    #[test]
+    fn substitute_once_is_utf8_safe() {
+        let out = substitute_once("héllo __T__ wörld", &[("__T__", Cow::Borrowed("→"))]);
+        assert_eq!(out, "héllo → wörld");
     }
 
     #[test]
