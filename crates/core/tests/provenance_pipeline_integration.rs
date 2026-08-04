@@ -10,13 +10,18 @@
 //! the executor walked every emitted DataPoint and stamped the
 //! pipeline + task names + user label.
 //!
-//! Two variants:
+//! Variants:
 //!
 //! 1. `pipeline_stamps_every_emitted_datapoint` — distinct UUIDs per
 //!    output. The first task that touches each DP wins.
 //! 2. `visited_set_keeps_first_task_attribution` — same UUID survives
 //!    across tasks. Locked decision 2: visited-set short-circuits the
 //!    second task; the first task's name is preserved.
+//! 3. `batch_task_outputs_carry_the_batch_tasks_own_rank` /
+//!    `batch_task_single_output_is_stamped` — a `*_batch` stage's outputs
+//!    are stamped with *that* stage's name and 1-based position, not the
+//!    predecessor's (Python gives every task its own `task_index`,
+//!    `run_tasks_base.py:181-190`).
 //!
 //! These tests do not depend on any specific `RUST_LOG` value — the
 //! pipeline executor stamps independently of the tracing subscriber
@@ -190,5 +195,129 @@ async fn visited_set_keeps_first_task_attribution() {
         Some("emit_chunks"),
         "decision 2: first task to stamp keeps the attribution; \
          clone_chunks must NOT overwrite it"
+    );
+}
+
+// ── Test 3: batch stages get their own task_index, not the producer's ──────
+
+/// A `SyncIterBatch` stage sitting at position 1 (0-based) must stamp the
+/// DataPoints *it* emits with `topological_rank = 2`, not with the rank of
+/// the `emit_chunks` producer that filled its batch. The expected values
+/// here are derived from the static pipeline layout (`emit_chunks` is task 0
+/// → rank 1, `expand_chunks` is task 1 → rank 2), not from anything the
+/// stamping code produced.
+#[tokio::test]
+async fn batch_task_outputs_carry_the_batch_tasks_own_rank() {
+    // What the batch stage observed on its *inputs*, captured from inside the
+    // closure. Proves the producer's rank really is 1, so the rank-2
+    // expectation on the outputs is an independent value and not a tautology.
+    let observed_input_ranks: Arc<Mutex<Vec<Option<i32>>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let task_a = Task::sync_iter_typed(|_input: &i32, _ctx| {
+        let chunks: Vec<Box<DocumentChunk>> = (0..2)
+            .map(|i| Box::new(make_chunk(&format!("src-{i}"))))
+            .collect();
+        Ok(chunks.into_iter())
+    });
+
+    let seen = Arc::clone(&observed_input_ranks);
+    let task_b = Task::sync_iter_batch_typed(move |chunks: &[&DocumentChunk], _ctx| {
+        // Exercises `Task::borrow_item`: a non-empty batch slice must
+        // downcast to the element type, not to `Box<dyn Value>`.
+        assert_eq!(chunks.len(), 2, "both upstream items land in one batch");
+        // lock poison is unrecoverable
+        let mut seen = seen.lock().unwrap();
+        for c in chunks {
+            seen.push(c.base.topological_rank);
+        }
+        // Fresh UUIDs, so the visited-set cannot short-circuit the stamp.
+        let out: Vec<Box<DocumentChunk>> = chunks
+            .iter()
+            .map(|c| Box::new(make_chunk(&format!("expanded-{}", c.text))))
+            .collect();
+        Ok(out.into_iter())
+    });
+
+    let pipeline = Pipeline::new("batch_rank_pipeline")
+        .with_name("batch_rank_pipeline")
+        .with_task(TaskInfo::new(task_a).with_name("emit_chunks"))
+        .with_task(TaskInfo::new(task_b).with_name("expand_chunks"));
+
+    let ctx = build_ctx(pipeline_ctx("batch_rank_pipeline")).await;
+
+    let outputs = execute(&pipeline, vec![Arc::new(0_i32)], ctx, &NoopWatcher)
+        .await
+        .unwrap();
+
+    // lock poison is unrecoverable
+    let input_ranks = observed_input_ranks.lock().unwrap().clone();
+    assert_eq!(
+        input_ranks,
+        vec![Some(1), Some(1)],
+        "the producer at task 0 stamps rank 1 on the items it feeds the batch"
+    );
+
+    assert_eq!(outputs.len(), 2, "one output per batched input");
+    for arc in outputs {
+        let chunk = (*arc).as_any().downcast_ref::<DocumentChunk>().unwrap();
+        assert!(chunk.text.starts_with("expanded-"), "batch stage output");
+        assert_eq!(
+            chunk.base.source_task.as_deref(),
+            Some("expand_chunks"),
+            "a batch stage's output is attributed to the batch stage"
+        );
+        assert_eq!(
+            chunk.base.topological_rank,
+            Some(2),
+            "expand_chunks is task index 1, so its DataPoints carry rank 2 \
+             (not the producer's rank 1)"
+        );
+        assert_eq!(
+            chunk.base.source_pipeline.as_deref(),
+            Some("batch_rank_pipeline")
+        );
+        assert_eq!(chunk.base.source_user.as_deref(), Some("alice@example.com"));
+    }
+}
+
+/// Same expectation for the single-value flavour: a `SyncBatch` stage's one
+/// output is stamped with the batch stage's own name and rank.
+#[tokio::test]
+async fn batch_task_single_output_is_stamped() {
+    let task_a = Task::sync_iter_typed(|_input: &i32, _ctx| {
+        let chunks: Vec<Box<DocumentChunk>> = (0..3)
+            .map(|i| Box::new(make_chunk(&format!("src-{i}"))))
+            .collect();
+        Ok(chunks.into_iter())
+    });
+
+    let task_b = Task::sync_batch_typed(|chunks: &[&DocumentChunk], _ctx| {
+        assert_eq!(chunks.len(), 3);
+        let merged: String = chunks.iter().map(|c| c.text.as_str()).collect();
+        Ok(Box::new(make_chunk(&format!("merged:{merged}"))))
+    });
+
+    let pipeline = Pipeline::new("batch_single_pipeline")
+        .with_name("batch_single_pipeline")
+        .with_task(TaskInfo::new(task_a).with_name("emit_chunks"))
+        .with_task(TaskInfo::new(task_b).with_name("merge_chunks"));
+
+    let ctx = build_ctx(pipeline_ctx("batch_single_pipeline")).await;
+
+    let outputs = execute(&pipeline, vec![Arc::new(0_i32)], ctx, &NoopWatcher)
+        .await
+        .unwrap();
+
+    assert_eq!(outputs.len(), 1);
+    let chunk = (*outputs[0])
+        .as_any()
+        .downcast_ref::<DocumentChunk>()
+        .unwrap();
+    assert!(chunk.text.starts_with("merged:"));
+    assert_eq!(chunk.base.source_task.as_deref(), Some("merge_chunks"));
+    assert_eq!(
+        chunk.base.topological_rank,
+        Some(2),
+        "merge_chunks is task index 1 → rank 2"
     );
 }

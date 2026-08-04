@@ -14,25 +14,28 @@
 //! - `extract_graph_from_data`
 //! - `summarize_text`
 //!
-//! Plus the cross-cutting fields: `source_pipeline = "cognify"`
+//! Plus the cross-cutting fields: `source_pipeline = "cognify_pipeline"`
 //! on every node (Decision 14 of LIB-06 locked the pipeline name on the
-//! builder string), `source_user` carrying the user label
-//! (email-or-uuid per locked decision 4), and `topological_rank` carrying
-//! the 1-based task position that emitted the DataPoint
-//! (`run_tasks_base.py:69-75`).
+//! builder string; the value matches Python's
+//! `pipeline_name="cognify_pipeline"`), and `source_user` carrying the user
+//! label (email-or-uuid per locked decision 4).
 //!
 //! Gated on `OPENAI_TOKEN` + the embedding model dir; skips silently
 //! when either is unavailable so CI lanes without an LLM key stay
 //! green. No outbound HTTP requests when skipped.
+//!
+//! **`topological_rank` coverage does NOT live here.** Because this test
+//! skips without a live LLM it can never be the guard for the rank values;
+//! `crates/cognify/tests/topological_rank_parity.rs` covers them offline
+//! against Python-derived literals. The rank assertions kept below are a
+//! cross-check that the same numbers survive a real LLM run.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use cognee_cognify::tasks::{
-    ADD_DATA_POINTS_TASK_NAME, ADD_DATA_POINTS_TASK_RANK, CLASSIFY_DOCUMENTS_TASK_NAME,
-    CLASSIFY_DOCUMENTS_TASK_RANK, EXTRACT_CHUNKS_TASK_NAME, EXTRACT_CHUNKS_TASK_RANK,
-    EXTRACT_GRAPH_TASK_NAME, EXTRACT_GRAPH_TASK_RANK, SUMMARIZE_TEXT_TASK_NAME,
-    SUMMARIZE_TEXT_TASK_RANK,
+    ADD_DATA_POINTS_TASK_NAME, CLASSIFY_DOCUMENTS_TASK_NAME, EXTRACT_CHUNKS_TASK_NAME,
+    EXTRACT_GRAPH_TASK_NAME, SUMMARIZE_TEXT_TASK_NAME,
 };
 use cognee_cognify::{CognifyConfig, cognify};
 use cognee_database::{DatabaseConnection, IngestDb, connect, initialize, ops};
@@ -196,11 +199,10 @@ async fn cognify_e2e_stamps_with_expected_task_names() {
     // ── Step 3: collect every (source_pipeline, source_task, source_user)
     //          tuple and assert the parity-relevant invariants ───────────
     let mut tasks_seen: HashSet<String> = HashSet::new();
-    let mut ranks_seen: HashSet<i32> = HashSet::new();
     let mut record = |dp: &cognee_models::DataPoint| {
         assert_eq!(
             dp.source_pipeline.as_deref(),
-            Some("cognify"),
+            Some("cognify_pipeline"),
             "source_pipeline must be set on every stamped DataPoint"
         );
         assert_eq!(
@@ -209,25 +211,18 @@ async fn cognify_e2e_stamps_with_expected_task_names() {
             "source_user should reflect the user_label() resolution"
         );
         if let Some(t) = dp.source_task.as_deref() {
-            // `topological_rank` must agree with the task that stamped the
-            // DataPoint: the `*_TASK_RANK` constants are the 1-based positions
-            // in `build_cognify_pipeline`, and the earliest task to touch a
-            // DataPoint wins both fields (idempotent guards).
-            let expected_rank = match t {
-                CLASSIFY_DOCUMENTS_TASK_NAME => CLASSIFY_DOCUMENTS_TASK_RANK,
-                EXTRACT_CHUNKS_TASK_NAME => EXTRACT_CHUNKS_TASK_RANK,
-                EXTRACT_GRAPH_TASK_NAME => EXTRACT_GRAPH_TASK_RANK,
-                SUMMARIZE_TEXT_TASK_NAME => SUMMARIZE_TEXT_TASK_RANK,
-                ADD_DATA_POINTS_TASK_NAME => ADD_DATA_POINTS_TASK_RANK,
-                other => panic!("unexpected source_task {other}"),
-            };
-            assert_eq!(
-                dp.topological_rank,
-                Some(expected_rank),
-                "topological_rank must match the 1-based position of {t}"
+            assert!(
+                matches!(
+                    t,
+                    CLASSIFY_DOCUMENTS_TASK_NAME
+                        | EXTRACT_CHUNKS_TASK_NAME
+                        | EXTRACT_GRAPH_TASK_NAME
+                        | SUMMARIZE_TEXT_TASK_NAME
+                        | ADD_DATA_POINTS_TASK_NAME
+                ),
+                "unexpected source_task {t}"
             );
             tasks_seen.insert(t.to_string());
-            ranks_seen.insert(expected_rank);
         }
     };
 
@@ -261,54 +256,45 @@ async fn cognify_e2e_stamps_with_expected_task_names() {
         );
     }
 
-    // ── Step 4: per-type `topological_rank` expectations ─────────────────
-    // Each DataPoint kind is created by exactly one task, so its rank is the
-    // 1-based position of that task in `build_cognify_pipeline`
-    // (`run_tasks_base.py:69-75` parity).
+    // ── Step 4: per-type `topological_rank` cross-check ──────────────────
+    // Literal values taken from Python's deduplicated `task_sequence`
+    // (`run_tasks_base.py:181-190`) over the default task list
+    // (`cognify.py:350-375`): classify=1, chunks=2, the fused
+    // `extract_graph_and_summarize`=3, add_data_points=4. Deliberately NOT
+    // the `*_TASK_RANK` constants and NOT derived from `source_task` — an
+    // expectation read out of the same code under test cannot fail.
+    // Authoritative offline coverage: `topological_rank_parity.rs`.
     for c in &result.chunks {
         assert_eq!(
             c.base.topological_rank,
-            Some(EXTRACT_CHUNKS_TASK_RANK),
-            "DocumentChunk is emitted by extract_chunks_from_documents (rank 2)"
+            Some(2),
+            "DocumentChunk is emitted by extract_chunks_from_documents"
         );
     }
     for pair in &result.entities {
         assert_eq!(
             pair.entity.base.topological_rank,
-            Some(EXTRACT_GRAPH_TASK_RANK),
-            "Entity is emitted by extract_graph_from_data (rank 3)"
+            Some(3),
+            "Entity comes from Python's fused extract_graph_and_summarize stage"
         );
         assert_eq!(
             pair.entity_type.base.topological_rank,
-            Some(EXTRACT_GRAPH_TASK_RANK),
-            "EntityType is emitted by extract_graph_from_data (rank 3)"
+            Some(3),
+            "EntityType comes from the same fused Python stage"
         );
     }
     for s in &result.summaries {
         assert_eq!(
             s.base.topological_rank,
-            Some(SUMMARIZE_TEXT_TASK_RANK),
-            "TextSummary is emitted by summarize_text (rank 4)"
+            Some(3),
+            "TextSummary shares Python's fused stage 3 with graph extraction"
         );
     }
     for doc in &result.documents_for_dlt {
         assert_eq!(
             doc.base.topological_rank,
-            Some(CLASSIFY_DOCUMENTS_TASK_RANK),
-            "Document is emitted by classify_documents (rank 1)"
+            Some(1),
+            "Document is emitted by classify_documents"
         );
     }
-
-    // Ranks observed on the result surface are strictly increasing with the
-    // pipeline position, i.e. monotone in task order.
-    let mut sorted: Vec<i32> = ranks_seen.into_iter().collect();
-    sorted.sort_unstable();
-    assert!(
-        sorted.windows(2).all(|w| w[0] < w[1]),
-        "ranks must be distinct and ordered: {sorted:?}"
-    );
-    assert!(
-        sorted.iter().all(|r| *r > 0),
-        "the `0` sentinel must never survive on a stamped DataPoint: {sorted:?}"
-    );
 }

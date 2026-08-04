@@ -29,8 +29,10 @@ use crate::error::CognifyError;
 use crate::pipeline::CognifyResult;
 use crate::tasks::cognify;
 
-/// Pipeline name used for cognify pipeline run records (matches Python convention).
-const COGNIFY_PIPELINE_NAME: &str = "cognify_pipeline";
+/// Pipeline name used for cognify pipeline run records (matches Python
+/// convention). Aliased to the single source of truth so the pipeline-cache
+/// lookups below cannot drift from what the executor actually persists.
+use crate::tasks::COGNIFY_PIPELINE_STAMP_NAME as COGNIFY_PIPELINE_NAME;
 
 // ---------------------------------------------------------------------------
 // DatasetRef — identify a dataset by name or UUID

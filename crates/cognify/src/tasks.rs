@@ -340,6 +340,13 @@ pub async fn extract_graph_from_data(
     // provenance E2E test expects (locked decision 4 of
     // `docs/telemetry/05-datapoint-provenance.md`).
     user_label_override: Option<&str>,
+    // 1-based pipeline position written to `topological_rank` on every
+    // Entity / EntityType created below. Must be supplied here rather than
+    // stamped by the caller afterwards: the nodes are persisted to the graph
+    // DB before this function returns. `None` leaves the rank at its `0`
+    // sentinel. The default pipeline passes
+    // `Some(EXTRACT_GRAPH_TASK_RANK)` via `make_extract_graph_task`.
+    task_rank: Option<i32>,
 ) -> Result<ExtractedGraphData, CognifyError> {
     if input.chunks.is_empty() {
         return Ok(ExtractedGraphData {
@@ -484,6 +491,7 @@ pub async fn extract_graph_from_data(
         &existing_edges_set,
         ontology_resolver.as_ref(),
         user_label_owned.as_deref(),
+        task_rank,
     )
     .await;
 
@@ -1108,6 +1116,14 @@ pub async fn add_data_points(
     // These DataPoints are NOT stored as graph nodes (see parity note above),
     // so the stamp only affects vector payloads, not the graph/visualization.
     //
+    // `task_rank: None` — Python's `create_edge_type_datapoints`
+    // (`index_graph_edges.py:50`) builds these objects locally and never
+    // returns them from `add_data_points`, so no stamper ever assigns them a
+    // rank and they reach the vector payload with the `0` sentinel. Stamping
+    // a rank here would put a non-Python value in the persisted
+    // `EdgeType_relationship_name` payload (`DataPoint::vector_metadata`
+    // serialises `topological_rank` unconditionally).
+    //
     // DLT-derived edges (`extract_dlt_fk_edges`) construct
     // `GraphEdgePair` instances rather than DataPoints; they carry no
     // DataPoint to stamp, so no pre-stamp call is needed there.
@@ -1118,6 +1134,7 @@ pub async fn add_data_points(
             crate::graph_integration::expansion::pre_stamp_extraction(
                 et,
                 user_label.as_deref(),
+                None,
                 &mut local_visited,
             );
         }
@@ -2073,27 +2090,27 @@ struct DltTableMeta {
 
 /// Stamp pipeline provenance fields on a [`DataPoint`].
 ///
-/// Used by the **convenience [`cognify`] entry point** which bypasses
-/// `cognee_core::execute()` and therefore does not benefit from the
-/// executor-driven walk in
-/// [`cognee_core::provenance::stamp_tree`]. Per locked decision 6 of
-/// `docs/telemetry/05-datapoint-provenance.md`, both code paths land
-/// stamping; the `if dp.source_X.is_none()` guards make double-stamping
-/// a no-op.
-///
-/// Pipeline-driven cognify uses the executor walk via
-/// [`cognee_core::provenance::stamp_tree_dyn`] — see
-/// `crates/core/src/provenance.rs`.
+/// Called **in-body**, inside each cognify task's closure, because cognify's
+/// task outputs are wrapper structs (`ClassifiedDocuments`, `ExtractedChunks`,
+/// `ExtractedGraphData`, …) that do not implement `HasDataPoint` and are
+/// therefore not recognised by the executor's
+/// [`cognee_core::provenance::stamp_tree_dyn`] cascade — the executor walks
+/// right past them without stamping the nested DataPoints. Per locked
+/// decision 6 of `docs/telemetry/05-datapoint-provenance.md` both mechanisms
+/// coexist; the `if dp.source_X.is_none()` guards make double-stamping a
+/// no-op, and because these calls run inside the closure they always land
+/// *before* the executor's post-task walk.
 ///
 /// Only sets each field if it is currently `None`, so earlier (more specific)
 /// stamps are never overwritten.  Mirrors the Python
 /// `run_tasks_base.py` post-task provenance stamping.
 ///
-/// `rank` is the 1-based position of the emitting task in
-/// [`build_cognify_pipeline`] (one of the `*_TASK_RANK` constants below).
-/// It is written to `DataPoint.topological_rank` only while that field is
-/// still unset — `None` or the `Some(0)` Python sentinel — matching
-/// `run_tasks_base.py:69-75`. Pass `0` to skip the rank write entirely.
+/// `rank` is the 1-based position of the emitting task (one of the
+/// `*_TASK_RANK` constants below, or a caller-supplied position via the
+/// `make_*_task_with_rank` factories). It is written to
+/// `DataPoint.topological_rank` only while that field is still unset — `None`
+/// or the `Some(0)` Python sentinel — matching `run_tasks_base.py:69-75`.
+/// Pass `0` to skip the rank write entirely.
 fn stamp_provenance(dp: &mut DataPoint, pipeline: &str, task: &str, user: Option<&str>, rank: i32) {
     if dp.source_pipeline.is_none() {
         dp.source_pipeline = Some(pipeline.to_string());
@@ -2168,11 +2185,11 @@ pub async fn cognify(
     // whether to proceed, short-circuit, or reject. The pipeline name used
     // here MUST match what `DbPipelineWatcher` will persist on the next
     // `pipeline::execute` call — that is the `Pipeline.name` set below
-    // (`"cognify"` or `"temporal-cognify"`).
+    // ([`COGNIFY_PIPELINE_STAMP_NAME`] or `"temporal-cognify"`).
     let pipeline_name: &str = if effective_config.temporal_cognify {
         "temporal-cognify"
     } else {
-        "cognify"
+        COGNIFY_PIPELINE_STAMP_NAME
     };
     match check_pipeline_run_qualification(pipeline_run_repo.as_ref(), dataset_id, pipeline_name)
         .await
@@ -2210,7 +2227,7 @@ pub async fn cognify(
     // (user decision 2026-05-15), the shared tasks
     // (`make_classify_documents_task`, `make_extract_chunks_task`) stamp
     // `Document` / `DocumentChunk` DataPoints with
-    // `source_pipeline = "cognify"` (the LIB-06-03 constant) on both
+    // `source_pipeline = COGNIFY_PIPELINE_STAMP_NAME` on both
     // branches; the temporal pipeline keeps its distinct identity at the
     // `pipeline_runs` row level via `build_temporal_cognify_pipeline`'s
     // `with_name("temporal-cognify")`.
@@ -3292,38 +3309,82 @@ pub const EXTRACT_GRAPH_TASK_NAME: &str = "extract_graph_from_data";
 pub const SUMMARIZE_TEXT_TASK_NAME: &str = "summarize_text";
 pub const ADD_DATA_POINTS_TASK_NAME: &str = "add_data_points";
 
-/// 1-based position of `classify_documents` in [`build_cognify_pipeline`].
+/// `topological_rank` stamped on every DataPoint emitted by
+/// `classify_documents`.
 ///
-/// These `*_TASK_RANK` constants are written to
-/// `DataPoint.topological_rank` by the in-body [`stamp_provenance`] calls
-/// and **must stay in lockstep with the task order in
-/// [`build_cognify_pipeline`]** (classify → chunks → graph → summarize →
-/// add_data_points). The convenience [`cognify`] function bypasses
-/// `cognee_core::execute()` entirely, so for that path these constants are
-/// the *only* source of the rank — reordering the builder without updating
-/// them silently corrupts the ranks. Pipeline-driven runs additionally get
-/// `first_index + 1` from the executor, which agrees with these values.
+/// # What these constants are
 ///
-/// Python parity: `run_tasks_base.py:69-75` / `:181-190`.
+/// `DataPoint.topological_rank` is the 1-based index of the pipeline stage
+/// that created the node; the visualization's Story / Flow layouts use it as
+/// the column number. Python derives it at runtime from a **deduplicated**
+/// task-name sequence — `task_sequence.index(task_name) + 1`
+/// (`run_tasks_base.py:181-190`) — and writes it in `_stamp_provenance`
+/// (`:69-75`) only while the field is still unset (`None` or the `0`
+/// sentinel). The `*_TASK_RANK` constants below are Rust's equivalent, and
+/// they are keyed to **Python's** stage boundaries, not Rust's.
+///
+/// # Why they are not simply 1..=5
+///
+/// Python's default task list is
+/// `[classify_documents, extract_chunks_from_documents,
+/// extract_graph_and_summarize, add_data_points, extract_dlt_fk_edges]`
+/// (`cognify.py:350-375`), so its deduplicated sequence numbers
+/// `extract_graph_and_summarize` **3** and `add_data_points` **4**. Rust
+/// splits Python's single fused stage into two tasks (`extract_graph_from_data`
+/// then `summarize_text`); numbering them 3 and 4 would push
+/// `add_data_points` to 5 and give the same node type a different column in
+/// each SDK. Both halves of the fused stage therefore share rank **3** and
+/// `add_data_points` keeps Python's **4**.
+///
+/// # How the value actually reaches the DataPoint
+///
+/// Both the convenience [`cognify`] entry point and an explicit
+/// `cognee_core::execute(&build_cognify_pipeline(..), ..)` run the same
+/// pipeline through the executor, and the executor stamps `first_index + 1`
+/// on every output it recognises. These constants still win, for two
+/// independent reasons:
+///
+/// 1. the in-body [`stamp_provenance`] calls run *inside* the task closure,
+///    so they land before the executor's post-task walk and the
+///    `None | Some(0)` write-once guard makes the later stamp a no-op; and
+/// 2. cognify's task outputs are wrapper structs (`ClassifiedDocuments`,
+///    `ExtractedGraphData`, …) that are not `HasDataPoint`, so
+///    `cognee_core::provenance::stamp_tree_dyn` does not recognise them and
+///    the executor never reaches the nested DataPoints at all.
+///
+/// The consequence is that reordering [`build_cognify_pipeline`] without
+/// updating these constants silently corrupts the ranks — nothing errors and
+/// no test fails. Custom pipelines composed from the public
+/// `make_*_task` factories must use the `make_*_task_with_rank` variants to
+/// supply their own positions (see [`make_extract_graph_task_with_rank`]).
+///
+/// Python parity: `run_tasks_base.py:69-75` / `:181-190`,
+/// `cognify.py:350-375`.
 pub const CLASSIFY_DOCUMENTS_TASK_RANK: i32 = 1;
-/// 1-based position of `extract_chunks_from_documents`; see
-/// [`CLASSIFY_DOCUMENTS_TASK_RANK`] for the lockstep requirement.
+/// `topological_rank` for `extract_chunks_from_documents`; see
+/// [`CLASSIFY_DOCUMENTS_TASK_RANK`].
 pub const EXTRACT_CHUNKS_TASK_RANK: i32 = 2;
-/// 1-based position of `extract_graph_from_data`; see
-/// [`CLASSIFY_DOCUMENTS_TASK_RANK`] for the lockstep requirement.
+/// `topological_rank` for `extract_graph_from_data` — the first half of
+/// Python's fused `extract_graph_and_summarize` stage; see
+/// [`CLASSIFY_DOCUMENTS_TASK_RANK`].
 pub const EXTRACT_GRAPH_TASK_RANK: i32 = 3;
-/// 1-based position of `summarize_text`; see
-/// [`CLASSIFY_DOCUMENTS_TASK_RANK`] for the lockstep requirement.
-pub const SUMMARIZE_TEXT_TASK_RANK: i32 = 4;
-/// 1-based position of `add_data_points`; see
-/// [`CLASSIFY_DOCUMENTS_TASK_RANK`] for the lockstep requirement.
-pub const ADD_DATA_POINTS_TASK_RANK: i32 = 5;
+/// `topological_rank` for `summarize_text`. **Deliberately equal to
+/// [`EXTRACT_GRAPH_TASK_RANK`]**: Python fuses both into the single
+/// `extract_graph_and_summarize` task, which occupies one slot in its
+/// deduplicated task sequence. See [`CLASSIFY_DOCUMENTS_TASK_RANK`].
+pub const SUMMARIZE_TEXT_TASK_RANK: i32 = 3;
+/// `topological_rank` for `add_data_points`; 4 in Python because the fused
+/// graph+summarize stage takes only slot 3. See
+/// [`CLASSIFY_DOCUMENTS_TASK_RANK`].
+pub const ADD_DATA_POINTS_TASK_RANK: i32 = 4;
 
 /// Pipeline name carried by cognify task stamps (locked Decision 14 of
-/// LIB-06). Used by the per-task in-body stamping below so the test in
-/// `crates/cognify/tests/provenance_e2e.rs` sees `source_pipeline =
-/// "cognify"` on every produced DataPoint.
-const COGNIFY_PIPELINE_STAMP_NAME: &str = "cognify";
+/// LIB-06), matching Python's `pipeline_name="cognify_pipeline"` argument to
+/// `run_tasks` (`cognify.py:298`). Written to `DataPoint.source_pipeline` by
+/// the per-task in-body stamping below, used as the `pipeline_runs` row name
+/// by [`build_cognify_pipeline`], and the value the visualization's
+/// operations catalog matches on to mark a stage as observed.
+pub const COGNIFY_PIPELINE_STAMP_NAME: &str = "cognify_pipeline";
 
 /// Resolve the user label for in-body stamping from a [`TaskContext`].
 ///
@@ -3333,17 +3394,43 @@ fn user_label_from_ctx(ctx: &Arc<cognee_core::TaskContext>) -> Option<String> {
     ctx.pipeline_ctx.as_ref().and_then(|p| p.user_label())
 }
 
+// ── Rank-overriding factory variants ───────────────────────────────────────
+//
+// Every `make_*_task` factory below is public API, so an embedder can compose
+// a custom pipeline that puts a stage at a different position than
+// [`build_cognify_pipeline`] does. Because the rank is stamped in-body (see
+// [`CLASSIFY_DOCUMENTS_TASK_RANK`] for why the executor's positional stamp
+// never wins), a mis-positioned stage would otherwise emit the default
+// pipeline's rank on every node — silently mis-rendering the visualization's
+// Flow layout with no error and no failing test.
+//
+// Each factory therefore comes in two flavours:
+//
+// * `make_x_task(..)` — rank fixed to the Python-parity constant. Use this
+//   inside (or alongside) the default pipeline.
+// * `make_x_task_with_rank(.., rank)` — `rank` is the 1-based position the
+//   stage occupies in the caller's pipeline. Pass `0` to suppress the in-body
+//   rank write entirely and leave `topological_rank` at its `0` sentinel.
+
 /// Build a [`TypedTask`] that classifies Data items into Documents.
 ///
 /// The returned task does **not** carry a name; the pipeline builder
 /// [`build_cognify_pipeline`] wraps it with [`CLASSIFY_DOCUMENTS_TASK_NAME`].
 ///
 /// In-body provenance stamping: stamps every emitted `Document` with
-/// `source_pipeline = "cognify"` and `source_task = "classify_documents"`.
-/// Necessary because `ClassifiedDocuments` is a non-`HasDataPoint` wrapper
-/// not walked by the executor's `stamp_tree_dyn` (LIB-06-03 fixup).
+/// `source_pipeline = `[`COGNIFY_PIPELINE_STAMP_NAME`] and `source_task =
+/// "classify_documents"`. Necessary because `ClassifiedDocuments` is a
+/// non-`HasDataPoint` wrapper not walked by the executor's `stamp_tree_dyn`
+/// (LIB-06-03 fixup).
 pub fn make_classify_documents_task() -> TypedTask<CognifyInput, ClassifiedDocuments> {
-    TypedTask::sync(|input: &CognifyInput, ctx| {
+    make_classify_documents_task_with_rank(CLASSIFY_DOCUMENTS_TASK_RANK)
+}
+
+/// [`make_classify_documents_task`] with a caller-chosen `topological_rank`.
+pub fn make_classify_documents_task_with_rank(
+    rank: i32,
+) -> TypedTask<CognifyInput, ClassifiedDocuments> {
+    TypedTask::sync(move |input: &CognifyInput, ctx| {
         let mut classified = classify_documents(input).map_err(|e| format!("{e}"))?;
         let user_label = user_label_from_ctx(&ctx);
         for doc in &mut classified.documents {
@@ -3352,7 +3439,7 @@ pub fn make_classify_documents_task() -> TypedTask<CognifyInput, ClassifiedDocum
                 COGNIFY_PIPELINE_STAMP_NAME,
                 CLASSIFY_DOCUMENTS_TASK_NAME,
                 user_label.as_deref(),
-                CLASSIFY_DOCUMENTS_TASK_RANK,
+                rank,
             );
         }
         Ok(Box::new(classified))
@@ -3371,6 +3458,26 @@ pub fn make_extract_chunks_task(
     token_counter_kind: TokenCounterKind,
     db: Option<Arc<DatabaseConnection>>,
     loader_registry: Arc<LoaderRegistry>,
+) -> TypedTask<ClassifiedDocuments, ExtractedChunks> {
+    make_extract_chunks_task_with_rank(
+        storage,
+        max_chunk_size,
+        token_counter_kind,
+        db,
+        loader_registry,
+        EXTRACT_CHUNKS_TASK_RANK,
+    )
+}
+
+/// [`make_extract_chunks_task`] with a caller-chosen `topological_rank`.
+#[allow(clippy::too_many_arguments)]
+pub fn make_extract_chunks_task_with_rank(
+    storage: Arc<dyn StorageTrait>,
+    max_chunk_size: usize,
+    token_counter_kind: TokenCounterKind,
+    db: Option<Arc<DatabaseConnection>>,
+    loader_registry: Arc<LoaderRegistry>,
+    rank: i32,
 ) -> TypedTask<ClassifiedDocuments, ExtractedChunks> {
     TypedTask::async_fn(move |input: &ClassifiedDocuments, ctx| {
         let input = input.clone();
@@ -3396,7 +3503,7 @@ pub fn make_extract_chunks_task(
                     COGNIFY_PIPELINE_STAMP_NAME,
                     EXTRACT_CHUNKS_TASK_NAME,
                     user_label.as_deref(),
-                    EXTRACT_CHUNKS_TASK_RANK,
+                    rank,
                 );
             }
             // Documents carried forward keep their earlier stamp from
@@ -3408,7 +3515,7 @@ pub fn make_extract_chunks_task(
                     COGNIFY_PIPELINE_STAMP_NAME,
                     EXTRACT_CHUNKS_TASK_NAME,
                     user_label.as_deref(),
-                    EXTRACT_CHUNKS_TASK_RANK,
+                    rank,
                 );
             }
             Ok(Box::new(extracted))
@@ -3428,6 +3535,29 @@ pub fn make_extract_graph_task(
     ontology_resolver: Arc<dyn OntologyResolver>,
     config: CognifyConfig,
 ) -> TypedTask<ExtractedChunks, ExtractedGraphData> {
+    make_extract_graph_task_with_rank(
+        llm,
+        graph_db,
+        ontology_resolver,
+        config,
+        EXTRACT_GRAPH_TASK_RANK,
+    )
+}
+
+/// [`make_extract_graph_task`] with a caller-chosen `topological_rank`.
+///
+/// `rank` is threaded all the way into [`extract_graph_from_data`] (and from
+/// there into `expand_with_nodes_and_edges`) rather than only being applied to
+/// the task body's own stamp loop: Entity / EntityType nodes are written to the
+/// graph DB *inside* `extract_graph_from_data`, so a rank applied afterwards
+/// would never reach the persisted rows.
+pub fn make_extract_graph_task_with_rank(
+    llm: Arc<dyn Llm>,
+    graph_db: Arc<dyn GraphDBTrait>,
+    ontology_resolver: Arc<dyn OntologyResolver>,
+    config: CognifyConfig,
+    rank: i32,
+) -> TypedTask<ExtractedChunks, ExtractedGraphData> {
     TypedTask::async_fn(move |input: &ExtractedChunks, ctx| {
         let input = input.clone();
         let llm = Arc::clone(&llm);
@@ -3443,6 +3573,7 @@ pub fn make_extract_graph_task(
                 ontology_resolver,
                 &config,
                 user_label.as_deref(),
+                (rank > 0).then_some(rank),
             )
             .await
             .map_err(|e| format!("{e}"))?;
@@ -3457,14 +3588,14 @@ pub fn make_extract_graph_task(
                     COGNIFY_PIPELINE_STAMP_NAME,
                     EXTRACT_GRAPH_TASK_NAME,
                     user_label.as_deref(),
-                    EXTRACT_GRAPH_TASK_RANK,
+                    rank,
                 );
                 stamp_provenance(
                     &mut pair.entity_type.base,
                     COGNIFY_PIPELINE_STAMP_NAME,
                     EXTRACT_GRAPH_TASK_NAME,
                     user_label.as_deref(),
-                    EXTRACT_GRAPH_TASK_RANK,
+                    rank,
                 );
             }
             // Chunks/documents carried forward — idempotent re-stamp keeps
@@ -3475,7 +3606,7 @@ pub fn make_extract_graph_task(
                     COGNIFY_PIPELINE_STAMP_NAME,
                     EXTRACT_GRAPH_TASK_NAME,
                     user_label.as_deref(),
-                    EXTRACT_GRAPH_TASK_RANK,
+                    rank,
                 );
             }
             for doc in &mut graph_data.documents {
@@ -3484,7 +3615,7 @@ pub fn make_extract_graph_task(
                     COGNIFY_PIPELINE_STAMP_NAME,
                     EXTRACT_GRAPH_TASK_NAME,
                     user_label.as_deref(),
-                    EXTRACT_GRAPH_TASK_RANK,
+                    rank,
                 );
             }
             Ok(Box::new(graph_data))
@@ -3501,6 +3632,15 @@ pub fn make_summarize_text_task(
     llm: Arc<dyn Llm>,
     config: CognifyConfig,
 ) -> TypedTask<ExtractedGraphData, SummarizedData> {
+    make_summarize_text_task_with_rank(llm, config, SUMMARIZE_TEXT_TASK_RANK)
+}
+
+/// [`make_summarize_text_task`] with a caller-chosen `topological_rank`.
+pub fn make_summarize_text_task_with_rank(
+    llm: Arc<dyn Llm>,
+    config: CognifyConfig,
+    rank: i32,
+) -> TypedTask<ExtractedGraphData, SummarizedData> {
     TypedTask::async_fn(move |input: &ExtractedGraphData, ctx| {
         let input = input.clone();
         let llm = Arc::clone(&llm);
@@ -3516,7 +3656,7 @@ pub fn make_summarize_text_task(
                     COGNIFY_PIPELINE_STAMP_NAME,
                     SUMMARIZE_TEXT_TASK_NAME,
                     user_label.as_deref(),
-                    SUMMARIZE_TEXT_TASK_RANK,
+                    rank,
                 );
             }
             // Idempotent re-stamp of carried-forward DataPoints — only
@@ -3527,7 +3667,7 @@ pub fn make_summarize_text_task(
                     COGNIFY_PIPELINE_STAMP_NAME,
                     SUMMARIZE_TEXT_TASK_NAME,
                     user_label.as_deref(),
-                    SUMMARIZE_TEXT_TASK_RANK,
+                    rank,
                 );
             }
             for doc in &mut summarized.documents {
@@ -3536,7 +3676,7 @@ pub fn make_summarize_text_task(
                     COGNIFY_PIPELINE_STAMP_NAME,
                     SUMMARIZE_TEXT_TASK_NAME,
                     user_label.as_deref(),
-                    SUMMARIZE_TEXT_TASK_RANK,
+                    rank,
                 );
             }
             for pair in &mut summarized.entities {
@@ -3545,14 +3685,14 @@ pub fn make_summarize_text_task(
                     COGNIFY_PIPELINE_STAMP_NAME,
                     SUMMARIZE_TEXT_TASK_NAME,
                     user_label.as_deref(),
-                    SUMMARIZE_TEXT_TASK_RANK,
+                    rank,
                 );
                 stamp_provenance(
                     &mut pair.entity_type.base,
                     COGNIFY_PIPELINE_STAMP_NAME,
                     SUMMARIZE_TEXT_TASK_NAME,
                     user_label.as_deref(),
-                    SUMMARIZE_TEXT_TASK_RANK,
+                    rank,
                 );
             }
             Ok(Box::new(summarized))
@@ -3575,6 +3715,31 @@ pub fn make_add_data_points_task(
     db: Option<Arc<DatabaseConnection>>,
     config: CognifyConfig,
 ) -> TypedTask<SummarizedData, CognifyResult> {
+    make_add_data_points_task_with_rank(
+        graph_db,
+        vector_db,
+        embedding_engine,
+        db,
+        config,
+        ADD_DATA_POINTS_TASK_RANK,
+    )
+}
+
+/// [`make_add_data_points_task`] with a caller-chosen `topological_rank`.
+///
+/// `rank` never reaches `result.edge_types`: Python's `index_graph_edges`
+/// `EdgeType` objects are never stamped at all, so Rust leaves their rank at
+/// the `0` sentinel regardless of this argument (see the parity note at the
+/// `edge_types` loop below).
+#[allow(clippy::too_many_arguments)]
+pub fn make_add_data_points_task_with_rank(
+    graph_db: Arc<dyn GraphDBTrait>,
+    vector_db: Arc<dyn VectorDB>,
+    embedding_engine: Arc<dyn EmbeddingEngine>,
+    db: Option<Arc<DatabaseConnection>>,
+    config: CognifyConfig,
+    rank: i32,
+) -> TypedTask<SummarizedData, CognifyResult> {
     TypedTask::async_fn(move |input: &SummarizedData, ctx| {
         let input = input.clone();
         let graph_db = Arc::clone(&graph_db);
@@ -3594,7 +3759,7 @@ pub fn make_add_data_points_task(
                     COGNIFY_PIPELINE_STAMP_NAME,
                     ADD_DATA_POINTS_TASK_NAME,
                     user_label.as_deref(),
-                    ADD_DATA_POINTS_TASK_RANK,
+                    rank,
                 );
             }
             for pair in &mut result.entities {
@@ -3603,14 +3768,14 @@ pub fn make_add_data_points_task(
                     COGNIFY_PIPELINE_STAMP_NAME,
                     ADD_DATA_POINTS_TASK_NAME,
                     user_label.as_deref(),
-                    ADD_DATA_POINTS_TASK_RANK,
+                    rank,
                 );
                 stamp_provenance(
                     &mut pair.entity_type.base,
                     COGNIFY_PIPELINE_STAMP_NAME,
                     ADD_DATA_POINTS_TASK_NAME,
                     user_label.as_deref(),
-                    ADD_DATA_POINTS_TASK_RANK,
+                    rank,
                 );
             }
             for summary in &mut result.summaries {
@@ -3619,16 +3784,22 @@ pub fn make_add_data_points_task(
                     COGNIFY_PIPELINE_STAMP_NAME,
                     ADD_DATA_POINTS_TASK_NAME,
                     user_label.as_deref(),
-                    ADD_DATA_POINTS_TASK_RANK,
+                    rank,
                 );
             }
+            // `rank = 0` skips the `topological_rank` write. Python's
+            // `create_edge_type_datapoints` (`index_graph_edges.py:50`) never
+            // routes these `EdgeType` objects through a provenance stamper, so
+            // their rank stays at the `0` sentinel; `add_data_points` already
+            // pre-stamped the `source_*` keys they need for the
+            // `EdgeType_relationship_name` vector payload (gap-05/08 §4.4).
             for edge_type in &mut result.edge_types {
                 stamp_provenance(
                     &mut edge_type.base,
                     COGNIFY_PIPELINE_STAMP_NAME,
                     ADD_DATA_POINTS_TASK_NAME,
                     user_label.as_deref(),
-                    ADD_DATA_POINTS_TASK_RANK,
+                    0,
                 );
             }
             for doc in &mut result.documents_for_dlt {
@@ -3637,7 +3808,7 @@ pub fn make_add_data_points_task(
                     COGNIFY_PIPELINE_STAMP_NAME,
                     ADD_DATA_POINTS_TASK_NAME,
                     user_label.as_deref(),
-                    ADD_DATA_POINTS_TASK_RANK,
+                    rank,
                 );
             }
             Ok(Box::new(result))
@@ -3695,7 +3866,7 @@ pub fn build_cognify_pipeline(
     config: CognifyConfig,
 ) -> Pipeline {
     let loader_registry = Arc::new(build_loader_registry(&llm, &config));
-    PipelineBuilder::new_with_task("cognify", make_classify_documents_task())
+    PipelineBuilder::new_with_task(COGNIFY_PIPELINE_STAMP_NAME, make_classify_documents_task())
         .with_first_task_name(CLASSIFY_DOCUMENTS_TASK_NAME)
         .add_task_named(
             make_extract_chunks_task(
@@ -3724,7 +3895,7 @@ pub fn build_cognify_pipeline(
             make_add_data_points_task(graph_db, vector_db, embedding_engine, db, config),
             ADD_DATA_POINTS_TASK_NAME,
         )
-        .with_name("cognify")
+        .with_name(COGNIFY_PIPELINE_STAMP_NAME)
         .build()
 }
 
@@ -4673,6 +4844,7 @@ mod tests {
             &HashMap::new(),
             &HashSet::new(),
             &resolver,
+            None,
             None,
         )
         .await;

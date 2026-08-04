@@ -110,7 +110,7 @@ fn ctx<'a>(
 /// `topological_rank` parity cases.
 fn ctx_with_rank<'a>(task_rank: Option<i32>) -> ProvenanceContext<'a> {
     ProvenanceContext {
-        pipeline_name: "cognify",
+        pipeline_name: "cognify_pipeline",
         task_name: "extract_graph_from_data",
         user_label: None,
         node_set: None,

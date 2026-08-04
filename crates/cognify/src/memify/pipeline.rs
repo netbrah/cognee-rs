@@ -25,6 +25,16 @@ use super::extract_triplets::extract_triplets_from_graph_db;
 use super::index_triplets::{IndexResult, index_triplets};
 use crate::qualification::{Qualification, check_pipeline_run_qualification};
 
+/// Pipeline name for memify runs, matching Python's
+/// `pipeline_name="memify_pipeline"` argument to `run_tasks`
+/// (`cognee/modules/memify/memify.py:128`).
+///
+/// Used both as the `pipeline_runs` row name (and hence the qualification-gate
+/// lookup key) and as the `source_pipeline` the executor stamps on every
+/// DataPoint the pipeline emits — the value the visualization's operations
+/// catalog matches on to mark a memify stage as observed.
+pub const MEMIFY_PIPELINE_STAMP_NAME: &str = "memify_pipeline";
+
 /// Result of the memify pipeline.
 #[derive(Debug, Clone)]
 pub struct MemifyResult {
@@ -127,10 +137,10 @@ pub fn build_memify_index_only_pipeline(
     // run_info `data_ids` carrier stays empty (Python's `"None"` branch).
     let data_id_fn: DataIdFn = Arc::new(|_v: Arc<dyn Value>| None);
     PipelineBuilder::new_with_task(
-        "memify",
+        MEMIFY_PIPELINE_STAMP_NAME,
         make_index_triplets_task(vector_db, embedding_engine, dataset_id, user_id, tenant_id),
     )
-    .with_name("memify")
+    .with_name(MEMIFY_PIPELINE_STAMP_NAME)
     .with_data_id(data_id_fn)
     .build()
 }
@@ -184,9 +194,10 @@ pub async fn memify(
     // Skip when `dataset_id` is `None` — Python's gate only applies per
     // dataset, and ad-hoc memify runs without a dataset cannot be looked up
     // via `get_pipeline_run_by_dataset`. The pipeline name used here matches
-    // what the executor-routed pipeline persists (`build_memify_index_only_pipeline`
-    // sets `with_name("memify")`).
-    let pipeline_name = "memify";
+    // what the executor-routed pipeline persists
+    // (`build_memify_index_only_pipeline` sets
+    // `with_name(MEMIFY_PIPELINE_STAMP_NAME)`).
+    let pipeline_name = MEMIFY_PIPELINE_STAMP_NAME;
     if let Some(ds_id) = dataset_id {
         match check_pipeline_run_qualification(pipeline_run_repo.as_ref(), ds_id, pipeline_name)
             .await

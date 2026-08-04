@@ -17,7 +17,7 @@
 //! accumulates its items into a buffer (sized by [`TaskInfo::with_batch_size`])
 //! and hands the buffer to `dispatch_batch`. If the consuming task is one of the
 //! `*Batch` [`Task`] variants, `dispatch_batch` calls it **directly** with the
-//! accumulated slice, skipping `call_with_retry` entirely. Three services live
+//! accumulated slice, skipping `call_with_retry` entirely. Two services live
 //! in `call_with_retry` and are therefore **not** applied to such a task:
 //!
 //! 1. **Retries.** The configured [`RetryPolicy`] is never consulted; the batch
@@ -25,13 +25,8 @@
 //! 2. **Per-task watcher events.** No `on_task` / `on_task_started` /
 //!    `on_task_completed` is emitted for the batch task, so it is invisible both
 //!    to watcher observers and to per-task status tracking.
-//! 3. **Provenance stamping.** The executor does not walk the batch task's
-//!    output with `stamp_tree_dyn`. (Items *inside* the incoming slice were
-//!    already stamped eagerly by the upstream `process_iter` / `process_stream`,
-//!    but anything the batch task newly creates stays unstamped unless the task
-//!    stamps it itself.)
 //!
-//! Three further services used to be missing on this path and are now provided
+//! Four further services used to be missing on this path and are now provided
 //! directly by `dispatch_batch` and the accumulation loops, so a batch task can
 //! rely on them:
 //!
@@ -48,14 +43,55 @@
 //!   the batch task. A terminal batch task needs its own check because
 //!   `execute_from(rest=[], ..)` returns via the empty-tasks base case *before*
 //!   reaching the check at the top of `execute_from`.
+//! - **Provenance stamping.** `dispatch_batch` walks the batch task's own output
+//!   with `stamp_tree_dyn`, so DataPoints the task newly creates are attributed
+//!   to it. See the subsection below for why this one moved and how it is built.
 //!
-//! What a batch task *does* get, beyond those three, is the pre-accumulated
+//! What a batch task *does* get, beyond those four, is the pre-accumulated
 //! slice; it is expected to handle its own error semantics.
 //!
-//! This is a **divergence from Python cognee**, where every task goes through
-//! `handle_task` and receives stamping, telemetry and spans regardless of
-//! batching (there, `batch_size` only controls how many items are gathered into
-//! the list handed to the task).
+//! ## Provenance stamping moved to the provided list
+//!
+//! Until recently this was the **third withheld service**: the executor did not
+//! walk a batch task's output, so anything the task newly created stayed
+//! unstamped unless it stamped itself. It is now provided, which continues the
+//! direction of the change that moved rate limiting, progress and cancellation
+//! across — every one of those was withheld for the same accidental reason
+//! (the service happened to live inside `call_with_retry`), not by design.
+//!
+//! Provenance stamping was the last of the four to move because it was the only
+//! one whose cost looked *recoverable*. When the withheld list was first written
+//! down, [`DataPoint`](cognee_models::DataPoint) had no `topological_rank`
+//! field, so skipping a batch stage cost only a missing pipeline/task label —
+//! and a downstream stamp could still fill that in later. `topological_rank`
+//! removes the recovery: the rank write is **single-shot** (guarded by
+//! `matches!(dp.topological_rank, None | Some(0))`, mirroring Python's
+//! `if current_rank is None or current_rank == 0`), so the first task to touch a
+//! DataPoint fixes its rank forever. With the batch stage left out, its outputs
+//! kept the *predecessor's* rank — every DataPoint born in a batch stage sat one
+//! pipeline column short, with no later opportunity to correct it.
+//!
+//! Python has no such gap: `handle_task` assigns every task its own
+//! `task_index` regardless of batching
+//! (`cognee/modules/pipelines/operations/run_tasks_base.py:181-190`), so parity
+//! requires stamping here too. `dispatch_batch` therefore builds a **fresh**
+//! `ProvenanceInputs` for the batch task itself — its own name and
+//! `first_index + 1` as the rank — and uses it for the task's `Single`, `Iter`
+//! and `Stream` outputs alike. Pinned by
+//! `batch_task_outputs_carry_the_batch_tasks_own_rank` and
+//! `batch_task_single_output_is_stamped` in
+//! `crates/core/tests/provenance_pipeline_integration.rs`.
+//!
+//! Items *inside* the incoming slice are unaffected: they were already stamped
+//! eagerly by the upstream `process_iter` / `process_stream`, and the run's
+//! shared visited-set makes re-stamping them a no-op.
+//!
+//! ## Remaining divergence from Python
+//!
+//! The two withheld services above remain a **divergence from Python cognee**,
+//! where every task goes through `handle_task` and receives telemetry and spans
+//! regardless of batching (there, `batch_size` only controls how many items are
+//! gathered into the list handed to the task).
 //!
 //! Only the `*Batch` variants take this path. A **non-batch** task reached from
 //! `dispatch_batch` is executed one buffered item at a time through
@@ -239,9 +275,10 @@ impl Pipeline {
     /// not only `*Batch` variants — see [`TaskInfo::with_batch_size`] for what
     /// that means for a non-batch consumer.
     ///
-    /// When the consumer *is* a `*Batch` variant it is dispatched off the
-    /// executor's service path (no retries, watcher events, provenance stamping,
-    /// rate limiting, progress completion or cancellation checks); see
+    /// When the consumer *is* a `*Batch` variant it skips `call_with_retry` and
+    /// with it two services — retries and per-task watcher events. Rate
+    /// limiting, progress, cancellation and provenance stamping are applied on
+    /// both paths; see
     /// [Batch dispatch bypasses executor services](crate::pipeline#batch-dispatch-bypasses-executor-services).
     pub fn with_batch_size(mut self, size: usize) -> Self {
         assert!(size > 0, "batch_size must be > 0");
@@ -1351,14 +1388,18 @@ fn execute_from<'a>(
 ///   all outputs.
 ///
 /// **Design note:** batch-dispatched tasks bypass [`call_with_retry`], and with
-/// it *three* executor services — there are no retries, no per-task watcher
-/// events, and no provenance stamping of the batch task's own output. Batch
-/// tasks receive pre-accumulated slices and are expected to handle their own
-/// error semantics. Only single-value tasks executed via [`execute_from`] get
-/// those three.
+/// it *two* executor services — there are no retries and no per-task watcher
+/// events. Batch tasks receive pre-accumulated slices and are expected to handle
+/// their own error semantics. Only single-value tasks executed via
+/// [`execute_from`] get those two.
 ///
-/// Rate limiting, progress and cancellation *are* provided on this path —
-/// acquired / scoped / checked here rather than in `call_with_retry`.
+/// Rate limiting, progress, cancellation **and provenance stamping** *are*
+/// provided on this path — acquired / scoped / checked / applied here rather
+/// than in `call_with_retry`. Stamping uses a [`ProvenanceInputs`] built below
+/// for the batch task itself rather than the caller's (which describes the
+/// *producer* of the accumulated items) — see `batch_prov`. Because the
+/// `DataPoint::topological_rank` write is single-shot, reusing the caller's
+/// inputs would permanently stamp the predecessor's rank.
 ///
 /// This doc comment is the code-side summary; the authoritative version, with
 /// the reasoning for each service, is the module documentation:
@@ -1381,16 +1422,6 @@ fn dispatch_batch<'a>(
         };
 
         if next_info.task.is_batch() {
-            // Call the batch task directly with the accumulated slice.
-            // Note: batch tasks bypass `call_with_retry` and therefore
-            // provenance stamping (gap 05-06 §8). Items in `batch`
-            // were already stamped before being pushed by the
-            // upstream `process_iter` / `process_stream`. Pass
-            // `prov_inputs` through so any nested iter / stream from
-            // the batch task's output reuses the visited-set
-            // (already-stamped items short-circuit; new items adopt
-            // the parent task's provenance as a best-effort default).
-
             // Cancellation: `execute_from`'s check is unreachable for a
             // *terminal* batch task, because `execute_from(rest=[], ..)`
             // returns via its empty-tasks base case before reaching it. Check
@@ -1435,8 +1466,40 @@ fn dispatch_batch<'a>(
                 .ctx
                 .with_progress(env.task_subtokens[first_index].clone());
 
+            // Provenance for the batch task's *own* outputs. The caller's
+            // `prov_inputs` describes the task that produced the accumulated
+            // items (`first_index - 1`), so reusing it here would stamp every
+            // DataPoint the batch task emits with the predecessor's name and
+            // rank — one pipeline column short, and unfixable afterwards
+            // because the rank write is single-shot (`None | Some(0)` guard).
+            // Python gives every task its own `task_index`
+            // (`run_tasks_base.py:181-190`); `first_index` is this batch
+            // task's own 0-based position, so `+ 1` is its 1-based rank.
+            //
+            // `node_set` / `content_hash` are lineage values inherited from
+            // the items flowing in, so they carry over from `prov_inputs`
+            // rather than being re-extracted (the batch slice holds
+            // descendants of the very value they were extracted from).
+            //
+            // Built after the cancellation / rate-limit gates above so a
+            // cancelled run does not pay for the clones.
+            let batch_prov = ProvenanceInputs {
+                pipeline_name: prov_inputs.pipeline_name,
+                task_name: next_info.name.as_deref().unwrap_or(""),
+                user_label: prov_inputs.user_label.clone(),
+                input_node_set: prov_inputs.input_node_set.clone(),
+                input_content_hash: prov_inputs.input_content_hash.clone(),
+                task_rank: (first_index + 1) as i32,
+            };
+
+            // Call the batch task directly with the accumulated slice.
+            // Note: batch tasks bypass `call_with_retry`, so there are no
+            // retries and no watcher events (gap 05-06 §8). Items in `batch`
+            // were already stamped before being pushed by the upstream
+            // `process_iter` / `process_stream`; the shared visited-set makes
+            // re-stamping them here a no-op.
             let call = next_info.task.call_batch(&batch, batch_ctx);
-            let resolved =
+            let mut resolved =
                 resolve_call(call)
                     .await
                     .map_err(|source| ExecutionError::TaskFailed {
@@ -1444,6 +1507,9 @@ fn dispatch_batch<'a>(
                         attempts: 1,
                         source,
                     })?;
+            if let Resolved::Single(ref mut v) = resolved {
+                stamp_single_output(v, &batch_prov, env);
+            }
             // After the batch call resolves, continue through the remaining tail.
             let rest = &tail[1..];
             match resolved {
@@ -1453,14 +1519,14 @@ fn dispatch_batch<'a>(
                         .first()
                         .and_then(|t| t.batch_size)
                         .unwrap_or(env.default_batch_size);
-                    process_iter(iter, rest, batch_size, first_index + 1, prov_inputs, env).await
+                    process_iter(iter, rest, batch_size, first_index + 1, &batch_prov, env).await
                 }
                 Resolved::Stream(stream) => {
                     let batch_size = rest
                         .first()
                         .and_then(|t| t.batch_size)
                         .unwrap_or(env.default_batch_size);
-                    process_stream(stream, rest, batch_size, first_index + 1, prov_inputs, env)
+                    process_stream(stream, rest, batch_size, first_index + 1, &batch_prov, env)
                         .await
                 }
             }
@@ -1619,6 +1685,33 @@ fn stamp_boxed_item(
         let _ = crate::provenance::stamp_tree_dyn(item.as_mut(), &prov_ctx, &mut visited);
     }
 }
+
+/// Stamp a `Resolved::Single` task output using the pipeline's shared
+/// visited-set (locked decision 8). Shared by [`call_with_retry`] and the
+/// batch-dispatch path so both stamp identically.
+///
+/// Uniquely-owned `Arc` only: a shared `Arc` cannot be mutated, which would
+/// mean silently dropping the stamp, so that case is logged instead.
+fn stamp_single_output(
+    value: &mut Arc<dyn Value>,
+    prov_inputs: &ProvenanceInputs<'_>,
+    env: &ExecEnv<'_>,
+) {
+    let Some(pctx) = env.ctx.pipeline_ctx.as_ref() else {
+        return;
+    };
+    let prov_ctx = prov_inputs.ctx();
+    // lock poison is unrecoverable
+    let mut visited = pctx.provenance_visited.lock().unwrap();
+    if let Some(inner) = Arc::get_mut(value) {
+        let _ = crate::provenance::stamp_tree_dyn(inner, &prov_ctx, &mut visited);
+    } else {
+        tracing::warn!(
+            "skipping provenance stamping: shared Arc<dyn Value> for task '{}'",
+            prov_inputs.task_name
+        );
+    }
+}
 /// Call `task` on `input`, retrying on failure according to `env.policy`.
 ///
 /// Retry applies to the task call itself (including awaiting async tasks and
@@ -1694,20 +1787,8 @@ async fn call_with_retry(
                 // consumption site in `process_iter` / `process_stream`.
                 // The audit-log call below (locked decision 3) is
                 // separate — both coexist.
-                if let Resolved::Single(ref mut v) = resolved
-                    && let Some(pctx) = env.ctx.pipeline_ctx.as_ref()
-                {
-                    let prov_ctx = prov_inputs.ctx();
-                    // lock poison is unrecoverable
-                    let mut visited = pctx.provenance_visited.lock().unwrap();
-                    if let Some(inner) = Arc::get_mut(v) {
-                        let _ = crate::provenance::stamp_tree_dyn(inner, &prov_ctx, &mut visited);
-                    } else {
-                        tracing::warn!(
-                            "skipping provenance stamping: shared Arc<dyn Value> for task '{}'",
-                            prov_inputs.task_name
-                        );
-                    }
+                if let Resolved::Single(ref mut v) = resolved {
+                    stamp_single_output(v, prov_inputs, env);
                 }
 
                 // ── Provenance stamping (best-effort) ───────────────────
