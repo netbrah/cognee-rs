@@ -97,12 +97,13 @@ The crate is implemented at [`crates/visualization/`](../../../crates/visualizat
 |---|---|---|
 | `pub async fn visualize(graph_db, output_path)` | Implemented | Writes HTML to a path; returns the path. Used by the CLI. |
 | `pub async fn render(graph_db)` | Implemented | Returns the HTML string without filesystem side effects. **This is what the GET handler uses.** |
-| `pub async fn render_multi_user(pairs)` | Implemented | Aggregates multiple `(User, Arc<dyn GraphDBTrait>)` pairs into one visualization, stamping `source_user` so the renderer can colour-code by user. **This is what the POST handler uses.** |
+| `pub async fn render_multi_user(pairs)` | Implemented | Aggregates multiple `(user_label, Arc<dyn GraphDBTrait>)` pairs into one visualization, stamping `source_user` so the renderer can colour-code by user. The label is a plain `String` (the caller resolves it — there is no `User` struct in this crate's signature). **This is what the POST handler uses.** |
 
 The HTML pipeline is complete: `preprocessor` derives the payload, `html.rs` substitutes it into the
 vendored frontend assets, `paths.rs` resolves the output location. Multi-user aggregation dedupes
-nodes first-write-wins by stringified id and edges by `(source, target, relation)`, and only fills
-`source_user` when the node does not already carry one.
+nodes first-write-wins by stringified id and edges by `(source, target, relation)`, and fills
+`source_user` whenever the node's own value is *falsy* — absent, `null`, `""`, `0`, `false`, `[]` or
+`{}` — matching Python's `not x` truthiness rather than only the absent/`null` cases.
 
 ### 3.2 Tenant context
 
