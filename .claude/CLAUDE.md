@@ -127,7 +127,7 @@ Runs in order: `cargo fmt --check` → `cargo check --all-targets` → `cargo cl
 
 ### CI (GitHub Actions)
 
-`ci.yml` runs on push/PR to main: lint (fmt + check + clippy), tests (with `OPENAI_KEY` secret via `scripts/run_tests_with_openai.sh`), `cargo doc --no-deps`, and C/Python/TS/Java binding checks. `http-parity.yml` runs the cross-SDK Rust↔Python parity suite (`workflow_dispatch` only; see task 12). `ts-prebuild.yml` builds Neon prebuilt binaries for multiple platforms (publishes the `cognee-ts` npm package).
+`ci.yml` runs on push/PR to main: lint (fmt + check + clippy), tests (with `OPENAI_KEY` secret via `scripts/run_tests_with_openai.sh`), `cargo doc --no-deps`, and C/Python/TS/Java binding checks. `http-parity.yml` runs the cross-SDK Rust↔Python parity suite on push/PR to main (re-enabled in task 12 — it is *not* `workflow_dispatch`-only). Its phase-1 deterministic and telemetry checks need no secrets; LLM-gated phases use `OPENAI_KEY` and skip cleanly when absent (fork-safe). **The phase-3 specialty tests — websocket, sync, permissions and visualize — remain `workflow_dispatch`-only** behind the `run_phase3` input, so a green PR board does not cover them. `ts-prebuild.yml` builds Neon prebuilt binaries for multiple platforms (publishes the `cognee-ts` npm package).
 
 ## Coding Conventions
 
