@@ -45,7 +45,8 @@ from the docs is correct). The four memory-API CLI verbs (`remember` / `recall` 
 - **MCP server** — Python ships `cognee-mcp` (usable from Cursor, Claude Code, and other MCP
   clients). There is no MCP crate in the Rust workspace.
 - **Local UI** — Python offers a web UI (`cognee-cli -ui` + the `cognee-frontend` app). Rust has only
-  the static, self-contained d3.js graph export (`cognee-cli visualize`), not an interactive app.
+  the single-file d3.js graph export (`cognee-cli visualize`) — interactive in the browser, but a
+  static artifact with no server behind it.
 - **LLM / embedding / backend provider breadth** — Python documents many more backends than Rust
   implements:
   - LLM: Python adds Anthropic, Google Gemini, Mistral, Bedrock; Rust covers OpenAI-compatible
@@ -196,17 +197,25 @@ from the result" behavior to rely on.
 
 ## Visualization
 
-- **Story / Schema / Inspector multi-view deferred.** The Python `cognee_network_visualization`
-  module renders three HTML tabs (Story, Schema, Inspector) backed by four JS modules
-  (`ui_chrome`, `schema_view`, `story_view`, `inspector`). The Rust `cognee-visualization` crate
-  emits a single self-contained d3.js force-directed graph view. The schema tab is always absent;
-  node-type coloring uses the 12-entry hard-coded map in `colors.rs`. The full multi-view rewrite
-  is a substantial JS-embedding effort and is deferred to a post-0.1.0 release.
+The multi-view frontend now ships: the Graph / Schema / Memory / Semantic tabs and the inspector
+panel are rendered from the same six JS view modules Python uses, vendored verbatim (see
+`crates/visualization/assets/README.md` for the resync rule). Three payload gaps remain.
 
-  The 8-key schema-node name fallback from Python's `preprocessor.py:223–237` (`database_type`,
-  `primary_key`, `source_table`, `source_column`, `target_table`, `target_column`,
-  `relationship_type`, `row_count_estimate`) is implemented in `serialize.rs` so schema-typed
-  nodes render with meaningful names in the single-view output.
+- **Search-event timeline is always empty.** Python passes `search_events or []` into the story
+  view from `visualization/session_events.py`; that module has no Rust counterpart, so the
+  `__SEARCH_EVENTS__` payload is hard-coded `[]` and the story view's event lane renders empty.
+
+- **Semantic map renders its empty state.** Python computes 2-D node positions and clusters
+  best-effort (PCA + seeded k-means over stored embeddings). Rust cannot: `cognee_vector::SearchResult`
+  exposes no `vector` field, so persisted embeddings are not readable back, and the workspace has no
+  PCA/SVD or seeded k-means. Both payloads are `null` — the same state Python's own blanket
+  `except Exception` fallback reaches, so `semantic_map.js` shows its documented empty state rather
+  than breaking.
+
+- **The page is not offline-self-contained.** The vendored `template.html` loads d3 v7 and the Inter
+  font from a CDN, exactly as Python does. Rendering therefore needs network access on first load.
+  This is upstream behaviour, not a Rust-side regression, but it does mean "self-contained HTML" now
+  means "single file", not "zero external fetches".
 
 ## Cross-SDK parity harness
 

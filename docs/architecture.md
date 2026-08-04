@@ -35,7 +35,7 @@ cognee-rs/
 │   ├── delete/                 # Dataset/data deletion across all backends
 │   ├── core/                   # Task pipeline orchestration framework
 │   ├── http-server/            # axum HTTP server (library + cognee-http-server binary)
-│   ├── visualization/          # Self-contained HTML knowledge-graph visualization (d3.js)
+│   ├── visualization/          # Single-file multi-tab HTML knowledge-graph visualization (d3.js)
 │   ├── observability/          # OpenTelemetry tracing pipeline (OTLP exporter, telemetry feature)
 │   ├── telemetry/              # Product-analytics client (send_telemetry → prometh.ai, opt-out)
 │   ├── logging/                # Shared file logging (rotation, Python-compatible plain formatter)
@@ -96,7 +96,7 @@ cognee-rs/
 
 **cognee-http-server** — `axum`-based HTTP server. Library exposes `build_router`, `run`, and `AppState`; also builds the `cognee-http-server` binary. Routers mirror the Python FastAPI surface under `/api/v1/*`. See [http-server/](http-server/README.md).
 
-**cognee-visualization** — Self-contained HTML knowledge-graph visualization (d3.js v7, force-directed, Canvas). Entry points: `visualize`/`render`/`render_multi_user`. Surfaces via the CLI `visualize` subcommand.
+**cognee-visualization** — Single-file HTML knowledge-graph visualization (d3.js v7) with four tabs — Graph, Schema, Memory, Semantic — plus a node inspector. `preprocessor` derives the whole payload (node/link normalization, stage + `topological_rank` layout, colour maps, memory map, type-schema graph, operation layer); `html` substitutes it into the frontend assets under `assets/`, which are vendored **verbatim** from Python and must never be hand-edited (see `assets/README.md`). Entry points: `visualize`/`render`/`render_multi_user`. Surfaces via the CLI `visualize` subcommand. Payload gaps in [roadmap/not-implemented.md](roadmap/not-implemented.md#visualization).
 
 **cognee-observability** — OpenTelemetry tracing pipeline. Bridges `#[tracing::instrument]` sites into an OTLP exporter. Entry point: `init_telemetry` (tracing layer + RAII `TelemetryGuard`). Activated by `COGNEE_TRACING_ENABLED=true` or a non-empty `OTEL_EXPORTER_OTLP_ENDPOINT`; real exporter behind the `telemetry` feature. See [observability/opentelemetry.md](observability/opentelemetry.md).
 

@@ -1,8 +1,42 @@
 //! Interactive HTML knowledge-graph visualization for Cognee-Rust.
 //!
-//! This crate ports the Python `cognee_network_visualization` module to Rust.
-//! It renders all nodes + edges of a `GraphDBTrait` into a single self-contained
-//! HTML file that uses d3.js v7 for force-directed layout and Canvas rendering.
+//! This crate ports two Python modules and vendors one frontend:
+//!
+//! * [`preprocessor.py`](https://github.com/topoteretes/cognee/blob/main/cognee/modules/visualization/preprocessor.py)
+//!   — turns raw `(nodes, edges)` into the renderer-facing snapshot: per-node
+//!   `stage` / `visual_rank` / `degree` / `importance` / `label_priority` /
+//!   `provenance`, per-link `edge_class` / `bundle_key`, the four provenance
+//!   color maps, the derived type-schema graph and the Memory-tab payload.
+//!   Ported in [`preprocessor`], which is public so callers can build the
+//!   renderer snapshot themselves (and so the parity tests can pin it).
+//! * [`cognee_network_visualization.py`](https://github.com/topoteretes/cognee/blob/main/cognee/modules/visualization/cognee_network_visualization.py)
+//!   — the orchestrator: reads the HTML shell and substitutes all 20
+//!   `__TOKEN__` slots (JS chunks first, data payloads second). Ported in the
+//!   private `html` module.
+//! * `template.html` + `views/{ui_chrome,schema_view,story_view,inspector,memory_map,semantic_map}.js`
+//!   — **vendored byte-for-byte** into `assets/`, not ported. They must be
+//!   re-synced wholesale from upstream rather than hand-edited; see
+//!   `assets/README.md` for the rule and the reason it exists.
+//!
+//! The rendered page has four tabs: **Graph** (canvas force/flow/story
+//! renderer), **Schema** (ontology diagram + type/instance inspector),
+//! **Memory** (deterministic column map of documents → chunks → entities →
+//! summaries → context) and **Semantic**.
+//!
+//! # Deferred pieces
+//!
+//! * **Semantic tab** — `__SEMANTIC_POSITIONS__` and `__SEMANTIC_CLUSTERS__`
+//!   are both the literal `null`, so the tab renders its friendly empty state.
+//!   Rust's `cognee_vector::SearchResult` carries no `vector` field, so stored
+//!   embeddings cannot be read back, and the workspace has no PCA/SVD or
+//!   k-means. This is the same state Python reaches whenever its own
+//!   best-effort `_semantic_payload` raises.
+//! * **Session events** — `__SEARCH_EVENTS__` is the literal `[]`; there is no
+//!   Rust equivalent of Python's `visualization/session_events.py`, so the
+//!   Memory timeline rail and the Semantic recall overlay stay empty.
+//! * **Subgraph bounding** — Python's `subgraph_data.py` (bounded per-dataset
+//!   subgraph extraction) has no Rust counterpart; Rust always renders the
+//!   full graph returned by `get_graph_data()`.
 //!
 //! # Quick start
 //!
@@ -24,9 +58,10 @@ mod colors;
 mod error;
 mod html;
 mod paths;
-mod serialize;
+pub mod preprocessor;
 
 pub use error::VisualizationError;
+pub use preprocessor::{ColorMaps, PreprocessedGraph, preprocess};
 
 use std::path::{Path, PathBuf};
 
@@ -72,12 +107,18 @@ pub async fn visualize(
 /// Render the HTML visualization string for the supplied graph database,
 /// without writing it anywhere.
 ///
+/// Preprocesses the raw graph (Python `preprocess(graph_data,
+/// schema_data=None)`) and then assembles the vendored HTML shell around it
+/// (Python `cognee_network_visualization`). `schema_data` is `None` here — the
+/// preprocessor derives the type-schema graph from the nodes and links it sees,
+/// which is what feeds the Schema tab.
+///
 /// Useful when the caller wants to stream the HTML over HTTP, embed it into a
 /// larger page, or post-process it before persisting.
 pub async fn render(graph_db: &dyn GraphDBTrait) -> Result<String, VisualizationError> {
     let (nodes, edges) = graph_db.get_graph_data().await?;
-    let serialized = serialize::serialize_graph(nodes, edges);
-    html::build_html(&serialized, None)
+    let pre = preprocessor::preprocess(nodes, edges, None);
+    html::build_html(&pre)
 }
 
 /// Render a combined HTML visualization aggregating multiple `(user_label, graph_db)`
@@ -86,7 +127,7 @@ pub async fn render(graph_db: &dyn GraphDBTrait) -> Result<String, Visualization
 /// Each pair's nodes are tagged with a `source_user` attribute carrying the
 /// supplied human-readable label so the d3 template can color-code by user.
 /// Mirrors Python's `aggregate_multi_user_graphs()` in
-/// [`cognee/modules/visualization/cognee_network_visualization.py:115-157`](https://github.com/topoteretes/cognee/blob/main/cognee/modules/visualization/cognee_network_visualization.py#L115-L157):
+/// [`cognee/modules/visualization/cognee_network_visualization.py:184-227`](https://github.com/topoteretes/cognee/blob/main/cognee/modules/visualization/cognee_network_visualization.py#L184-L227):
 ///
 /// - Nodes are deduplicated by `str(node_id)` with **first-write-wins**
 ///   semantics so iteration order across the supplied pairs determines the
@@ -108,11 +149,11 @@ pub async fn render_multi_user(
     use std::borrow::Cow;
     use std::collections::{HashMap, HashSet};
 
-    // First-write-wins by stringified node id (mirror Python L142).
+    // First-write-wins by stringified node id (mirror Python L211).
     let mut all_nodes: HashMap<String, cognee_graph::GraphNode> = HashMap::new();
     let mut node_order: Vec<String> = Vec::new();
 
-    // Edge dedupe by (source, target, relation) (mirror Python L150-155).
+    // Edge dedupe by (source, target, relation) (mirror Python L221-225).
     let mut all_edges: Vec<cognee_graph::EdgeData> = Vec::new();
     let mut seen_edges: HashSet<(String, String, String)> = HashSet::new();
 
@@ -126,11 +167,15 @@ pub async fn render_multi_user(
             // Mirror Python's `if not node_info.get("source_user"): node_info["source_user"] = user_label`
             // — preserve any pre-existing `source_user` on the node so the
             // owning user's value (if already tagged) survives.
-            let needs_label = match node_info.get("source_user") {
-                Some(serde_json::Value::String(s)) if !s.is_empty() => false,
-                Some(serde_json::Value::Null) | None => true,
-                _ => false,
-            };
+            //
+            // `not x` is Python *truthiness*, so `""`, `0`, `false`, `[]` and
+            // `{}` are all "unlabelled" and must be overwritten just like a
+            // missing key. Getting this wrong left the node's `source_user`
+            // falsy, kept it out of the `userColors` map and left it uncoloured
+            // in the colour-by-user overlay.
+            let needs_label = !node_info
+                .get("source_user")
+                .is_some_and(preprocessor::is_truthy);
             if needs_label {
                 node_info.insert(
                     Cow::Borrowed("source_user"),
@@ -153,6 +198,6 @@ pub async fn render_multi_user(
         .filter_map(|k| all_nodes.remove(&k))
         .collect();
 
-    let serialized = serialize::serialize_graph(ordered_nodes, all_edges);
-    html::build_html(&serialized, None)
+    let pre = preprocessor::preprocess(ordered_nodes, all_edges, None);
+    html::build_html(&pre)
 }

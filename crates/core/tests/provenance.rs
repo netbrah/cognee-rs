@@ -18,6 +18,13 @@
 //! 7. content_hash inherits from context
 //! 8. content_hash on DP overrides context for further recursion
 //!
+//! A further six cases cover `topological_rank` stamping, ported from
+//! `run_tasks_base.py:69-75` (`_stamp_provenance`'s `task_index` branch):
+//! the `Some(0)` sentinel and `None` are both writable, an existing
+//! non-zero rank is never overwritten, `task_rank: None` / `Some(0)` never
+//! write, children inherit the parent's rank, and already-visited
+//! DataPoints are skipped.
+//!
 //! A ninth drift-guard test (`extract_helpers_cover_all_known_datapoint_types`)
 //! is a stub; it will be fleshed out by gap 05-04 when `HasDataPoint`
 //! impls land on the `cognee-models` container types.
@@ -92,6 +99,23 @@ fn ctx<'a>(
         user_label,
         node_set,
         content_hash,
+        // The rank-specific cases below build their own contexts; the shared
+        // helper stays rank-free so the pre-existing cases keep asserting the
+        // `source_*` behaviour in isolation.
+        task_rank: None,
+    }
+}
+
+/// Same as [`ctx`] but with an explicit `task_rank`, for the
+/// `topological_rank` parity cases.
+fn ctx_with_rank<'a>(task_rank: Option<i32>) -> ProvenanceContext<'a> {
+    ProvenanceContext {
+        pipeline_name: "cognify_pipeline",
+        task_name: "extract_graph_from_data",
+        user_label: None,
+        node_set: None,
+        content_hash: None,
+        task_rank,
     }
 }
 
@@ -231,6 +255,95 @@ fn content_hash_on_dp_overrides_context() {
     assert_eq!(
         parent.child.base.source_content_hash.as_deref(),
         Some("md5:dp")
+    );
+}
+
+// ── topological_rank (Python `run_tasks_base.py:69-75`) ────────────────────
+
+#[test]
+fn task_rank_stamps_zero_sentinel() {
+    let mut leaf = LeafContainer::new();
+    // `DataPoint::new` initialises the field to the `Some(0)` sentinel;
+    // assert that rather than assuming, so a constructor change trips here.
+    assert_eq!(leaf.base.topological_rank, Some(0));
+
+    let mut visited = HashSet::new();
+    stamp_tree(&mut leaf, &ctx_with_rank(Some(3)), &mut visited);
+
+    assert_eq!(leaf.base.topological_rank, Some(3));
+}
+
+#[test]
+fn task_rank_stamps_none() {
+    let mut leaf = LeafContainer::new();
+    leaf.base.topological_rank = None;
+
+    let mut visited = HashSet::new();
+    stamp_tree(&mut leaf, &ctx_with_rank(Some(3)), &mut visited);
+
+    assert_eq!(leaf.base.topological_rank, Some(3));
+}
+
+#[test]
+fn existing_non_zero_task_rank_not_overwritten() {
+    let mut leaf = LeafContainer::new();
+    leaf.base.topological_rank = Some(2);
+
+    let mut visited = HashSet::new();
+    stamp_tree(&mut leaf, &ctx_with_rank(Some(5)), &mut visited);
+
+    assert_eq!(
+        leaf.base.topological_rank,
+        Some(2),
+        "an upstream (earlier) rank must win, mirroring Python's guard"
+    );
+}
+
+#[test]
+fn absent_or_zero_task_rank_never_writes() {
+    // `task_rank: None` — Python's `ctx is None` / non-context pipeline.
+    let mut leaf = LeafContainer::new();
+    leaf.base.topological_rank = None;
+    let mut visited = HashSet::new();
+    stamp_tree(&mut leaf, &ctx_with_rank(None), &mut visited);
+    assert_eq!(leaf.base.topological_rank, None);
+
+    // `task_rank: Some(0)` — Python's `task_index > 0` guard.
+    let mut leaf = LeafContainer::new();
+    leaf.base.topological_rank = None;
+    let mut visited = HashSet::new();
+    stamp_tree(&mut leaf, &ctx_with_rank(Some(0)), &mut visited);
+    assert_eq!(leaf.base.topological_rank, None);
+}
+
+#[test]
+fn nested_children_inherit_task_rank() {
+    let mut parent = ParentContainer::new();
+    parent.child.base.topological_rank = None;
+
+    let mut visited = HashSet::new();
+    stamp_tree(&mut parent, &ctx_with_rank(Some(4)), &mut visited);
+
+    assert_eq!(parent.base.topological_rank, Some(4));
+    assert_eq!(
+        parent.child.base.topological_rank,
+        Some(4),
+        "the rank flows unchanged into `for_each_child_mut` descendants"
+    );
+}
+
+#[test]
+fn visited_datapoint_skipped_for_task_rank() {
+    let mut leaf = LeafContainer::new();
+    let mut visited = HashSet::new();
+    visited.insert(leaf.base.id);
+
+    stamp_tree(&mut leaf, &ctx_with_rank(Some(3)), &mut visited);
+
+    assert_eq!(
+        leaf.base.topological_rank,
+        Some(0),
+        "an already-visited DataPoint is skipped entirely (Python parity)"
     );
 }
 

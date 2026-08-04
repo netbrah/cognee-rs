@@ -55,6 +55,16 @@ pub struct ProvenanceContext<'a> {
     /// Default `content_hash` inherited by stamped DPs whose own
     /// `source_content_hash` is `None`.
     pub content_hash: Option<&'a str>,
+    /// 1-based position of the emitting task in the pipeline. Written to
+    /// `DataPoint.topological_rank` when that field is still unset (`None` or
+    /// `Some(0)`). `None` means "do not stamp a rank" (Python's `ctx is None`
+    /// non-context-pipeline case).
+    ///
+    /// Python parity:
+    /// `run_tasks_base.py:69-75` (`task_index is not None and task_index > 0`)
+    /// with `task_index` derived from the deduplicated task sequence at
+    /// `run_tasks_base.py:181-190`.
+    pub task_rank: Option<i32>,
 }
 
 /// Stamp a tree of [`HasDataPoint`] values in place.
@@ -70,6 +80,12 @@ pub struct ProvenanceContext<'a> {
 /// - **Inheritance**: `node_set` and `content_hash` inherit from the
 ///   parent context if absent on the DP, but a value already present
 ///   on the DP overrides for further recursion.
+/// - **Topological rank**: `ctx.task_rank` is written to
+///   `DataPoint.topological_rank` only while the field is still unset
+///   (`None` or the `Some(0)` Python sentinel) and flows unchanged to
+///   children, matching `run_tasks_base.py:69-75`. Already-visited
+///   DataPoints are skipped for the rank write too — Python's visited
+///   set covers the same branch.
 pub fn stamp_tree(
     root: &mut dyn HasDataPoint,
     ctx: &ProvenanceContext<'_>,
@@ -92,6 +108,15 @@ pub fn stamp_tree(
             && let Some(u) = ctx.user_label
         {
             dp.source_user = Some(u.to_string());
+        }
+        // Topological rank: only stamped while still unset. `Some(0)` is
+        // Python's "unset" sentinel, hence the `None | Some(0)` match
+        // (parity with `if current_rank is None or current_rank == 0`).
+        if let Some(rank) = ctx.task_rank
+            && rank > 0
+            && matches!(dp.topological_rank, None | Some(0))
+        {
+            dp.topological_rank = Some(rank);
         }
     }
 
@@ -127,6 +152,7 @@ pub fn stamp_tree(
         user_label: ctx.user_label,
         node_set: current_node_set.as_deref(),
         content_hash: current_hash.as_deref(),
+        task_rank: ctx.task_rank,
     };
 
     root.for_each_child_mut(&mut |child| {

@@ -28,6 +28,7 @@ fn read_max_db_size() -> u64 {
         .unwrap_or(DEFAULT_MAX_DB_SIZE)
 }
 
+use crate::types::parse_audit_timestamp;
 use crate::{EdgeData, GraphDBError, GraphDBResult, GraphDBTrait, GraphNode, NodeData};
 
 /// Strip control characters (`\u{0000}`–`\u{001F}`, except `\t`, `\n`, `\r`)
@@ -322,6 +323,15 @@ impl LadybugAdapter {
     /// Extracts core fields (id, name, type) and serializes remaining fields
     /// as a JSON properties string.
     ///
+    /// `created_at` / `updated_at` are copied into the dedicated `TIMESTAMP`
+    /// columns **and left in the properties blob**, mirroring Python's
+    /// `add_nodes` (`ladybug/adapter.py:1120-1141`), which pops only
+    /// `id`/`name`/`type` (plus the provenance columns Rust does not have) before
+    /// `json.dumps`. That is not redundancy: the columns record *when this write
+    /// happened*, while the blob preserves the `DataPoint`'s own epoch-ms
+    /// `created_at`, which is the only thing [`GraphDBTrait::get_graph_data`]
+    /// returns — and therefore the only source for the visualization's
+    /// `t_created` / Memory-tab timeline.
     fn serialize_to_node_props(&self, node: &serde_json::Value) -> GraphDBResult<NodeProperties> {
         let mut props = if let serde_json::Value::Object(map) = node.clone() {
             map
@@ -331,19 +341,8 @@ impl LadybugAdapter {
             ));
         };
 
-        let created_at = props
-            .get("created_at")
-            .and_then(|v| v.as_str())
-            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(Utc::now);
-
-        let updated_at = props
-            .get("updated_at")
-            .and_then(|v| v.as_str())
-            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(Utc::now);
+        let created_at = parse_audit_timestamp(props.get("created_at")).unwrap_or_else(Utc::now);
+        let updated_at = parse_audit_timestamp(props.get("updated_at")).unwrap_or_else(Utc::now);
 
         let id = props
             .get("id")
@@ -366,8 +365,6 @@ impl LadybugAdapter {
             .to_string();
 
         props.remove("id");
-        props.remove("created_at");
-        props.remove("updated_at");
         props.remove("type");
         props.remove("data_type");
 

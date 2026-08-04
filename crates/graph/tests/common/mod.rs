@@ -376,6 +376,78 @@ pub async fn test_get_graph_data(db: &dyn GraphDBTrait) {
     assert_eq!(edges.len(), 1);
 }
 
+/// `get_graph_data()` must hand back the `DataPoint`'s own epoch-ms
+/// `created_at` / `updated_at`.
+///
+/// Python keeps both in the serialized `properties` payload (its `core_keys` /
+/// popped-key set is only `{id, name, type}`) and merges that payload back on
+/// read, which is what makes `preprocessor.py`'s `t_created` — and with it the
+/// Memory tab's run timeline and its summary/chunk ordering — work on real data.
+/// Rust used to strip them at the write boundary, so `t_created` could only ever
+/// appear in hand-written fixtures and every timeline was synthetic.
+///
+/// This runs against a real backend on purpose: `MockGraphDB` echoes whatever
+/// JSON it was handed, so it cannot observe the core-field/properties split that
+/// dropped the value.
+pub async fn test_get_graph_data_surfaces_created_at(db: &dyn GraphDBTrait) {
+    db.delete_graph().await.unwrap();
+
+    // `cognee_models::DataPoint` serializes both fields as epoch milliseconds.
+    const CREATED_AT: i64 = 1_768_164_683_000;
+    const UPDATED_AT: i64 = 1_768_164_684_500;
+
+    db.add_node_raw(json!({
+        "id": "ts1",
+        "name": "Timestamped",
+        "type": "DocumentChunk",
+        "created_at": CREATED_AT,
+        "updated_at": UPDATED_AT,
+        "chunk_index": 0,
+    }))
+    .await
+    .unwrap();
+
+    let (nodes, _edges) = db.get_graph_data().await.unwrap();
+    let (_, props) = nodes
+        .iter()
+        .find(|(id, _)| id == "ts1")
+        .expect("ts1 returned by get_graph_data");
+
+    assert_eq!(
+        props.get("created_at").and_then(serde_json::Value::as_i64),
+        Some(CREATED_AT),
+        "get_graph_data must surface the epoch-ms created_at; got {:?}",
+        props.get("created_at")
+    );
+    assert_eq!(
+        props.get("updated_at").and_then(serde_json::Value::as_i64),
+        Some(UPDATED_AT),
+        "get_graph_data must surface the epoch-ms updated_at; got {:?}",
+        props.get("updated_at")
+    );
+    // The ordinary property must be unaffected.
+    assert_eq!(
+        props.get("chunk_index").and_then(serde_json::Value::as_i64),
+        Some(0)
+    );
+
+    // A node written without timestamps must not have any fabricated: the
+    // preprocessor keys "does this node have a creation time?" off their absence.
+    db.add_node_raw(json!({"id": "ts2", "name": "Legacy", "type": "DocumentChunk"}))
+        .await
+        .unwrap();
+    let (nodes, _edges) = db.get_graph_data().await.unwrap();
+    let (_, legacy) = nodes
+        .iter()
+        .find(|(id, _)| id == "ts2")
+        .expect("ts2 returned by get_graph_data");
+    assert!(
+        legacy.get("created_at").is_none(),
+        "created_at must not be invented for a node that carried none: {:?}",
+        legacy.get("created_at")
+    );
+}
+
 pub async fn test_get_graph_metrics(db: &dyn GraphDBTrait) {
     db.delete_graph().await.unwrap();
 

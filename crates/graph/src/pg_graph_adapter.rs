@@ -27,7 +27,7 @@ use tracing::debug;
 
 use crate::error::{GraphDBError, GraphDBResult};
 use crate::traits::GraphDBTrait;
-use crate::types::{EdgeData, GraphNode, NodeData};
+use crate::types::{EdgeData, GraphNode, NodeData, parse_audit_timestamp};
 
 /// Max rows per INSERT batch (6 params per node row, 6 per edge row → 600 params at 100 rows,
 /// well within PostgreSQL's limit). Matches `PgVectorAdapter::BATCH_SIZE`.
@@ -214,6 +214,14 @@ impl PgGraphAdapter {
     }
 
     /// Extract core fields from a JSON value and build a [`NodeRow`].
+    ///
+    /// `created_at` / `updated_at` populate the dedicated `TIMESTAMPTZ` columns
+    /// *and* stay in the JSONB `properties`, mirroring Python's `add_nodes`
+    /// (`postgres/adapter.py:266-289`) whose `core_keys` is exactly
+    /// `{"id", "name", "type"}`. The columns record when the row was written; the
+    /// blob preserves the `DataPoint`'s own epoch-ms `created_at`, which is what
+    /// [`GraphDBTrait::get_graph_data`] returns and the visualization turns into
+    /// `t_created`.
     fn serialize_node_to_row(node: &Value) -> GraphDBResult<NodeRow> {
         let obj = node
             .as_object()
@@ -238,28 +246,12 @@ impl PgGraphAdapter {
             .to_string();
 
         let now = Utc::now();
-        let created_at = obj
-            .get("created_at")
-            .and_then(|v| v.as_str())
-            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or(now);
-        let updated_at = obj
-            .get("updated_at")
-            .and_then(|v| v.as_str())
-            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or(now);
+        let created_at = parse_audit_timestamp(obj.get("created_at")).unwrap_or(now);
+        let updated_at = parse_audit_timestamp(obj.get("updated_at")).unwrap_or(now);
 
-        // Everything that isn't a core field goes into `properties`.
-        let core_keys = [
-            "id",
-            "name",
-            "type",
-            "data_type",
-            "created_at",
-            "updated_at",
-        ];
+        // Everything that isn't a core field goes into `properties`. `created_at`
+        // and `updated_at` are deliberately *not* core keys — see the doc comment.
+        let core_keys = ["id", "name", "type", "data_type"];
         let extra: serde_json::Map<String, Value> = obj
             .iter()
             .filter(|(k, _)| !core_keys.contains(&k.as_str()))

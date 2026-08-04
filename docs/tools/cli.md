@@ -30,7 +30,7 @@ feature-gated).
 | `delete` | Remove data/datasets across all backends | `-d/--dataset-name` \| `--dataset-id`, `--data-id`, `--all`, `--mode` (`soft`/`hard`), `--dry-run`, `-f/--force` | — |
 | `config get\|set\|unset <key>` | Read/write the persisted JSON config | — | — |
 | `run-sequence` | Run a scripted add/cognify/search sequence | — | — |
-| `visualize` | Render the graph to a self-contained HTML file | `-o/--output` (`~/graph_visualization.html`) | `visualization` |
+| `visualize` | Render the graph to a single-file multi-tab HTML page | `-o/--output` (`~/graph_visualization.html`) | `visualization` |
 | `bench` | Phase-timed benchmark driver | `--memories`, `--mock-llm`, `--output` | `bench` |
 
 The feature-gated commands are enabled in the default build of `cognee-cli`

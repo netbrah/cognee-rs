@@ -32,21 +32,38 @@ use crate::graph_integration::types::{GraphEdgePair, GraphNodePair};
 /// this pre-stamp coexists with cognify's local `stamp_provenance`
 /// helper at `crates/cognify/src/tasks.rs`; the `if dp.source_X.is_none()`
 /// guards inside [`stamp_tree`] make double-stamping a no-op.
+///
+/// `task_rank` is the 1-based pipeline position written to
+/// `topological_rank`, or `None` to leave the field at its `Some(0)`
+/// sentinel. It is a **parameter, not a constant**, because this helper has
+/// two unrelated callers with different correct answers:
+///
+/// - the graph-expansion path below, reached from the extract-graph task,
+///   which passes that task's rank (entities are persisted to the graph DB
+///   inside `extract_graph_from_data`, before the task body's own stamp
+///   runs, so the rank has to be right here);
+/// - [`crate::tasks::add_data_points`], which pre-stamps freshly-counted
+///   `EdgeType` DataPoints and passes `None` — Python's
+///   `index_graph_edges.py:50` builds those `EdgeType` objects without ever
+///   handing them to a provenance stamper, so their rank stays at the `0`
+///   sentinel and matching that is the parity-correct outcome.
 pub(crate) fn pre_stamp_extraction(
     target: &mut dyn HasDataPoint,
     user_label: Option<&str>,
+    task_rank: Option<i32>,
     visited: &mut HashSet<Uuid>,
 ) {
     let ctx = ProvenanceContext {
-        // Locked Decision 14 (LIB-06): the pipeline name carried on
-        // every stamped DataPoint is `"cognify"`. Must byte-match
-        // [`crate::tasks::COGNIFY_PIPELINE_STAMP_NAME`] and the
-        // `.with_name("cognify")` set on `build_cognify_pipeline`.
-        pipeline_name: "cognify",
-        task_name: "extract_graph_from_data",
+        // Locked Decision 14 (LIB-06): the pipeline name carried on every
+        // stamped DataPoint. Must byte-match the `.with_name(...)` set on
+        // `build_cognify_pipeline` — hence the shared constant rather than a
+        // second literal.
+        pipeline_name: crate::tasks::COGNIFY_PIPELINE_STAMP_NAME,
+        task_name: crate::tasks::EXTRACT_GRAPH_TASK_NAME,
         user_label,
         node_set: None,
         content_hash: None,
+        task_rank,
     };
     stamp_tree(target, &ctx, visited);
 }
@@ -90,9 +107,16 @@ pub(crate) fn pre_stamp_extraction(
 /// * `ontology_resolver` - Ontology resolver for entity validation and enrichment.
 ///   When loaded, validates entity types against "classes" and entities against
 ///   "individuals". A [`NoOpOntologyResolver`] leaves everything unvalidated.
+/// * `task_rank` - 1-based position of the calling task in its pipeline,
+///   written to `topological_rank` on every created Entity / EntityType (see
+///   [`pre_stamp_extraction`]). Pass
+///   `Some(`[`crate::tasks::EXTRACT_GRAPH_TASK_RANK`]`)` for the default
+///   cognify pipeline, the task's real position for a custom pipeline, or
+///   `None` to leave the rank unstamped.
 ///
 /// # Returns
 /// Tuple of (graph_nodes, graph_edges) for storage.
+#[allow(clippy::too_many_arguments)]
 pub async fn expand_with_nodes_and_edges(
     graphs: Vec<(Uuid, KnowledgeGraph)>,
     dataset_id: Uuid,
@@ -101,6 +125,7 @@ pub async fn expand_with_nodes_and_edges(
     existing_edges_set: &HashSet<String>,
     ontology_resolver: &dyn OntologyResolver,
     user_label: Option<&str>,
+    task_rank: Option<i32>,
 ) -> (Vec<GraphNodePair>, Vec<GraphEdgePair>) {
     // Function-local visited set for the pre-stamp pass. The executor's
     // per-run set sees the same DataPoints during its own walk and
@@ -151,7 +176,7 @@ pub async fn expand_with_nodes_and_edges(
                 // Python: `importance_weight=data_chunk.importance_weight`
                 // (expand_with_nodes_and_edges.py:163).
                 et.base.importance_weight = Some(chunk_importance_weight);
-                pre_stamp_extraction(&mut et, user_label, &mut local_visited);
+                pre_stamp_extraction(&mut et, user_label, task_rank, &mut local_visited);
 
                 if ontology_resolver.is_loaded() {
                     match ontology_resolver.get_subgraph(&node.node_type, "classes", true) {
@@ -178,6 +203,7 @@ pub async fn expand_with_nodes_and_edges(
                                 &mut ontology_types_map,
                                 &mut ontology_entities_map,
                                 user_label,
+                                task_rank,
                                 &mut local_visited,
                             );
                             // The resolver returns the matched root class
@@ -251,7 +277,12 @@ pub async fn expand_with_nodes_and_edges(
                     chunk_node_sets.get(&chunk_id),
                     chunk_importance_weight,
                 );
-                pre_stamp_extraction(&mut entity_pair.entity, user_label, &mut local_visited);
+                pre_stamp_extraction(
+                    &mut entity_pair.entity,
+                    user_label,
+                    task_rank,
+                    &mut local_visited,
+                );
 
                 if ontology_resolver.is_loaded() {
                     match ontology_resolver.get_subgraph(&node.name, "individuals", true) {
@@ -304,6 +335,7 @@ pub async fn expand_with_nodes_and_edges(
                     &mut ontology_types_map,
                     &mut ontology_entities_map,
                     user_label,
+                    task_rank,
                     &mut local_visited,
                 );
                 process_ontology_edges(
@@ -494,6 +526,7 @@ fn process_ontology_nodes(
     ontology_types_map: &mut HashMap<String, EntityType>,
     ontology_entities_map: &mut HashMap<String, GraphNodePair>,
     user_label: Option<&str>,
+    task_rank: Option<i32>,
     visited: &mut HashSet<Uuid>,
 ) {
     for node in ontology_nodes {
@@ -521,7 +554,7 @@ fn process_ontology_nodes(
                 // Python: `importance_weight=data_chunk.importance_weight`
                 // (expand_with_nodes_and_edges.py:66).
                 et.base.importance_weight = Some(importance_weight);
-                pre_stamp_extraction(&mut et, user_label, visited);
+                pre_stamp_extraction(&mut et, user_label, task_rank, visited);
                 ontology_types_map.insert(dedup_key, et);
             }
             NodeCategory::Individuals => {
@@ -541,7 +574,7 @@ fn process_ontology_nodes(
                 // Python: `importance_weight=data_chunk.importance_weight`
                 // (expand_with_nodes_and_edges.py:79).
                 entity.base.importance_weight = Some(importance_weight);
-                pre_stamp_extraction(&mut entity, user_label, visited);
+                pre_stamp_extraction(&mut entity, user_label, task_rank, visited);
 
                 // Placeholder EntityType for the GraphNodePair (Rust-only; the
                 // Python `Entity(is_a=...)` field is optional). Its id is stable
@@ -549,7 +582,7 @@ fn process_ontology_nodes(
                 let mut placeholder_et =
                     EntityType::new("OntologyIndividual", "", Some(dataset_id));
                 placeholder_et.base.id = EntityType::id_for("OntologyIndividual");
-                pre_stamp_extraction(&mut placeholder_et, user_label, visited);
+                pre_stamp_extraction(&mut placeholder_et, user_label, task_rank, visited);
 
                 let pair = GraphNodePair {
                     entity,
@@ -665,6 +698,7 @@ mod tests {
             &HashSet::new(),
             &noop(),
             None,
+            None,
         )
         .await;
 
@@ -697,6 +731,7 @@ mod tests {
             &HashSet::new(),
             &noop(),
             None,
+            None,
         )
         .await;
 
@@ -720,6 +755,7 @@ mod tests {
             &HashMap::new(),
             &HashSet::new(),
             &noop(),
+            None,
             None,
         )
         .await;
@@ -750,6 +786,7 @@ mod tests {
             &HashSet::new(),
             &noop(),
             None,
+            None,
         )
         .await;
 
@@ -772,6 +809,7 @@ mod tests {
             &HashMap::new(),
             &HashSet::new(),
             &noop(),
+            None,
             None,
         )
         .await;
@@ -810,6 +848,7 @@ mod tests {
             &HashMap::new(),
             &HashSet::new(),
             &noop(),
+            None,
             None,
         )
         .await;
@@ -862,6 +901,7 @@ mod tests {
             &HashSet::new(),
             &noop(),
             None,
+            None,
         )
         .await;
 
@@ -897,6 +937,7 @@ mod tests {
             &HashMap::new(),
             &HashSet::new(),
             &noop(),
+            None,
             None,
         )
         .await;
@@ -936,6 +977,7 @@ mod tests {
             &chunk_importance_weights,
             &HashSet::new(),
             &resolver,
+            None,
             None,
         )
         .await;
@@ -981,6 +1023,7 @@ mod tests {
             &HashSet::new(),
             &noop(),
             None,
+            None,
         )
         .await;
 
@@ -1000,6 +1043,7 @@ mod tests {
             &HashMap::new(),
             &HashSet::new(),
             &noop(),
+            None,
             None,
         )
         .await;
@@ -1052,6 +1096,7 @@ mod tests {
             &HashSet::new(),
             &noop(),
             None,
+            None,
         )
         .await;
 
@@ -1100,6 +1145,7 @@ mod tests {
             &HashMap::new(),
             &HashSet::new(),
             &noop(),
+            None,
             None,
         )
         .await;
@@ -1226,6 +1272,7 @@ mod tests {
             &HashSet::new(),
             &resolver,
             None,
+            None,
         )
         .await;
 
@@ -1290,6 +1337,7 @@ mod tests {
             &HashMap::new(),
             &HashSet::new(),
             &noop(),
+            None,
             None,
         )
         .await;
@@ -1364,6 +1412,7 @@ mod tests {
             &mut ontology_types_map,
             &mut ontology_entities_map,
             None,
+            None,
             &mut HashSet::new(),
         );
 
@@ -1415,6 +1464,7 @@ mod tests {
             &mut ontology_types_map,
             &mut ontology_entities_map,
             None,
+            None,
             &mut HashSet::new(),
         );
 
@@ -1444,6 +1494,7 @@ mod tests {
             &type_map,
             &mut ontology_types_map,
             &mut ontology_entities_map,
+            None,
             None,
             &mut HashSet::new(),
         );
@@ -1583,6 +1634,7 @@ mod tests {
             &HashSet::new(),
             &resolver,
             None,
+            None,
         )
         .await;
 
@@ -1633,6 +1685,7 @@ mod tests {
             &HashSet::new(),
             &resolver,
             None,
+            None,
         )
         .await;
 
@@ -1680,6 +1733,7 @@ mod tests {
             &HashMap::new(),
             &HashSet::new(),
             &resolver,
+            None,
             None,
         )
         .await;
@@ -1746,6 +1800,7 @@ mod tests {
             &HashSet::new(),
             &resolver,
             None,
+            None,
         )
         .await;
 
@@ -1809,6 +1864,7 @@ mod tests {
             &HashSet::new(),
             &resolver,
             None,
+            None,
         )
         .await;
 
@@ -1834,6 +1890,12 @@ mod tests {
         // from `expand_with_nodes_and_edges` with `source_pipeline` and
         // `source_task` already set, mirroring Python's
         // `_stamp_provenance_deep` in `extract_graph_from_data.py`.
+        //
+        // The caller-supplied `task_rank` must land on both halves of every
+        // pair: the nodes are persisted to the graph DB inside
+        // `extract_graph_from_data`, so a rank applied after this call would
+        // never reach the stored rows.
+        const CALLER_RANK: i32 = 3;
         let dataset_id = Uuid::new_v4();
         let chunk_id = Uuid::new_v4();
         let graph = create_test_graph();
@@ -1846,6 +1908,7 @@ mod tests {
             &HashSet::new(),
             &noop(),
             Some("alice@example.com"),
+            Some(CALLER_RANK),
         )
         .await;
 
@@ -1853,8 +1916,14 @@ mod tests {
         for pair in &nodes {
             assert_eq!(
                 pair.entity_type.base.source_pipeline.as_deref(),
-                Some("cognify"),
-                "EntityType '{}' should be pre-stamped with cognify",
+                Some("cognify_pipeline"),
+                "EntityType '{}' should be pre-stamped with cognify_pipeline",
+                pair.entity_type.name
+            );
+            assert_eq!(
+                pair.entity_type.base.topological_rank,
+                Some(CALLER_RANK),
+                "EntityType '{}' should carry the caller-supplied task_rank",
                 pair.entity_type.name
             );
             assert_eq!(
@@ -1872,8 +1941,14 @@ mod tests {
 
             assert_eq!(
                 pair.entity.base.source_pipeline.as_deref(),
-                Some("cognify"),
-                "Entity '{}' should be pre-stamped with cognify",
+                Some("cognify_pipeline"),
+                "Entity '{}' should be pre-stamped with cognify_pipeline",
+                pair.entity.name
+            );
+            assert_eq!(
+                pair.entity.base.topological_rank,
+                Some(CALLER_RANK),
+                "Entity '{}' should carry the caller-supplied task_rank",
                 pair.entity.name
             );
             assert_eq!(

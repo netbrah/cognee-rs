@@ -43,6 +43,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in the input value. Python behaves the same way, holding `data_item` on its
   per-item context for the duration of the run.
 
+- **`cognee-cognify`: `source_pipeline` is now stamped with Python's pipeline
+  names.** Rust stamped the bare `"cognify"` / `"memify"`; Python stamps
+  `"cognify_pipeline"` / `"memify_pipeline"`, so the value persisted on every
+  node and edge differed between the two SDKs. Rust now matches Python. Anything
+  that filtered graph data on the old short names must be updated — but note the
+  mismatch already broke in-tree lookups: `dataset_resolver`,
+  `cognee::api::datasets` and three HTTP routers all queried the long names the
+  executor never wrote, so those paths could never match and are fixed by this
+  change. `"temporal-cognify"` is unchanged (it has no Python counterpart).
+
+- **`cognee-cognify`: `extract_graph_from_data` and `expand_with_nodes_and_edges`
+  each take one additional argument.** Both gained a `task_rank` parameter so a
+  caller composing a custom pipeline can supply the correct
+  `DataPoint::topological_rank`; without it the deep pre-stamp inside graph
+  expansion would defeat any override. Both are `pub` and therefore
+  semver-visible, though every caller in this workspace and in the C/Python/TS/
+  Java bindings is internal to `cognee-cognify`.
+
+### Added
+
+- **`cognee-visualization`: the Python multi-view frontend is now what Rust
+  renders.** `crates/visualization` previously shipped a fork of Python's
+  pre-refactor single-view template, which meant no Memory tab, no Story/Flow
+  layouts, no inspector, and a Schema tab that was dead code (`schema_data` was
+  hardcoded `None` at both call sites). Python's `preprocessor.py` is now ported
+  (the enriched node/link payload — `stage`, `visual_rank`, `degree`,
+  `importance`, `label_priority`, `t_created`, `provenance`, and Python-exact
+  `derive_node_name` / `edge_class` / `bundle_key` — plus the four colour maps,
+  the schema graph and the operations catalog), and Python's `template.html` and
+  `views/*.js` are vendored verbatim. Two areas are deliberately not ported: the
+  Semantic tab emits `null` (its Python tests assert exact float equality against
+  `np.linalg.svd` PCA and seeded k-means++, which is unattainable rather than
+  merely expensive), and bounded k-hop rendering is unimplemented — Rust renders
+  the whole graph, which is Python's `full=True` mode.
+
+- **`cognee-models`: `DataPoint::topological_rank` is now written at runtime.**
+  The field existed but was only ever `None`, so graphs produced by Rust and read
+  by Python tooling fell back to the legacy `node_type_rank` layout with
+  `has_meaningful_topological_rank = false`. Ranks now match Python's *default*
+  pipeline numbering: because Python fuses graph extraction and summarization into
+  one task, `summarize_text` shares rank 3 with `extract_graph`. Rank is inherently
+  pipeline-shape-dependent in both SDKs, so the new
+  `make_*_task_with_rank` builders let a custom pipeline supply its own values.
+
 ### Fixed
 
 - **`cognee-core`: batch-dispatched tasks now observe cancellation.** A run
@@ -75,6 +119,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reporting from inside was a silent no-op. Batch tasks now receive their own
   subtoken, and the accumulation loops complete that slice once the producer is
   exhausted.
+
+- **`cognee-core`: batch-dispatched tasks now have their output provenance
+  stamped.** This is the last of the four services listed above to move, leaving
+  two genuinely withheld (retries and per-task watcher events); the module docs in
+  `crates/core/src/pipeline.rs` record the revision. Provenance went last because
+  its cost looked recoverable — a missing pipeline/task label could be filled in
+  downstream. `DataPoint::topological_rank` removes that recovery: the rank write
+  is single-shot (`None | Some(0)`, mirroring Python's `if current_rank is None or
+  current_rank == 0`), so the first task to touch a DataPoint fixes its rank
+  forever, and every DataPoint born in a batch stage was stamped with the
+  *predecessor's* rank — one pipeline column short, permanently. `dispatch_batch`
+  now builds a fresh `ProvenanceInputs` for the batch task itself and applies it to
+  the task's `Single`, `Iter` and `Stream` outputs alike; the `Single` case was
+  previously not stamped at all. Python has no such gap — `handle_task` assigns
+  every task its own `task_index` regardless of batching.
+
+- **`cognee-graph`: `created_at` now reaches consumers of `get_graph_data()`.**
+  Both adapters stripped it before persisting the properties blob (Ladybug removed
+  it outright; the Postgres adapter excluded it via `core_keys`), and both parsed
+  it as an RFC 3339 string although `DataPoint` stores epoch milliseconds, so every
+  real write silently fell back to `Utc::now()`. Python keeps the value in the
+  properties blob and pops only `{id, name, type}`, so Rust now does the same, and
+  a shared `parse_audit_timestamp` accepts both epoch-ms integers and RFC 3339.
+  Without this the visualization's Memory-tab timeline was inert on real data.
+
+- **`cognee-models`: `DataPoint::topological_rank` gained `#[serde(default)]`.**
+  Unlike its `source_*` neighbours the field had no serde attributes, and an
+  `Option<T>` without a default is still a required key — so deserializing any
+  node-properties blob written before the field existed failed outright. It now
+  defaults to Python's `0` sentinel and serializes as `0` rather than `null`.
+
+- **`cognee-visualization`: embedded payloads can no longer corrupt the rendered
+  page.** The 20 template tokens were substituted with sequential
+  `String::replace` calls over the whole document, so a graph containing the
+  literal text of a *later* token had that token rewritten inside an
+  already-embedded JSON string — producing invalid JSON and a `SyntaxError` that
+  blanked every tab. Substitution is now a single left-to-right pass that never
+  rescans injected values, which also replaces 20 whole-document copies with one.
+
+- **`cognee-visualization`: node colours and per-user attribution match Python.**
+  `ontology_valid` was `#D8D8D8`, the value Python replaced with `#FF5CA8`
+  precisely because it was indistinguishable from the `#DBD8D8` unknown-type
+  fallback; `NodeSet` was missing from the type map entirely; and
+  `render_multi_user` treated a present-but-falsy `source_user` (`""`, `0`,
+  `false`) as already-attributed, where Python's `if not …` overwrites it.
 
 ## [0.2.0](https://github.com/topoteretes/cognee-rs/compare/v0.1.3...v0.2.0) - 2026-07-30
 
