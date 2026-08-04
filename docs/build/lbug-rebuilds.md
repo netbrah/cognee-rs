@@ -211,10 +211,44 @@ Stale agent worktrees each hold a 13–18 GB target dir; remove with
   runners, so `http-parity.yml` persists the mount with
   `reproducible-containers/buildkit-cache-dance` + `actions/cache`
   (inject before build, extract after).
-- Rust-side equivalent: `sccache` as `RUSTC_WRAPPER` would also cache the
-  ~700 dependency crates across fresh worktree target dirs. Not wired because
-  a hard `RUSTC_WRAPPER` breaks machines without sccache; revisit if worktree
-  warm-up (not lbug) becomes the bottleneck.
+- Rust-side equivalent: `sccache` as `RUSTC_WRAPPER` also caches the ~700
+  dependency crates across fresh worktree target dirs. Now wired — see
+  "sccache for the Rust half" below for how it stays safe on machines that do
+  not have it, and for the two ways of wiring it that are *not* safe.
+
+### sccache for the Rust half (wired, opt-in by installation)
+
+`scripts/check_all.sh` exports `RUSTC_WRAPPER=sccache` when that binary is on
+PATH, and leaves it unset otherwise. A caller-set `RUSTC_WRAPPER` still wins.
+
+Deliberately *not* done two more obvious ways, both of which are broken in ways
+that only surface off a macOS dev machine:
+
+- **A `#!/bin/sh` wrapper script**, mirroring `ccache-launcher.sh`. A shell
+  interposed between cargo and rustc drops every environment variable whose
+  name is not a valid shell identifier. Linux `/bin/sh` is dash, which discards
+  `CARGO_BIN_EXE_cognee-cli`, so `crates/cli/tests` fails to compile;
+  `env CARGO_BIN_EXE_cognee-cli=X dash wrapper.sh env | grep -c cognee-cli`
+  prints 0 under dash and 1 under bash. This was tried and turned PR CI red on
+  every Linux runner while passing locally.
+- **`build.rustc-wrapper` in `.cargo/config.toml`.** That applies on Windows
+  too, where CreateProcess cannot launch a `.sh` at all, breaking every Windows
+  release leg — the same hazard `capi-release.yml` already resets the CMake
+  launcher variables for.
+
+Toggling sccache does **not** invalidate cargo fingerprints: verified by
+building, rebuilding with a wrapper, then rebuilding without — both follow-ups
+were 0-crate no-ops. So installing or removing it costs no rebuild.
+
+The trade against the config.toml approach is scope: this covers
+`check_all.sh` runs rather than every `cargo` invocation. Export it yourself
+for interactive builds.
+
+What it will not cache, by design rather than by failure: units built with
+`-C incremental` (every first-party crate), proc macros, build scripts, and
+the final bin/cdylib/staticlib links. Those fall back to a normal compile. The
+registry dependencies are the cached part — the same graph this repo compiles
+four times over.
 
 ### Escape hatch: prebuilt Ladybug (`LBUG_LIBRARY_DIR`)
 
