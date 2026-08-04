@@ -43,6 +43,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in the input value. Python behaves the same way, holding `data_item` on its
   per-item context for the duration of the run.
 
+### Fixed
+
+- **`cognee-core`: batch-dispatched tasks now observe cancellation.** A run
+  cancelled while its *terminal* task was a `*Batch` variant used to drain the
+  upstream producer, keep writing every remaining batch to the graph and vector
+  stores, and then return `Ok` with status `Completed`. The executor's only
+  cancellation check sat at the top of `execute_from`, *after* the empty-tasks
+  base case, so `execute_from(rest=[], ..)` returned before reaching it; neither
+  the `process_iter` / `process_stream` accumulation loops nor the batch branch
+  of `dispatch_batch` checked at all. Both loops now stop pulling from the
+  producer once cancelled, and `dispatch_batch` re-checks before invoking a batch
+  task. Such a run now returns `ExecutionError::Cancelled`.
+
+- **`cognee-core`: batch-dispatched tasks are now rate-limited.**
+  `Pipeline::with_rate_limiter` and `TaskInfo::with_rate_limiter` were threaded
+  only into `call_with_retry`, so a configured limiter silently did not apply to
+  `*Batch` tasks — a pipeline whose LLM or embedding work happened in a batch
+  task ran unthrottled. `dispatch_batch` now acquires the effective limiter
+  (per-task override, else pipeline-level) once per batch call. Note the
+  granularity: single-value tasks acquire once per *retry attempt*, batch tasks
+  once per *batch*.
+
+- **`cognee-core`: batch-dispatched tasks now report progress.** The per-task
+  progress subtoken was completed only by `execute_from`, so a batch consumer's
+  slice never advanced and `ProgressToken::root_fraction()` — exported by all
+  three bindings — under-reported permanently after a *successful* run (a
+  two-task pipeline ending in a batch task stuck at 0.5). The task could not
+  compensate either: it was handed the run-level context whose `progress` is the
+  root token, and `ProgressToken::split` had already zeroed the root's width, so
+  reporting from inside was a silent no-op. Batch tasks now receive their own
+  subtoken, and the accumulation loops complete that slice once the producer is
+  exhausted.
+
 ## [0.2.0](https://github.com/topoteretes/cognee-rs/compare/v0.1.3...v0.2.0) - 2026-07-30
 
 ### Breaking changes

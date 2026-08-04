@@ -17,8 +17,8 @@
 //! accumulates its items into a buffer (sized by [`TaskInfo::with_batch_size`])
 //! and hands the buffer to `dispatch_batch`. If the consuming task is one of the
 //! `*Batch` [`Task`] variants, `dispatch_batch` calls it **directly** with the
-//! accumulated slice, skipping `call_with_retry` entirely. Such a task gets
-//! **none** of the following six services:
+//! accumulated slice, skipping `call_with_retry` entirely. Three services live
+//! in `call_with_retry` and are therefore **not** applied to such a task:
 //!
 //! 1. **Retries.** The configured [`RetryPolicy`] is never consulted; the batch
 //!    call is made exactly once and the first error fails the item.
@@ -30,24 +30,27 @@
 //!    already stamped eagerly by the upstream `process_iter` / `process_stream`,
 //!    but anything the batch task newly creates stays unstamped unless the task
 //!    stamps it itself.)
-//! 4. **Rate limiting.** Neither [`Pipeline::with_rate_limiter`] nor
-//!    [`TaskInfo::with_rate_limiter`] is acquired — the effective limiter is
-//!    threaded only into `call_with_retry`. Batch calls are unthrottled.
-//! 5. **Progress-subtoken completion.** The per-task progress subtoken is only
-//!    completed by `execute_from`, so a batch task's slice of the progress bar
-//!    never advances. The task cannot compensate from inside, either: it is
-//!    handed the run-level [`TaskContext`], whose `progress` is the *root* token,
-//!    and [`ProgressToken::split`] has already zeroed the root's width — so
-//!    `ctx.progress.set(..)` from a batch task is a silent no-op.
-//! 6. **Cancellation observation.** The executor's only cancellation check sits
-//!    at the top of `execute_from`, *after* the empty-tasks base case. The batch
-//!    branch of `dispatch_batch` never checks, and neither do the `process_iter`
-//!    / `process_stream` accumulation loops — so a batch task can still be
-//!    entered, and further batches still accumulated, after the run has been
-//!    cancelled.
 //!
-//! What a batch task *does* get is the pre-accumulated slice and the run-level
-//! context; it is expected to handle its own error semantics.
+//! Three further services used to be missing on this path and are now provided
+//! directly by `dispatch_batch` and the accumulation loops, so a batch task can
+//! rely on them:
+//!
+//! - **Rate limiting.** The effective limiter — [`TaskInfo::with_rate_limiter`]
+//!   if set, otherwise [`Pipeline::with_rate_limiter`] — is acquired once per
+//!   batch call, a batch being one external request.
+//! - **Progress.** The batch task is handed *its own* progress subtoken rather
+//!   than the run-level one, so it can report intermediate progress; the slice
+//!   is completed once its producer is exhausted. (`dispatch_batch` runs once
+//!   per accumulated batch and cannot tell which call is the last, so
+//!   completion happens in `process_iter` / `process_stream`.)
+//! - **Cancellation.** Both accumulation loops stop pulling from the producer
+//!   once the run is cancelled, and `dispatch_batch` re-checks before invoking
+//!   the batch task. A terminal batch task needs its own check because
+//!   `execute_from(rest=[], ..)` returns via the empty-tasks base case *before*
+//!   reaching the check at the top of `execute_from`.
+//!
+//! What a batch task *does* get, beyond those three, is the pre-accumulated
+//! slice; it is expected to handle its own error semantics.
 //!
 //! This is a **divergence from Python cognee**, where every task goes through
 //! `handle_task` and receives stamping, telemetry and spans regardless of
@@ -190,12 +193,10 @@ pub struct Pipeline {
     /// `Pipeline` struct shape is stable across feature flips. The
     /// snapshot is only consumed when the `telemetry` feature is on.
     pub telemetry_settings: Option<serde_json::Map<String, serde_json::Value>>,
-    /// Pipeline-wide proactive rate limiter applied to every **single-value**
-    /// task call, via `call_with_retry`. Individual tasks may override it via
-    /// [`TaskInfo::rate_limiter`]. `None` means no throttling.
-    ///
-    /// Batch-dispatched (`*Batch`) task calls are **not** throttled — see
-    /// [`Pipeline::with_rate_limiter`].
+    /// Pipeline-wide proactive rate limiter applied to every task call: once per
+    /// retry attempt for single-value tasks (via `call_with_retry`) and once per
+    /// batch for `*Batch` tasks (via `dispatch_batch`). Individual tasks may
+    /// override it via [`TaskInfo::rate_limiter`]. `None` means no throttling.
     pub rate_limiter: Option<Arc<dyn RateLimiter>>,
 }
 
@@ -273,11 +274,10 @@ impl Pipeline {
     /// each retry is a fresh acquisition. Use this for LLM API quota throttling
     /// or per-host crawl-rate control.
     ///
-    /// **Batch calls are not throttled today.** `dispatch_batch` invokes a
-    /// `*Batch` task directly without acquiring the limiter — the effective
-    /// limiter is threaded only into `call_with_retry` — so a pipeline whose LLM
-    /// work happens in a batch task gets no throttling from this setting. See
-    /// [Batch dispatch bypasses executor services](crate::pipeline#batch-dispatch-bypasses-executor-services).
+    /// Batch calls are throttled too: `dispatch_batch` acquires the effective
+    /// limiter once per batch call, a batch being one external request. Note the
+    /// difference in granularity — a single-value task acquires once per *retry
+    /// attempt*, a batch task once per *batch*.
     ///
     /// See [`crate::rate_limiter`] for the distinction between this,
     /// [`Pipeline::with_concurrency`] (item parallelism), and [`RetryPolicy`]
@@ -1338,14 +1338,17 @@ fn execute_from<'a>(
 ///   all outputs.
 ///
 /// **Design note:** batch-dispatched tasks bypass [`call_with_retry`], and with
-/// it *six* executor services — there are no retries, no per-task watcher
-/// events, no provenance stamping, no rate-limiter acquisition, no
-/// progress-subtoken completion, and no cancellation check. Batch tasks receive
-/// pre-accumulated slices and are expected to handle their own error semantics.
-/// Only single-value tasks executed via [`execute_from`] get the full treatment.
+/// it *three* executor services — there are no retries, no per-task watcher
+/// events, and no provenance stamping of the batch task's own output. Batch
+/// tasks receive pre-accumulated slices and are expected to handle their own
+/// error semantics. Only single-value tasks executed via [`execute_from`] get
+/// those three.
+///
+/// Rate limiting, progress and cancellation *are* provided on this path —
+/// acquired / scoped / checked here rather than in `call_with_retry`.
 ///
 /// This doc comment is the code-side summary; the authoritative version, with
-/// the reasoning for each of the six, is the module documentation:
+/// the reasoning for each service, is the module documentation:
 /// [Batch dispatch bypasses executor services](crate::pipeline#batch-dispatch-bypasses-executor-services).
 /// Keep the two in sync.
 fn dispatch_batch<'a>(
@@ -1374,7 +1377,52 @@ fn dispatch_batch<'a>(
             // the batch task's output reuses the visited-set
             // (already-stamped items short-circuit; new items adopt
             // the parent task's provenance as a best-effort default).
-            let call = next_info.task.call_batch(&batch, env.ctx.clone());
+
+            // Cancellation: `execute_from`'s check is unreachable for a
+            // *terminal* batch task, because `execute_from(rest=[], ..)`
+            // returns via its empty-tasks base case before reaching it. Check
+            // here so a cancelled run stops before writing another batch
+            // rather than draining the producer and reporting success.
+            if env.ctx.cancellation.is_cancelled() {
+                return Err(ExecutionError::Cancelled);
+            }
+
+            // Rate limiting: the batch task's own limiter wins over the
+            // pipeline-level one, mirroring `execute_from`'s `effective_rl`.
+            // Acquired once per batch call — a batch is one external request.
+            if let Some(rl) = next_info.rate_limiter.as_ref().or(env.rate_limiter) {
+                rl.acquire().await;
+
+                // The wait above is unbounded — a 1/s limiter parks here for
+                // roughly a second — so a cancellation arriving during it would
+                // otherwise still let this batch fire. Re-check before calling.
+                //
+                // Deliberately *not* racing `acquire()` against
+                // `cancellation.cancelled()`: `RateLimiter` is a public trait,
+                // and dropping a third-party `acquire()` future mid-poll would
+                // require a cancel-safety guarantee the trait does not state.
+                // (The built-in limiters are cancel-safe — they await a tokio
+                // `Semaphore` — but external impls need not be.) Letting the
+                // acquisition finish costs a cancelled run at most one limiter
+                // slot and never invokes the task.
+                if env.ctx.cancellation.is_cancelled() {
+                    return Err(ExecutionError::Cancelled);
+                }
+            }
+
+            // Progress: hand the batch task *its own* subtoken rather than the
+            // root token. `ProgressToken::split` zeroes the root's width, so a
+            // batch task reporting into the root context was a silent no-op and
+            // it could not describe its own progress at all. `with_progress`
+            // preserves `pipeline_ctx`, so `current_data` still resolves to the
+            // originating item. Completion is set by the caller once the
+            // producer is exhausted — `dispatch_batch` runs once per accumulated
+            // batch and cannot know which call is the last.
+            let batch_ctx = env
+                .ctx
+                .with_progress(env.task_subtokens[first_index].clone());
+
+            let call = next_info.task.call_batch(&batch, batch_ctx);
             let resolved =
                 resolve_call(call)
                     .await
@@ -1435,6 +1483,12 @@ async fn process_iter(
     let mut batch: Vec<Box<dyn Value>> = Vec::with_capacity(batch_size);
 
     for mut item in iter {
+        // Stop pulling from the producer once cancelled. Without this the loop
+        // drains the whole iterator and keeps dispatching batches after the
+        // cancel request.
+        if env.ctx.cancellation.is_cancelled() {
+            return Err(ExecutionError::Cancelled);
+        }
         // Drop sentinel: discard this item before stamping or accumulating.
         if crate::sentinels::is_dropped(item.as_ref()) {
             continue;
@@ -1452,6 +1506,8 @@ async fn process_iter(
     if !batch.is_empty() {
         outputs.append(&mut dispatch_batch(batch, tail, first_index, prov_inputs, env).await?);
     }
+
+    complete_batch_progress(tail, first_index, env);
 
     Ok(outputs)
 }
@@ -1474,7 +1530,28 @@ async fn process_stream(
     let mut outputs = Vec::new();
     let mut batch: Vec<Box<dyn Value>> = Vec::with_capacity(batch_size);
 
-    while let Some(mut item) = stream.next().await {
+    loop {
+        // Race the producer against cancellation rather than checking after
+        // each item: a slow or stalled stream would otherwise keep a cancelled
+        // run alive indefinitely, parked on `next()`. `biased` makes
+        // cancellation win deterministically when both are ready, and
+        // `StreamExt::next` is cancel-safe, so dropping it mid-poll loses
+        // nothing. (`process_iter` cannot do this — a synchronous iterator
+        // offers nothing to await, so it checks per item instead.)
+        //
+        // `cancel_requested`, *not* `cancelled`: the latter also resolves when
+        // the `CancellationHandle` is dropped, and every caller drops it
+        // (`let (_handle, ctx) = ..`), so that arm would win immediately and
+        // abort every streaming pipeline.
+        let next = tokio::select! {
+            biased;
+            () = env.ctx.cancellation.cancel_requested() => {
+                return Err(ExecutionError::Cancelled);
+            }
+            next = stream.next() => next,
+        };
+        let Some(mut item) = next else { break };
+
         // Drop sentinel: discard this item before stamping or accumulating.
         if crate::sentinels::is_dropped(item.as_ref()) {
             continue;
@@ -1493,7 +1570,25 @@ async fn process_stream(
         outputs.append(&mut dispatch_batch(batch, tail, first_index, prov_inputs, env).await?);
     }
 
+    complete_batch_progress(tail, first_index, env);
+
     Ok(outputs)
+}
+
+/// Mark a batch consumer's progress slice complete once its producer is
+/// exhausted.
+///
+/// `dispatch_batch` runs once per accumulated batch and cannot tell which call
+/// is the last, so it hands the batch task its subtoken (letting the task report
+/// its own progress) but never completes it. The accumulation loops do know, so
+/// completion happens here.
+///
+/// Only batch consumers need this: a non-batch consumer is reached through
+/// `execute_from`, which already sets its subtoken on every invocation.
+fn complete_batch_progress(tail: &[TaskInfo], first_index: usize, env: &ExecEnv<'_>) {
+    if tail.first().is_some_and(|next| next.task.is_batch()) {
+        env.task_subtokens[first_index].set(1.0);
+    }
 }
 
 /// Eagerly stamp a single boxed iter / stream item using the
@@ -3495,5 +3590,388 @@ mod tests {
             "the input must still be alive while a later task runs — that is \
              what pinning current_data per item means"
         );
+    }
+
+    // ── Executor services on the batch-dispatch path ─────────────────────────
+    //
+    // `dispatch_batch` calls a `*Batch` task directly, bypassing
+    // `call_with_retry`. Three services used to be lost with it — rate limiting,
+    // progress and cancellation — and are now provided on this path. Each test
+    // below fails before the corresponding fix.
+    //
+    // All three build a pipeline whose *terminal* task is a batch variant,
+    // because that is the shape that hid the cancellation bug:
+    // `execute_from(rest=[], ..)` returns via its empty-tasks base case before
+    // reaching the only `is_cancelled()` check.
+
+    /// Counts `acquire()` calls so a test can assert the batch path throttles.
+    struct CountingLimiter(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait]
+    impl crate::rate_limiter::RateLimiter for CountingLimiter {
+        async fn acquire(&self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Build a ctx with a pipeline context, returning the cancellation handle so
+    /// the caller can cancel mid-run. `stub_ctx_with_pipeline` drops its handle.
+    async fn cancellable_ctx(
+        name: &str,
+    ) -> (crate::cancellation::CancellationHandle, Arc<TaskContext>) {
+        let base = stub_ctx_with_pipeline(name).await;
+        let (handle, token) = cancellation_pair();
+        let ctx = Arc::new(TaskContext {
+            thread_pool: Arc::clone(&base.thread_pool),
+            database: Arc::clone(&base.database),
+            graph_db: Arc::clone(&base.graph_db),
+            vector_db: Arc::clone(&base.vector_db),
+            cancellation: token,
+            progress: base.progress.clone(),
+            pipeline_ctx: base.pipeline_ctx.clone(),
+            exec_status: Arc::clone(&base.exec_status),
+            pipeline_watcher: None,
+        });
+        (handle, ctx)
+    }
+
+    /// An iterator task that fans `n` items out to a terminal batch task.
+    fn fan_out_task(n: i32) -> Task {
+        Task::sync_iter_typed(move |_: &i32, _ctx| Ok((0..n).map(Box::new)))
+    }
+
+    #[tokio::test]
+    async fn cancellation_stops_a_terminal_batch_task() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_in_task = Arc::clone(&calls);
+        let handle_slot: Arc<std::sync::Mutex<Option<crate::cancellation::CancellationHandle>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let handle_in_task = Arc::clone(&handle_slot);
+
+        // Cancels the run from inside its first invocation, then returns Ok — so
+        // nothing but the cancellation check can stop the remaining batches.
+        let collect = Task::sync_batch(
+            move |items: &[Box<dyn Value>],
+                  _ctx: Arc<TaskContext>|
+                  -> Result<Arc<dyn Value>, TaskError> {
+                calls_in_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // lock poison is unrecoverable
+                if let Some(h) = handle_in_task.lock().unwrap().as_ref() {
+                    h.cancel();
+                }
+                Ok(Arc::new(items.len() as i32) as Arc<dyn Value>)
+            },
+        );
+
+        // 6 items at batch_size 2 → 3 batches if nothing stops it.
+        let pipeline = Pipeline::new("cancel-batch")
+            .with_name("cancel-batch")
+            .with_task(TaskInfo::new(fan_out_task(6)))
+            .with_task(TaskInfo::new(collect).with_batch_size(2));
+
+        let (handle, ctx) = cancellable_ctx("cancel-batch").await;
+        // lock poison is unrecoverable
+        *handle_slot.lock().unwrap() = Some(handle);
+
+        let input: Arc<dyn Value> = Arc::new(0_i32);
+        let result = execute(&pipeline, vec![input], ctx, &NoopWatcher).await;
+
+        assert!(
+            matches!(result, Err(ExecutionError::Cancelled)),
+            "a cancelled run whose terminal task is a batch variant must report \
+             Cancelled, not Ok/Completed — got {:?}",
+            result.map(|o| o.len())
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the batch task must not be invoked again after cancellation"
+        );
+    }
+
+    /// A limiter that parks until released, so a test can cancel *during*
+    /// acquisition — the window a pre-acquire-only check leaves open.
+    struct BlockingLimiter {
+        release: Arc<tokio::sync::Notify>,
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl crate::rate_limiter::RateLimiter for BlockingLimiter {
+        async fn acquire(&self) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+    }
+
+    /// `with_batch_size` is documented to size the upstream accumulation buffer
+    /// whatever kind the consumer is — the doc used to claim it mattered only for
+    /// `*Batch` variants, which is why this is pinned.
+    ///
+    /// A non-batch consumer is invoked once per item, so the buffer size is not
+    /// visible in its arguments. It *is* visible in the interleaving: with
+    /// `batch_size` N the producer is pulled N times before any consumption. The
+    /// pipeline default is 32, so if the per-task override were ignored all six
+    /// items would be buffered first and the log would be `PPPPPPCCCCCC`.
+    #[tokio::test]
+    async fn batch_size_sizes_the_buffer_for_a_non_batch_consumer() {
+        let log = Arc::new(std::sync::Mutex::new(String::new()));
+
+        let produce_log = Arc::clone(&log);
+        let producer = Task::sync_iter_typed(move |_: &i32, _ctx| {
+            let produce_log = Arc::clone(&produce_log);
+            Ok((0..6).map(move |i| {
+                // lock poison is unrecoverable
+                produce_log.lock().unwrap().push('P');
+                Box::new(i)
+            }))
+        });
+
+        let consume_log = Arc::clone(&log);
+        let consumer = Task::sync_typed(move |i: &i32, _ctx| {
+            // lock poison is unrecoverable
+            consume_log.lock().unwrap().push('C');
+            Ok(Box::new(*i))
+        });
+
+        let pipeline = Pipeline::new("buffer-size")
+            .with_name("buffer-size")
+            .with_task(TaskInfo::new(producer))
+            // Non-batch consumer, per-task override of the 32-item default.
+            .with_task(TaskInfo::new(consumer).with_batch_size(2));
+
+        let ctx = stub_ctx_with_pipeline("buffer-size").await;
+        let input: Arc<dyn Value> = Arc::new(0_i32);
+        execute(&pipeline, vec![input], ctx, &NoopWatcher)
+            .await
+            .unwrap();
+
+        // lock poison is unrecoverable
+        let observed = log.lock().unwrap().clone();
+        assert_eq!(
+            observed, "PPCCPPCCPPCC",
+            "batch_size 2 must buffer two items at a time before handing them to \
+             a non-batch consumer; got {observed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_rate_limiter_wait_stops_the_batch() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_in_task = Arc::clone(&calls);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let entered = Arc::new(tokio::sync::Notify::new());
+
+        let limiter: Arc<dyn crate::rate_limiter::RateLimiter> = Arc::new(BlockingLimiter {
+            release: Arc::clone(&release),
+            entered: Arc::clone(&entered),
+        });
+
+        let collect = Task::sync_batch(
+            move |items: &[Box<dyn Value>],
+                  _ctx: Arc<TaskContext>|
+                  -> Result<Arc<dyn Value>, TaskError> {
+                calls_in_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Arc::new(items.len() as i32) as Arc<dyn Value>)
+            },
+        );
+
+        let pipeline = Pipeline::new("cancel-in-acquire")
+            .with_name("cancel-in-acquire")
+            .with_task(TaskInfo::new(fan_out_task(2)))
+            .with_task(
+                TaskInfo::new(collect)
+                    .with_batch_size(2)
+                    .with_rate_limiter(limiter),
+            );
+
+        let (handle, ctx) = cancellable_ctx("cancel-in-acquire").await;
+        let input: Arc<dyn Value> = Arc::new(0_i32);
+
+        // Cancel only once the limiter has parked, so the pre-acquire check has
+        // already passed and only a post-acquire check can catch it.
+        let canceller = tokio::spawn({
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            async move {
+                entered.notified().await;
+                handle.cancel();
+                release.notify_one();
+            }
+        });
+
+        let result = execute(&pipeline, vec![input], ctx, &NoopWatcher).await;
+        canceller.await.unwrap();
+
+        assert!(
+            matches!(result, Err(ExecutionError::Cancelled)),
+            "cancellation arriving while the rate limiter was parked must stop \
+             the batch — got {:?}",
+            result.map(|o| o.len())
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the batch task must not run when cancelled during acquisition"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_a_stalled_stream() {
+        // A stream that yields one item then never yields again. Without racing
+        // cancellation against `next()`, a cancelled run parks here forever.
+        let producer = Task::async_stream_typed(|_: &i32, _ctx| {
+            let s =
+                futures::stream::once(async { Box::new(1_i32) }).chain(futures::stream::pending());
+            Ok(s)
+        });
+
+        let collect = Task::sync_batch(
+            |items: &[Box<dyn Value>],
+             _ctx: Arc<TaskContext>|
+             -> Result<Arc<dyn Value>, TaskError> {
+                Ok(Arc::new(items.len() as i32) as Arc<dyn Value>)
+            },
+        );
+
+        // batch_size 2 with only one item ever produced: the loop is parked on
+        // `next()` when cancellation arrives, having dispatched nothing.
+        let pipeline = Pipeline::new("stalled-stream")
+            .with_name("stalled-stream")
+            .with_task(TaskInfo::new(producer))
+            .with_task(TaskInfo::new(collect).with_batch_size(2));
+
+        let (handle, ctx) = cancellable_ctx("stalled-stream").await;
+        let input: Arc<dyn Value> = Arc::new(0_i32);
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            handle.cancel();
+        });
+
+        // The timeout is the assertion: before the fix this never returns.
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            execute(&pipeline, vec![input], ctx, &NoopWatcher),
+        )
+        .await
+        .expect("a cancelled run must not hang on a stalled stream");
+
+        assert!(
+            matches!(result, Err(ExecutionError::Cancelled)),
+            "expected Cancelled, got {:?}",
+            result.map(|o| o.len())
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_calls_acquire_the_rate_limiter() {
+        let acquires = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let limiter: Arc<dyn crate::rate_limiter::RateLimiter> =
+            Arc::new(CountingLimiter(Arc::clone(&acquires)));
+
+        let collect = Task::sync_batch(
+            |items: &[Box<dyn Value>],
+             _ctx: Arc<TaskContext>|
+             -> Result<Arc<dyn Value>, TaskError> {
+                Ok(Arc::new(items.len() as i32) as Arc<dyn Value>)
+            },
+        );
+
+        // Limiter set on the batch task only, so the producer's own acquisition
+        // in `call_with_retry` cannot be mistaken for the batch path working.
+        // 6 items at batch_size 2 → exactly 3 batch calls.
+        let pipeline = Pipeline::new("rl-batch")
+            .with_name("rl-batch")
+            .with_task(TaskInfo::new(fan_out_task(6)))
+            .with_task(
+                TaskInfo::new(collect)
+                    .with_batch_size(2)
+                    .with_rate_limiter(limiter),
+            );
+
+        let ctx = stub_ctx_with_pipeline("rl-batch").await;
+        let input: Arc<dyn Value> = Arc::new(0_i32);
+        execute(&pipeline, vec![input], ctx, &NoopWatcher)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            acquires.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "the batch task's limiter must be acquired once per batch call"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_task_progress_reaches_completion() {
+        let collect = Task::sync_batch(
+            |items: &[Box<dyn Value>],
+             _ctx: Arc<TaskContext>|
+             -> Result<Arc<dyn Value>, TaskError> {
+                Ok(Arc::new(items.len() as i32) as Arc<dyn Value>)
+            },
+        );
+
+        let pipeline = Pipeline::new("progress-batch")
+            .with_name("progress-batch")
+            .with_task(TaskInfo::new(fan_out_task(6)))
+            .with_task(TaskInfo::new(collect).with_batch_size(2));
+
+        let ctx = stub_ctx_with_pipeline("progress-batch").await;
+        let root = ctx.progress.clone();
+        let input: Arc<dyn Value> = Arc::new(0_i32);
+        execute(&pipeline, vec![input], ctx, &NoopWatcher)
+            .await
+            .unwrap();
+
+        // Two equally-weighted tasks: without the fix the batch task's half is
+        // never completed and this sticks at 0.5 after a successful run.
+        assert_eq!(
+            root.root_fraction(),
+            1.0,
+            "a successful run must report full progress; the batch consumer's \
+             slice was left incomplete"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_task_gets_its_own_progress_subtoken() {
+        // The batch task must receive a *usable* token: reporting into the root
+        // context was a silent no-op because `split` zeroes the root's width.
+        let observed_width = Arc::new(std::sync::Mutex::new(Vec::<f64>::new()));
+        let widths = Arc::clone(&observed_width);
+
+        let collect = Task::sync_batch(
+            move |items: &[Box<dyn Value>],
+                  ctx: Arc<TaskContext>|
+                  -> Result<Arc<dyn Value>, TaskError> {
+                // lock poison is unrecoverable
+                widths.lock().unwrap().push(ctx.progress.width());
+                Ok(Arc::new(items.len() as i32) as Arc<dyn Value>)
+            },
+        );
+
+        let pipeline = Pipeline::new("subtoken-batch")
+            .with_name("subtoken-batch")
+            .with_task(TaskInfo::new(fan_out_task(4)))
+            .with_task(TaskInfo::new(collect).with_batch_size(2));
+
+        let ctx = stub_ctx_with_pipeline("subtoken-batch").await;
+        let input: Arc<dyn Value> = Arc::new(0_i32);
+        execute(&pipeline, vec![input], ctx, &NoopWatcher)
+            .await
+            .unwrap();
+
+        // lock poison is unrecoverable
+        let widths = observed_width.lock().unwrap().clone();
+        assert!(!widths.is_empty(), "the batch task should have run");
+        for w in widths {
+            assert!(
+                w > 0.0,
+                "the batch task was handed a zero-width token, so its own \
+                 progress reports cannot land anywhere"
+            );
+        }
     }
 }

@@ -958,6 +958,35 @@ pub async fn summarize_text(
 // Task 5: add_data_points
 // ---------------------------------------------------------------------------
 
+/// Why a provenance-ledger write was skipped, and hence how loudly to say so.
+///
+/// Extracted from the logging call so the level choice is directly testable:
+/// getting it wrong is not a compile error and shows up only as log noise (or
+/// silence) in someone else's deployment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LedgerSkip {
+    /// Both a database and a `user_id` are present — nothing was skipped.
+    NotSkipped,
+    /// A relational backend is configured, so the row *could* have been written;
+    /// the absent `user_id` is a genuine config inconsistency. Warn.
+    Inconsistent,
+    /// No relational backend at all — the ledger does not apply to this
+    /// deployment (embedded / unauthenticated use, where both are legitimately
+    /// `None` in the public `cognify()` signature). Must not warn: it would fire
+    /// once per data item and flag every normal ingest as data loss.
+    NotApplicable,
+}
+
+impl LedgerSkip {
+    fn classify(has_db: bool, has_user: bool) -> Self {
+        match (has_db, has_user) {
+            (true, true) => Self::NotSkipped,
+            (true, false) => Self::Inconsistent,
+            (false, _) => Self::NotApplicable,
+        }
+    }
+}
+
 /// Generate embeddings and index all data points in vector DB (Task 5).
 ///
 /// Generates embeddings for chunks, entities (name + description), summaries,
@@ -1144,6 +1173,10 @@ pub async fn add_data_points(
     .await?;
 
     // ── Provenance upsert (mirrors Python's `if user and dataset and data:`) ──
+    #[allow(
+        clippy::single_match_else,
+        reason = "the match is the tested decision; collapsing it hides the classification"
+    )]
     if let (Some(db), Some(user_id)) = (&db, input.user_id) {
         upsert_provenance(
             db,
@@ -1158,29 +1191,24 @@ pub async fn add_data_points(
             &structural_edges,
         )
         .await?;
-    } else if db.is_some() {
-        // A relational backend *is* configured, so the ledger row could have been
-        // written — the missing `user_id` is a genuine config inconsistency, not a
-        // deployment shape. Python degrades silently here
-        // (`add_data_points.py:123`); we make it loud.
-        warn!(
-            dataset_id = %input.dataset_id,
-            "Skipping provenance ledger write: a relational database is configured but \
-             user_id is None. Nodes and edges were written to the graph without a \
-             rollback/ownership record, so rollback and ownership tracking will not \
-             cover them."
-        );
     } else {
-        // No relational backend at all: the ledger is not applicable to this
-        // deployment (embedded / unauthenticated use, where `db` and `user_id` are
-        // legitimately `None` in the public `cognify()` signature). Not a
-        // data-integrity problem, so this must not be a WARN — it would fire once
-        // per data item and flag every normal ingest.
-        debug!(
-            dataset_id = %input.dataset_id,
-            "No relational database configured; provenance ledger write not applicable. \
-             Nodes and edges are in the graph with no rollback/ownership record."
-        );
+        match LedgerSkip::classify(db.is_some(), input.user_id.is_some()) {
+            LedgerSkip::Inconsistent => warn!(
+                dataset_id = %input.dataset_id,
+                "Skipping provenance ledger write: a relational database is configured but \
+                 user_id is None. Nodes and edges were written to the graph without a \
+                 rollback/ownership record, so rollback and ownership tracking will not \
+                 cover them."
+            ),
+            LedgerSkip::NotApplicable => debug!(
+                dataset_id = %input.dataset_id,
+                "No relational database configured; provenance ledger write not applicable. \
+                 Nodes and edges are in the graph with no rollback/ownership record."
+            ),
+            // Unreachable from here: the `if let` above matched both, so we only
+            // reach this arm if one of them is absent.
+            LedgerSkip::NotSkipped => {}
+        }
     }
 
     Ok(CognifyResult {
@@ -3846,6 +3874,38 @@ mod tests {
                 .iter()
                 .all(|c| c.base.importance_weight == Some(0.9)),
             "every chunk must inherit the document's importance_weight"
+        );
+    }
+
+    /// The ledger-skip classification decides a *log level*, which no type check
+    /// protects: getting it wrong is silent locally and shows up as either noise
+    /// or silence in someone else's deployment. `NotApplicable` must never be
+    /// `Inconsistent`, because a WARN there fires once per data item and flags
+    /// every normal embedded ingest as data loss — the regression this split
+    /// exists to prevent.
+    #[test]
+    fn ledger_skip_classification_matches_config_shape() {
+        assert_eq!(
+            LedgerSkip::classify(true, true),
+            LedgerSkip::NotSkipped,
+            "both present: the ledger row is written, nothing to report"
+        );
+        assert_eq!(
+            LedgerSkip::classify(true, false),
+            LedgerSkip::Inconsistent,
+            "a database is configured, so the row could have been written — the \
+             absent user_id is a real inconsistency and must warn"
+        );
+        // Both `db: None` shapes are supported configurations, not defects.
+        assert_eq!(
+            LedgerSkip::classify(false, false),
+            LedgerSkip::NotApplicable,
+            "no relational backend: the ledger does not apply, must not warn"
+        );
+        assert_eq!(
+            LedgerSkip::classify(false, true),
+            LedgerSkip::NotApplicable,
+            "a user_id without a backend is still nothing to warn about"
         );
     }
 
