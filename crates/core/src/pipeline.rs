@@ -3704,6 +3704,57 @@ mod tests {
         }
     }
 
+    /// `with_batch_size` is documented to size the upstream accumulation buffer
+    /// whatever kind the consumer is — the doc used to claim it mattered only for
+    /// `*Batch` variants, which is why this is pinned.
+    ///
+    /// A non-batch consumer is invoked once per item, so the buffer size is not
+    /// visible in its arguments. It *is* visible in the interleaving: with
+    /// `batch_size` N the producer is pulled N times before any consumption. The
+    /// pipeline default is 32, so if the per-task override were ignored all six
+    /// items would be buffered first and the log would be `PPPPPPCCCCCC`.
+    #[tokio::test]
+    async fn batch_size_sizes_the_buffer_for_a_non_batch_consumer() {
+        let log = Arc::new(std::sync::Mutex::new(String::new()));
+
+        let produce_log = Arc::clone(&log);
+        let producer = Task::sync_iter_typed(move |_: &i32, _ctx| {
+            let produce_log = Arc::clone(&produce_log);
+            Ok((0..6).map(move |i| {
+                // lock poison is unrecoverable
+                produce_log.lock().unwrap().push('P');
+                Box::new(i)
+            }))
+        });
+
+        let consume_log = Arc::clone(&log);
+        let consumer = Task::sync_typed(move |i: &i32, _ctx| {
+            // lock poison is unrecoverable
+            consume_log.lock().unwrap().push('C');
+            Ok(Box::new(*i))
+        });
+
+        let pipeline = Pipeline::new("buffer-size")
+            .with_name("buffer-size")
+            .with_task(TaskInfo::new(producer))
+            // Non-batch consumer, per-task override of the 32-item default.
+            .with_task(TaskInfo::new(consumer).with_batch_size(2));
+
+        let ctx = stub_ctx_with_pipeline("buffer-size").await;
+        let input: Arc<dyn Value> = Arc::new(0_i32);
+        execute(&pipeline, vec![input], ctx, &NoopWatcher)
+            .await
+            .unwrap();
+
+        // lock poison is unrecoverable
+        let observed = log.lock().unwrap().clone();
+        assert_eq!(
+            observed, "PPCCPPCCPPCC",
+            "batch_size 2 must buffer two items at a time before handing them to \
+             a non-batch consumer; got {observed}"
+        );
+    }
+
     #[tokio::test]
     async fn cancellation_during_rate_limiter_wait_stops_the_batch() {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
