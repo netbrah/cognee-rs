@@ -171,17 +171,104 @@ jobs:
       - name: Test (keyless)
         run: bash scripts/run_tests_no_secrets.sh
 
+  # ── Postgres graph adapter tests (mirror of ci.yml's `pggraph-postgres`) ──
+  # Belongs on this keyless lane because it genuinely needs no secrets: a
+  # service container starts from a public image on fork runs exactly as it does
+  # in-repo. Without it, the `PgGraphAdapter` suite would stay invisible to
+  # community contributors — `run_tests_no_secrets.sh` cannot reach it, since
+  # those tests are behind the non-default `postgres` cargo feature *and* the
+  # `PGGRAPH_TEST_URL` gate. Keep in sync with the ci.yml job.
+  pggraph-postgres:
+    name: Test (Postgres graph lane)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: cognee_test_graph
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      PGGRAPH_TEST_URL: postgres://postgres:postgres@localhost:5432/cognee_test_graph
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install mold linker
+        uses: rui314/setup-mold@v1
+        with:
+          make-default: true
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: ccache (lbug bundled C++, restore-only)
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: lbug-cxx
+          max-size: 1G
+          save: false
+
+      - name: Cache cargo/target (test, restore-only)
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-test-v6
+          save-if: "false"
+
+      - name: Cache ORT binary
+        uses: actions/cache@v4
+        with:
+          path: target/ort-cache
+          key: ort-v2.0.0-rc.12-cpu-linux-x86_64
+
+      # `--nocapture` plus the guard step below: a skipped case still reports
+      # `ok`, so the printed skip line is the only thing separating a real run
+      # from a green no-op. See the ci.yml twin for the full rationale.
+      - name: Run PgGraphAdapter integration tests
+        run: |
+          set -o pipefail
+          cargo test -p cognee-graph --features postgres,testing \
+            --test pg_graph_integration -- --nocapture 2>&1 | tee pggraph-integration.log
+
+      - name: Run PgGraphAdapter inline (lib) tests
+        run: |
+          set -o pipefail
+          cargo test -p cognee-graph --features postgres,testing \
+            --lib -- --nocapture 2>&1 | tee pggraph-lib.log
+
+      - name: Assert no test skipped
+        run: |
+          if grep -n "PGGRAPH_TEST_URL not set" pggraph-integration.log pggraph-lib.log; then
+            echo "::error::PgGraph tests skipped — PGGRAPH_TEST_URL never reached the test process."
+            exit 1
+          fi
+          echo "No skip markers: the Postgres graph suite really executed."
+
   # ── Aggregate status (single required check for branch protection) ────
   notify:
     name: Community Checks Status
-    needs: [ lint, test-no-secrets ]
+    needs: [ lint, test-no-secrets, pggraph-postgres ]
     runs-on: ubuntu-latest
     if: ${{ !cancelled() }}
     steps:
       - name: Check status
         run: |
           if [[ "${{ needs.lint.result }}" == "success" &&
-                "${{ needs.test-no-secrets.result }}" == "success" ]]; then
+                "${{ needs.test-no-secrets.result }}" == "success" &&
+                "${{ needs.pggraph-postgres.result }}" == "success" ]]; then
             echo "All community checks passed!"
           else
             echo "One or more community checks failed."

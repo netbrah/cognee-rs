@@ -634,7 +634,8 @@ jobs:
   # `pg_graph_adapter` is intentionally not exercised here — per-method
   # span instrumentation was deferred in 04-08 pending a fan-in
   # refactor (the public `query` is a stub returning
-  # `QueryError("not supported")`).
+  # `QueryError("not supported")`). That is a statement about spans only; the
+  # adapter's own integration tests run in the `pggraph-postgres` lane below.
   pgvector-spans:
     name: Test (Postgres span lane)
     needs: lint
@@ -703,6 +704,118 @@ jobs:
 
       - name: Run pgvector span instrumentation tests
         run: cargo test -p cognee-vector --test pgvector_span_instrumentation -- --nocapture
+
+  # ── Stage 2.5: Postgres graph adapter tests (depends on lint, parallel with `test`) ──
+  # `crates/graph/tests/pg_graph_integration.rs` and the two inline
+  # `shared_db_migration_tests` cases in `pg_graph_adapter.rs` all return early
+  # unless `PGGRAPH_TEST_URL` points at a live Postgres, so until this lane
+  # existed the whole `PgGraphAdapter` suite had never executed once — the
+  # `created_at` plumbing that the visualization Memory tab depends on was
+  # proven only for the Ladybug backend.
+  #
+  # Deliberately a sibling of `pgvector-spans` rather than extra steps in it:
+  # that lane's comment records a decision about per-method *span*
+  # instrumentation being deferred, which says nothing about the adapter's
+  # integration tests. Folding these in would falsify that comment and make the
+  # "span lane" name wrong.
+  #
+  # No secrets and no extensions: a service container spins up from a public
+  # image on every runner (forks included), and `PgGraphAdapter` is plain
+  # sea-orm over ordinary tables — no `CREATE EXTENSION` anywhere — so stock
+  # `postgres:16` is enough. Mirrored in `community.yml` for fork PRs.
+  pggraph-postgres:
+    name: Test (Postgres graph lane)
+    needs: lint
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        # Stock Postgres, not pgvector/pgvector — the graph path needs no
+        # extensions. `POSTGRES_DB` is the graph database directly, which is why
+        # no `CREATE DATABASE` step is needed: a service container creates
+        # exactly one database, so naming it here matches the URL the test file
+        # already documents.
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: cognee_test_graph
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      PGGRAPH_TEST_URL: postgres://postgres:postgres@localhost:5432/cognee_test_graph
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install mold linker
+        uses: rui314/setup-mold@v1
+        with:
+          make-default: true
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: ccache (lbug bundled C++, restore-only)
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: lbug-cxx
+          max-size: 1G
+          save: false
+
+      # Restore-only for the same reason as `pgvector-spans`: this lane builds
+      # one crate with a non-default feature set, so saving under the shared key
+      # would only fork a divergent copy of workspace-test-v6.
+      - name: Cache cargo/target (test, restore-only)
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-test-v6
+          save-if: "false"
+
+      - name: Cache ORT binary
+        uses: actions/cache@v4
+        with:
+          path: target/ort-cache
+          key: ort-v2.0.0-rc.12-cpu-linux-x86_64
+
+      # `--nocapture` is load-bearing here. A skipped `pggraph_test!` case still
+      # reports `ok`, so the printed `PGGRAPH_TEST_URL not set — skipping` line
+      # is the only signal that separates a real run from a green no-op. The
+      # logs are kept so the guard step below can turn that line into a failure.
+      - name: Run PgGraphAdapter integration tests
+        run: |
+          set -o pipefail
+          cargo test -p cognee-graph --features postgres,testing \
+            --test pg_graph_integration -- --nocapture 2>&1 | tee pggraph-integration.log
+
+      # The shared-DB migration and legacy-purge cases live inline in the crate,
+      # not in the integration file, so they need their own invocation.
+      - name: Run PgGraphAdapter inline (lib) tests
+        run: |
+          set -o pipefail
+          cargo test -p cognee-graph --features postgres,testing \
+            --lib -- --nocapture 2>&1 | tee pggraph-lib.log
+
+      # Without this, a future change that stops the URL reaching the test
+      # process (renamed env var, service container failing to bind) would leave
+      # this lane reporting green while every case inside it skips.
+      - name: Assert no test skipped
+        run: |
+          if grep -n "PGGRAPH_TEST_URL not set" pggraph-integration.log pggraph-lib.log; then
+            echo "::error::PgGraph tests skipped — PGGRAPH_TEST_URL never reached the test process."
+            exit 1
+          fi
+          echo "No skip markers: the Postgres graph suite really executed."
 
   # ── Stage 3: Language binding checks (depend on lint, parallel with `test`) ──
   # Gated on `lint` (not `test`) so the binding builds run concurrently with the
@@ -954,7 +1067,7 @@ jobs:
   # cognee `notify` aggregator.
   notify:
     name: Test Suite Status
-    needs: [ lint, msrv, wasm, test, docs-and-extras, pgvector-spans, capi-check, python-check, ts-check, java-check ]
+    needs: [ lint, msrv, wasm, test, docs-and-extras, pgvector-spans, pggraph-postgres, capi-check, python-check, ts-check, java-check ]
     runs-on: ubuntu-latest
     if: >-
       !cancelled() &&
@@ -969,6 +1082,7 @@ jobs:
                 "${{ needs.test.result }}" == "success" &&
                 "${{ needs.docs-and-extras.result }}" == "success" &&
                 "${{ needs.pgvector-spans.result }}" == "success" &&
+                "${{ needs.pggraph-postgres.result }}" == "success" &&
                 "${{ needs.capi-check.result }}" == "success" &&
                 "${{ needs.python-check.result }}" == "success" &&
                 "${{ needs.ts-check.result }}" == "success" &&
