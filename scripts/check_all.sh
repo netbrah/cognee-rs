@@ -69,6 +69,28 @@ cargo check -p cognee --no-default-features
 
 echo ""
 echo "================================================================"
+echo "=== Rust: Test (cognee-vector lancedb lane) ==="
+echo "================================================================"
+# crates/vector declares no default features, so a per-crate `cargo test -p
+# cognee-vector` runs ZERO of the inline LanceDB adapter tests. Only the
+# workspace-wide run covers them today (via feature unification from `cognee`),
+# which hides a break behind an unrelated dependency edge. Spell the lane out.
+cargo test -p cognee-vector --features lancedb
+
+echo ""
+echo "================================================================"
+echo "=== Rust: Compilation check (Postgres-only server: no onnx/ladybug/lancedb) ==="
+echo "================================================================"
+# Guards the seam a downstream consumer uses to drop the embedded backends —
+# ort (onnx), bundled ladybug C++, and the Arrow + lance stack — and run every
+# store on Postgres instead. Without a lane like this the `#[cfg(feature = ...)]`
+# paths behind those features rot and the seam silently stops building.
+# Scoped to cognee-http-server to stay cheap.
+cargo check -p cognee-http-server --no-default-features \
+  --features telemetry,html-loader,pgvector,pggraph
+
+echo ""
+echo "================================================================"
 echo "=== Rust: wasm32 Config-1 (logic crates + wasm test drift guard) ==="
 echo "================================================================"
 # The wasm smoke-test files are #![cfg(target_arch = "wasm32")], so the native
