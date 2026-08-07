@@ -171,17 +171,121 @@ jobs:
       - name: Test (keyless)
         run: bash scripts/run_tests_no_secrets.sh
 
+  # ── Postgres graph adapter tests (mirror of ci.yml's `pggraph-postgres`) ──
+  # Belongs on this keyless lane because it genuinely needs no secrets: a
+  # service container starts from a public image on fork runs exactly as it does
+  # in-repo. Without it, the `PgGraphAdapter` suite would stay invisible to
+  # community contributors — `run_tests_no_secrets.sh` cannot reach it, since
+  # those tests are behind the non-default `postgres` cargo feature *and* the
+  # `PGGRAPH_TEST_URL` gate.
+  #
+  # Fork PRs only — unlike `lint` / `test-no-secrets` above, which duplicate
+  # their keyed counterparts on every PR. This lane costs ~15 min and a second
+  # service container, and on an in-repo PR `ci.yml` already runs the identical
+  # job, so duplicating it would double both the runner cost and the flake
+  # surface (two required aggregators, either of which can fail on a transient
+  # container start) for zero extra coverage — right after #129 went to some
+  # trouble to cut PR wall-clock. The `notify` aggregator below therefore
+  # accepts `skipped` for this job.
+  #
+  # The steps are a mirror of the ci.yml job; the part that actually matters,
+  # the skip guard, is shared as `scripts/ci/assert_pggraph_suite_ran.sh` so it
+  # cannot drift between the two copies.
+  pggraph-postgres:
+    name: Test (Postgres graph lane)
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.head.repo.full_name != github.repository
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: cognee_test_graph
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      PGGRAPH_TEST_URL: postgres://postgres:postgres@localhost:5432/cognee_test_graph
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install mold linker
+        uses: rui314/setup-mold@v1
+        with:
+          make-default: true
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: ccache (lbug bundled C++, restore-only)
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: lbug-cxx
+          max-size: 1G
+          save: false
+
+      - name: Cache cargo/target (test, restore-only)
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-test-v6
+          save-if: "false"
+
+      # No ORT cache step — see the ci.yml twin: `cognee-graph` pulls in no
+      # `ort-sys`, and an unguarded writer here can poison the shared ORT key.
+
+      # `--nocapture` plus the guard step below: a skipped case still reports
+      # `ok`, so the printed skip line is the only thing separating a real run
+      # from a green no-op. Keep as `cargo test`, not nextest — see the ci.yml
+      # twin for both rationales.
+      #
+      # Note there is deliberately no retry here, unlike `test-no-secrets`'s
+      # `NEXTEST_PROFILE: ci`: a transient failure starting the Postgres service
+      # container should be visible rather than absorbed, since a silently
+      # retried infrastructure problem is how this suite went unexecuted for so
+      # long. Fork contributors who hit one can push an empty commit to re-run.
+      - name: Run PgGraphAdapter integration tests
+        run: |
+          set -o pipefail
+          cargo test -p cognee-graph --features postgres,testing \
+            --test pg_graph_integration -- --nocapture 2>&1 | tee pggraph-integration.log
+
+      - name: Run PgGraphAdapter inline (lib) tests
+        run: |
+          set -o pipefail
+          cargo test -p cognee-graph --features postgres,testing \
+            --lib -- --nocapture 2>&1 | tee pggraph-lib.log
+
+      - name: Assert the suite really executed
+        run: bash scripts/ci/assert_pggraph_suite_ran.sh pggraph-integration.log pggraph-lib.log
+
   # ── Aggregate status (single required check for branch protection) ────
   notify:
     name: Community Checks Status
-    needs: [ lint, test-no-secrets ]
+    needs: [ lint, test-no-secrets, pggraph-postgres ]
     runs-on: ubuntu-latest
     if: ${{ !cancelled() }}
     steps:
       - name: Check status
         run: |
+          # `skipped` is the expected result for pggraph-postgres on an in-repo
+          # PR, where the job is gated off because ci.yml runs the same lane.
+          # Any other non-success value (failure / cancelled) must still fail.
           if [[ "${{ needs.lint.result }}" == "success" &&
-                "${{ needs.test-no-secrets.result }}" == "success" ]]; then
+                "${{ needs.test-no-secrets.result }}" == "success" &&
+                ( "${{ needs.pggraph-postgres.result }}" == "success" ||
+                  "${{ needs.pggraph-postgres.result }}" == "skipped" ) ]]; then
             echo "All community checks passed!"
           else
             echo "One or more community checks failed."
