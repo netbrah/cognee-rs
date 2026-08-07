@@ -1,0 +1,142 @@
+name: Cache cleanup (closed PRs)
+
+# GitHub scopes a PR's caches to refs/pull/<n>/merge and then keeps them until
+# they go 7 days unread — merging or closing the PR does not reclaim anything.
+# On a repo whose Rust caches run ~1 GB each that is a large, permanent tax on
+# the 10 GB quota: hours after #127 merged, its refs/pull/127/merge entries
+# still held 4.61 GB of a 10.35 GB quota, and the resulting LRU eviction is
+# what kept the working caches cold.
+#
+# Deleting them on close is safe: once a PR is closed nothing can restore from
+# its ref again. A branch that is reopened simply repopulates from main.
+#
+# This is the other half of the main-only `save-if` policy in ci.yml — that
+# stops branches *writing* duplicates, this reclaims what PR runs already
+# wrote.
+
+on:
+  # pull_request_target, NOT pull_request. A `pull_request` run for a PR from a
+  # fork gets a read-only GITHUB_TOKEN no matter what the permissions block
+  # says, so the delete below would silently fail for exactly the PRs that most
+  # need it — community.yml (the fork lane) saves workspace-lint-v6 and
+  # workspace-test-v6 unrestricted, so a fork PR writes ~2 GB of its own.
+  #
+  # The usual pull_request_target hazard is running untrusted head code with a
+  # writable token. That does not apply here: this workflow has no checkout and
+  # executes nothing from the PR — it reads only the PR *number* from the event
+  # and calls the cache API.
+  pull_request_target:
+    types: [ closed ]
+  # Lets a maintainer reclaim a specific PR's caches by hand without waiting
+  # for a close event (e.g. for PRs closed before this workflow existed).
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number whose caches should be deleted"
+        required: true
+        type: string
+
+permissions:
+  # actions: write is what the cache delete API requires. contents: read has to
+  # be restated because naming any permission resets the rest to none.
+  actions: write
+  contents: read
+
+concurrency:
+  group: cache-cleanup-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    name: Delete caches for closed PR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete caches scoped to the PR ref
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number || inputs.pr_number }}
+        run: |
+          set -euo pipefail
+
+          # Validate before building any URL or jq program. `pr_number` is a
+          # free-form workflow_dispatch string, and it used to be interpolated
+          # straight into a jq `select(.ref == "…")` predicate — a value
+          # containing a double quote rewrote the filter instead of being
+          # matched by it, and `x" or true or .ref=="` would have matched every
+          # cache in the repo and deleted main's warm caches wholesale.
+          if ! [[ "${PR}" =~ ^[0-9]+$ ]]; then
+            echo "error: pr_number must be digits only, got '${PR}'" >&2
+            exit 1
+          fi
+          REF="refs/pull/${PR}/merge"
+          echo "Reclaiming caches for ${REF}"
+
+          # Filter by ref SERVER-side and paginate.
+          #
+          # `GET /actions/caches` lists every cache in the repo, not just this
+          # ref's, so filtering client-side over a single 100-item page could
+          # miss a PR's entries entirely: the endpoint sorts by
+          # last_accessed_at descending, so the least recently used page out
+          # first — exactly the `workflow_dispatch`-an-old-PR case this
+          # workflow advertises. `?ref=` also means nothing is interpolated
+          # into the jq program any more.
+          #
+          # Written to a file with the exit status checked, NOT read from a
+          # process substitution: bash does not check a process substitution's
+          # status and `pipefail` does not cover `< <(…)`, so a 403, a
+          # secondary rate limit, a 5xx or a jq error produced zero lines and
+          # was reported as "no caches found — nothing to do" on a green run.
+          # A janitor job nobody watches must not fail silently.
+          CACHES="$(mktemp)"
+          if ! gh api --paginate \
+                "repos/${GH_REPO}/actions/caches?per_page=100&ref=${REF}" \
+                --jq '.actions_caches[] | [.id, .size_in_bytes, .key] | @tsv' \
+                > "${CACHES}"; then
+            echo "error: failed to list caches for ${REF} (see the API error above)" >&2
+            exit 1
+          fi
+
+          FREED=0
+          COUNT=0
+          FAILED=0
+          while IFS=$'\t' read -r id size key; do
+            [ -n "${id:-}" ] || continue
+            COUNT=$((COUNT + 1))
+            size="${size:-0}"
+            # Distinguish "vanished between list and delete" (a 404, benign
+            # concurrent eviction) from a real failure. The previous version
+            # sent every error to /dev/null and printed "already gone?", so a
+            # blanket 403 or a rate limit read as a successful cleanup of
+            # 0 MiB and pointed debugging at the wrong cause.
+            if err="$(gh api -X DELETE "repos/${GH_REPO}/actions/caches/${id}" --silent 2>&1)"; then
+              echo "  deleted ${key} ($((size / 1024 / 1024)) MiB)"
+              FREED=$((FREED + size))
+            elif printf '%s' "${err}" | grep -q '404'; then
+              echo "  gone already ${key} (404 — concurrent eviction)"
+            else
+              echo "  FAILED ${key}: ${err}" >&2
+              FAILED=$((FAILED + 1))
+            fi
+          done < "${CACHES}"
+          rm -f "${CACHES}"
+
+          if [ "${COUNT}" -eq 0 ]; then
+            echo "No caches found for ${REF} — nothing to do."
+            exit 0
+          fi
+
+          echo "Reclaimed $((FREED / 1024 / 1024)) MiB for ${REF}"
+          {
+            echo "### Cache cleanup for PR #${PR}"
+            echo "Reclaimed **$((FREED / 1024 / 1024)) MiB** across ${COUNT} cache entries."
+            if [ "${FAILED}" -gt 0 ]; then
+              echo ""
+              echo ":warning: **${FAILED}** delete(s) failed — see the job log."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${FAILED}" -gt 0 ]; then
+            echo "error: ${FAILED} cache delete(s) failed for ${REF}" >&2
+            exit 1
+          fi

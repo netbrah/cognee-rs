@@ -15,6 +15,31 @@ on:
   pull_request:
     branches: [ main, master ]
     types: [ opened, synchronize, reopened ]
+  # Twice-weekly cache warm-up on main. Since the cache saves below are main-only,
+  # branches can only ever restore what a main run has already written — so
+  # anything that invalidates main's caches leaves EVERY PR cold until main
+  # next runs. Two things do that, and neither is rare:
+  #
+  #   1. Toolchain churn. The jobs here install `dtolnay/rust-toolchain@stable`,
+  #      which sets RUSTUP_TOOLCHAIN and so overrides rust-toolchain.toml's
+  #      `channel = "1.91"` pin (CI really runs current stable; the MSRV job is
+  #      what covers 1.91). Every stable release therefore rotates the rustc
+  #      component of every rust-cache key at once — observed going
+  #      adf1a63c -> b33fdd40 while the dependency hash held at c4307474.
+  #   2. The 7-day idle eviction. GitHub deletes any cache not *read* for a
+  #      week, so a quiet week on main cools the whole repo by itself.
+  #
+  # Mon+Thu rather than daily. Case 1 is already covered on an active repo —
+  # main is pushed to most days, and the first main run after a stable release
+  # repopulates everything. Case 2 is the one normal activity cannot cover, and
+  # a max 4-day gap sits comfortably under the 7-day eviction. Daily was the
+  # first instinct but it would run the LLM-backed test lane every night for no
+  # extra cache benefit; this costs ~2 cycles a week instead of 7.
+  #
+  # 03:11 UTC: off-peak, and deliberately not publish-dry-run.yml's 04:17 so
+  # the two do not contend for runners.
+  schedule:
+    - cron: "11 3 * * 1,4"
   workflow_dispatch:
 
 # The group must NOT include github.sha. With the sha in it, every push
@@ -22,8 +47,18 @@ on:
 # superseded 40-65 min run kept occupying runners until it finished on its own.
 # ios.yml, community.yml and http-parity.yml already key on the ref alone
 # (and do show cancelled runs); CI showed none, which is how this surfaced.
+#
+# Scheduled runs get their OWN group. A cron fires with
+# `github.ref == refs/heads/main`, so sharing the group meant the 03:11 warm-up
+# cancelled any still-running post-merge run — main runs take 40-65 min, so
+# anything merged after ~02:06 on a Mon/Thu was in range. That left the merge
+# commit with a cancelled check (`notify` is gated on `!cancelled()`, so the
+# aggregator did not even report) and skipped that run's main-only cache saves,
+# which is the exact opposite of what the cron is for. Keying the cron
+# separately keeps the invariant that only a newer push supersedes a main run,
+# while two overlapping crons still collapse to the newest.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name == 'schedule' && 'scheduled-warmup' || github.ref }}
   cancel-in-progress: true
 
 env:
