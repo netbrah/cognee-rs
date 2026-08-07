@@ -25,10 +25,21 @@ fn test_url() -> Option<String> {
 }
 
 /// Create an adapter and wipe the graph for a clean slate.
+///
+/// `None` means one thing only: no URL was configured, so the caller should
+/// skip. Once a URL *is* set, a failure to connect, migrate or wipe is a real
+/// defect and panics with the underlying error — previously these were
+/// `.ok()?`-ed into the same `None`, so an adapter regression (a migrator
+/// collision, say) surfaced as "PGGRAPH_TEST_URL not set" and sent whoever
+/// read the CI log hunting for a broken service container instead.
 async fn make_adapter() -> Option<PgGraphAdapter> {
     let url = test_url()?;
-    let db = PgGraphAdapter::new(&url).await.ok()?;
-    let _: () = db.delete_graph().await.ok()?;
+    let db = PgGraphAdapter::new(&url)
+        .await
+        .expect("PGGRAPH_TEST_URL is set, so the adapter must connect and migrate");
+    db.delete_graph()
+        .await
+        .expect("delete_graph must succeed against a live Postgres");
     Some(db)
 }
 

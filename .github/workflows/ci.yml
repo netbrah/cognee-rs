@@ -782,16 +782,28 @@ jobs:
           shared-key: workspace-test-v6
           save-if: "false"
 
-      - name: Cache ORT binary
-        uses: actions/cache@v4
-        with:
-          path: target/ort-cache
-          key: ort-v2.0.0-rc.12-cpu-linux-x86_64
+      # No ORT cache step here on purpose. `cognee-graph` pulls in no `ort-sys`
+      # (checked with `cargo tree -p cognee-graph --features postgres,testing`),
+      # so this lane would never populate `target/ort-cache` — but
+      # `actions/cache` saves on the post-step whenever the key misses, so it
+      # could win the race to store a near-empty cache under the shared ORT key
+      # right after that key is rotated. The real save from `test` is then
+      # refused with "Cache already exists", and every later `test` run restores
+      # a target/ whose ort-sys build-script output points into an empty
+      # ort-cache — the link failure described at the top of this file.
 
       # `--nocapture` is load-bearing here. A skipped `pggraph_test!` case still
       # reports `ok`, so the printed `PGGRAPH_TEST_URL not set — skipping` line
       # is the only signal that separates a real run from a green no-op. The
-      # logs are kept so the guard step below can turn that line into a failure.
+      # logs are kept so the guard step below can assert on them.
+      #
+      # Keep this as `cargo test`, NOT `cargo nextest`. Every case shares the
+      # single `cognee_test_graph` database and wipes it on entry; that is only
+      # safe because `cargo test` runs the binary in one process where the
+      # `#[serial]` attributes actually serialize. nextest runs each test in its
+      # own process, where an in-process lock cannot help and the schema
+      # mutations would race. Switch to `cognee_test_utils::create_temp_postgres_db`
+      # first if this lane ever needs nextest for parity with the other lanes.
       - name: Run PgGraphAdapter integration tests
         run: |
           set -o pipefail
@@ -808,14 +820,11 @@ jobs:
 
       # Without this, a future change that stops the URL reaching the test
       # process (renamed env var, service container failing to bind) would leave
-      # this lane reporting green while every case inside it skips.
-      - name: Assert no test skipped
-        run: |
-          if grep -n "PGGRAPH_TEST_URL not set" pggraph-integration.log pggraph-lib.log; then
-            echo "::error::PgGraph tests skipped — PGGRAPH_TEST_URL never reached the test process."
-            exit 1
-          fi
-          echo "No skip markers: the Postgres graph suite really executed."
+      # this lane reporting green while every case inside it skips. The logic
+      # lives in a script rather than inline so this lane and its community.yml
+      # mirror cannot drift, and so it can be tested against captured logs.
+      - name: Assert the suite really executed
+        run: bash scripts/ci/assert_pggraph_suite_ran.sh pggraph-integration.log pggraph-lib.log
 
   # ── Stage 3: Language binding checks (depend on lint, parallel with `test`) ──
   # Gated on `lint` (not `test`) so the binding builds run concurrently with the
