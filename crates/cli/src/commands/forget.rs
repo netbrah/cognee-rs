@@ -1,8 +1,7 @@
 use std::sync::Arc;
 
 use cognee::api::{DatasetRef, ForgetTarget, forget};
-use cognee::database::{DeleteDb, IngestDb, PipelineRunRepository, SeaOrmPipelineRunRepository};
-use cognee::delete::DeleteService;
+use cognee::database::IngestDb;
 use cognee::{ComponentManager, PipelineContext};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -42,30 +41,12 @@ pub fn run(args: ForgetArgs, cm: Arc<ComponentManager>) -> Result<(), CliError> 
         .map_err(|error| CliError::Runtime(format!("Failed to create async runtime: {error}")))?;
 
     runtime.block_on(async {
-        let storage = cm
-            .storage()
-            .await
-            .map_err(|e| CliError::Runtime(format!("{e}")))?;
         let database = cm
             .database()
             .await
             .map_err(|e| CliError::Runtime(format!("{e}")))?;
-        let graph_db = cm
-            .graph_db()
-            .await
-            .map_err(|e| CliError::Runtime(format!("{e}")))?;
-        let vector_db = cm
-            .vector_db()
-            .await
-            .map_err(|e| CliError::Runtime(format!("{e}")))?;
 
-        let pipeline_run_repo: Arc<dyn PipelineRunRepository> =
-            Arc::new(SeaOrmPipelineRunRepository::new(database.clone()));
-
-        let delete_service = DeleteService::new(storage, database.clone() as Arc<dyn DeleteDb>)
-            .with_graph_db(graph_db)
-            .with_vector_db(vector_db)
-            .with_pipeline_run_repo(pipeline_run_repo);
+        let delete_service = super::build_delete_service(&cm).await?;
 
         // Build the ForgetTarget from the (already-validated) flags.
         let target = if args.all {

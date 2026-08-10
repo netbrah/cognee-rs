@@ -44,9 +44,13 @@ once the graph is large. That is the reason for the committed Moby-Dick fixture.
 | graph size | 150 nodes / 100 edges | 1189 nodes / 2667 edges |
 | add (wall) | 3.0 s | 8.5 s |
 | cognify (wall) | 0.86 s | 5.76 s |
-| search (wall) | 0.25 s | 0.35 s |
+| search (wall) † | 0.25 s | 0.35 s |
 | cognify on-CPU fraction | 11% | 26% |
 | top cognify hotspot | token-count update (53 ms) | graph.query (982 ms / 1061 calls) |
+
+† Measured when the timed `search` phase still ran `Chunks` + `Summaries` +
+`GraphCompletion`. It now times `GraphCompletion` alone — see the search note
+below.
 
 ## Method
 
@@ -93,8 +97,17 @@ Cypher execution per graph element.
 
 **search: 0.35 s wall, about 63% on-CPU (249 ms busy).** Small in absolute terms.
 `cognee.search` (123 ms) and retrieval (`get_context`, `graph_search`) split it.
-Retrieval is now visible because the bench exercises the no-LLM retrievers
-(`Chunks`, `Summaries`) alongside `GraphCompletion`.
+
+> **These search figures predate the phase split and are not reproducible as
+> written.** They were measured when the timed `search` phase ran `Chunks`,
+> `Summaries` and `GraphCompletion` together. The phase now times only the
+> single `GraphCompletion` query the Python bench times, so `search.svg` /
+> `search.telemetry.json` cover that query alone and come out well under
+> 0.35 s. The two no-LLM retrievers moved to a separate phase and now produce
+> `search_retrievers.svg` / `search_retrievers.telemetry.json` — that is where
+> the `Chunks`/`Summaries` retrieval cost went, and it is emitted only on a
+> `--features bench,profiling` build invoked with `--profile-dir`. Re-measure
+> both phases before quoting numbers here again.
 
 ## What is inside `graph.query`
 
@@ -153,6 +166,10 @@ MOCK_LLM=true MOCK_EMBEDDING=deterministic \
 ```
 
 Artifacts land in `target/perf-profiles/large/`: `<phase>.svg` (flamegraph) and
-`<phase>.telemetry.json` (wall-clock breakdown). `--min-graph-nodes 1189` asserts
+`<phase>.telemetry.json` (wall-clock breakdown), for phases `add`, `cognify`,
+`search`, `search_retrievers` and `dataset_delete`. `search` covers the one
+`GraphCompletion` query the benchmark reports as `search_time`;
+`search_retrievers` covers the untimed `Chunks`/`Summaries` queries and is
+written only on a `profiling` build. `--min-graph-nodes 1189` asserts
 the recorded baseline so a stale cassette fails loudly instead of profiling an
 empty graph.
