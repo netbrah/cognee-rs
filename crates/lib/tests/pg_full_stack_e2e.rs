@@ -14,8 +14,20 @@
 //!   TEST_POSTGRES_URL  — single Postgres instance for all three stores
 //!   OPENAI_URL         — OpenAI-compatible LLM endpoint
 //!   OPENAI_TOKEN       — API key (or alias LLM_API_KEY)
+//!
+//! Optional:
 //!   COGNEE_E2E_EMBED_MODEL_PATH — path to the BGE-Small-v1.5 ONNX model
 //!   COGNEE_E2E_TOKENIZER_PATH  — path to the BGE-Small tokenizer.json
+//!
+//! The ONNX pair used to be *required*, which kept this test unrunnable in CI:
+//! no job downloads that model, and the workspace moved to OpenAI embeddings by
+//! default. When the two paths are set the local model is still used; otherwise
+//! embeddings come from the same OpenAI-compatible account as the LLM (endpoint
+//! and key fall back to `llm_*` in `Settings::resolve_embedding_inputs`). This
+//! test asserts on ComponentManager wiring and on the graph/vector stores being
+//! non-empty after cognify — nothing depends on which embedding backend produced
+//! the vectors, so the choice is a deployment detail here, not part of the
+//! contract under test.
 //!
 //! Run with:
 //!   TEST_POSTGRES_URL="postgres://..." cargo test -p cognee \
@@ -53,24 +65,42 @@ fn postgres_url() -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-/// Return `true` when the LLM + embedding env vars are all set.
-fn llm_and_embedding_available() -> bool {
+/// Return `true` when the LLM env vars are set. Embeddings are not checked here:
+/// they come from the same account when no local ONNX model is configured (see
+/// [`onnx_assets`]).
+fn llm_available() -> bool {
     let _ = dotenv::dotenv();
-    let has_llm = std::env::var("OPENAI_URL")
+    std::env::var("OPENAI_URL")
         .or_else(|_| std::env::var("LLM_ENDPOINT"))
         .map(|v| !v.is_empty())
         .unwrap_or(false)
         && std::env::var("OPENAI_TOKEN")
             .or_else(|_| std::env::var("LLM_API_KEY"))
             .map(|v| !v.is_empty())
-            .unwrap_or(false);
-    let has_embed = std::env::var("COGNEE_E2E_EMBED_MODEL_PATH")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false)
-        && std::env::var("COGNEE_E2E_TOKENIZER_PATH")
-            .map(|v| !v.is_empty())
-            .unwrap_or(false);
-    has_llm && has_embed
+            .unwrap_or(false)
+}
+
+/// The local BGE-Small ONNX model + tokenizer paths, when both are configured
+/// *and* both files exist on disk. `None` selects the remote OpenAI embedding
+/// engine instead.
+///
+/// Existence is checked, not just the variables: a stale
+/// `COGNEE_E2E_EMBED_MODEL_PATH` in a developer's `.env` (pointing at a sibling
+/// checkout, say) would otherwise pick the ONNX path and fail at engine
+/// construction rather than falling back.
+fn onnx_assets() -> Option<(String, String)> {
+    let _ = dotenv::dotenv();
+    let model = std::env::var("COGNEE_E2E_EMBED_MODEL_PATH")
+        .ok()
+        .filter(|v| !v.is_empty())?;
+    let tokenizer = std::env::var("COGNEE_E2E_TOKENIZER_PATH")
+        .ok()
+        .filter(|v| !v.is_empty())?;
+    if std::path::Path::new(&model).is_file() && std::path::Path::new(&tokenizer).is_file() {
+        Some((model, tokenizer))
+    } else {
+        None
+    }
 }
 
 /// Build a `Settings` pointing all three stores at `pg_url`.
@@ -96,8 +126,29 @@ fn make_all_postgres_settings(pg_url: &str) -> Settings {
     let llm_model = std::env::var("LLM_MODEL")
         .or_else(|_| std::env::var("OPENAI_MODEL"))
         .unwrap_or_else(|_| "gpt-4o-mini".to_string());
-    let embed_model = std::env::var("COGNEE_E2E_EMBED_MODEL_PATH").unwrap_or_default();
-    let embed_tok = std::env::var("COGNEE_E2E_TOKENIZER_PATH").unwrap_or_default();
+
+    // Embedding backend: the local BGE-Small ONNX model when it is available,
+    // otherwise the `Settings::default()` values — provider `openai`,
+    // text-embedding-3-small, 1536 dims — whose endpoint and API key fall back
+    // to the `llm_*` fields set below.
+    let default_settings = Settings::default();
+    let (embedding_provider, embedding_model_name, embedding_dimensions, embed_model, embed_tok) =
+        match onnx_assets() {
+            Some((model, tokenizer)) => (
+                "onnx".to_string(),
+                "BGE-Small-v1.5".to_string(),
+                384,
+                model,
+                tokenizer,
+            ),
+            None => (
+                default_settings.embedding_provider.clone(),
+                default_settings.embedding_model_name.clone(),
+                default_settings.embedding_dimensions,
+                default_settings.embedding_model_path.clone(),
+                default_settings.embedding_tokenizer_path.clone(),
+            ),
+        };
 
     Settings {
         // Relational DB — individual fields; resolved_relational_db_url() builds the URL.
@@ -117,11 +168,13 @@ fn make_all_postgres_settings(pg_url: &str) -> Settings {
         vector_db_provider: "pgvector".to_string(),
         vector_db_url: pg_url.to_string(),
 
-        // Embedding — real ONNX model for non-trivial similarity.
-        embedding_provider: "onnx".to_string(),
+        // Embedding — real ONNX model for non-trivial similarity when present,
+        // otherwise the shared OpenAI-compatible account (see `onnx_assets`).
+        embedding_provider,
+        embedding_model_name,
         embedding_model_path: embed_model,
         embedding_tokenizer_path: embed_tok,
-        embedding_dimensions: 384,
+        embedding_dimensions,
 
         // LLM
         llm_provider: "openai".to_string(),
@@ -143,16 +196,51 @@ fn make_all_postgres_settings(pg_url: &str) -> Settings {
 #[tokio::test]
 #[serial]
 async fn pg_full_stack_add_and_cognify() {
-    // Skip when Postgres, LLM, or embedding model are unavailable.
-    let Some(pg_url) = postgres_url() else {
+    // Skip when Postgres or the LLM are unavailable.
+    let Some(base_url) = postgres_url() else {
         eprintln!("TEST_POSTGRES_URL not set — skipping pg_full_stack_add_and_cognify");
         return;
     };
-    if !llm_and_embedding_available() {
-        eprintln!("LLM/embedding env vars not set — skipping pg_full_stack_add_and_cognify");
+    if !llm_available() {
+        eprintln!("OPENAI_TOKEN not set — skipping pg_full_stack_add_and_cognify");
         return;
     }
 
+    // Own throwaway database, like the sibling `pg_shared_db_single_stack` suite.
+    // Two reasons it matters more here than elsewhere: the assertions in the body
+    // are "the graph/vector stores are non-empty", which leftover rows from an
+    // earlier run would satisfy without this run writing anything at all; and the
+    // cleanup this replaces was a bare `delete_graph()` against whatever database
+    // `TEST_POSTGRES_URL` named, which on a developer's own instance wiped real
+    // data.
+    let tmp = cognee_test_utils::create_temp_postgres_db(&base_url)
+        .await
+        .expect("create temp Postgres database");
+
+    // The body runs on a spawned task so a failed assertion surfaces as a
+    // `JoinError` instead of unwinding past the cleanup below.
+    // `TempPostgresDb::cleanup` is `async`, so it cannot be a `Drop` impl; without
+    // this the database would leak on every red run — and this test panics readily,
+    // since it depends on a live LLM. The panic is re-raised unchanged afterwards,
+    // so libtest still reports the original failure. Mirrors `with_temp_db` in
+    // `crates/graph/src/pg_graph_adapter.rs` and the `pggraph_test!` harness.
+    let outcome = tokio::spawn(run_full_stack(tmp.url().to_string())).await;
+    tmp.cleanup().await;
+    if let Err(join_err) = outcome {
+        // A `JoinError` here can only be a panic: the task is never aborted and its
+        // handle is awaited immediately, so there is no cancellation path. Assert
+        // that rather than leaning on it — `into_panic()` panics on a cancelled
+        // task, which would replace the real failure with a confusing one.
+        assert!(
+            join_err.is_panic(),
+            "the case task was cancelled instead of panicking, which this test never does: {join_err}"
+        );
+        std::panic::resume_unwind(join_err.into_panic());
+    }
+}
+
+/// The test body proper, against the throwaway database at `pg_url`.
+async fn run_full_stack(pg_url: String) {
     let settings = make_all_postgres_settings(&pg_url);
     let system_root = settings.system_root_directory.clone();
     let cm = Arc::new(ComponentManager::new(ConfigManager::new(settings)));
@@ -270,7 +358,9 @@ async fn pg_full_stack_add_and_cognify() {
     );
 
     // ---- Cleanup. -----------------------------------------------------------
-    // Best-effort; errors are non-fatal for the test result.
-    let _ = graph_db.delete_graph().await;
+    // Only the on-disk system root: the caller drops the whole throwaway database
+    // afterwards (which subsumes the `delete_graph()` this used to do), and does so
+    // even if anything above panicked. Best-effort; a failure here is non-fatal for
+    // the test result.
     let _ = std::fs::remove_dir_all(&system_root);
 }

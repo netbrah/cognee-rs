@@ -87,8 +87,8 @@ jobs:
     name: Lint (fmt + check + clippy)
     runs-on: ubuntu-latest
     # In-repo only: fork PRs get no secrets and are covered by the
-    # `Community Checks (No Secrets)` workflow. `test`, `pgvector-spans` and the
-    # binding-check jobs cascade off this gate via `needs`.
+    # `Community Checks (No Secrets)` workflow. `test`, the Postgres lanes and
+    # the binding-check jobs cascade off this gate via `needs`.
     if: >-
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository
@@ -620,29 +620,56 @@ jobs:
           RUSTDOCFLAGS: -W missing_docs --cfg docsrs
         run: cargo doc --no-deps --features telemetry
 
-  # ── Stage 2.5: Postgres-only span tests (depends on lint, runs in parallel with `test`) ──
-  # The pgvector adapter span tests in
-  # `crates/vector/tests/pgvector_span_instrumentation.rs` skip silently
-  # when `cognee_test_utils::pg_test_url()` returns `None`, so the host
-  # `test` lane's `cargo test --workspace` invocation never actually
-  # exercises them. This dedicated lane spins up a Postgres service
-  # container with the pgvector extension so the spans land on a real
-  # backend in CI. Added in gap 04 (task 04-11) once
-  # `PgvectorAdapter` started emitting `cognee.db.vector.*` spans with
-  # `cognee.db.system="pgvector"`.
+  # ── Stage 2.5: pgvector adapter tests (depends on lint, runs in parallel with `test`) ──
+  # Everything in `cognee-vector` that needs a live Postgres with the `vector`
+  # extension: the 24-case `pgvector_integration` suite, the two inline
+  # shared-database migration cases, and the three span-attribute cases.
   #
-  # `pg_graph_adapter` is intentionally not exercised here — per-method
-  # span instrumentation was deferred in 04-08 pending a fan-in
-  # refactor (the public `query` is a stub returning
-  # `QueryError("not supported")`). That is a statement about spans only; the
-  # adapter's own integration tests run in the `pggraph-postgres` lane below.
-  pgvector-spans:
-    name: Test (Postgres span lane)
+  # This lane is the former `pgvector-spans` / "Test (Postgres span lane)", which
+  # ran `cargo test -p cognee-vector --test pgvector_span_instrumentation` with no
+  # `--features` flag. That target is `#![cfg(feature = "pgvector")]` and
+  # `cognee-vector` has no `default` feature list, so the file compiled away
+  # entirely: libtest reported `running 0 tests`, the step exited 0, and the lane
+  # reported green from the day it was created without ever executing a single
+  # test — while paying for a pgvector service container to sit idle. The
+  # `--features pgvector,testing` below is the fix, and the guard step at the end
+  # is what stops it silently regressing: a test-count floor catches the
+  # zero-test case that no skip marker would reveal.
+  #
+  # The renamed lane also folds in the `PGVECTOR_TEST_URL` suites, which had the
+  # separate problem that no CI job ever supplied that variable. #128 chose *not*
+  # to fold the pggraph suites into the span lane, but its reason was that doing
+  # so would falsify a comment about per-method span instrumentation being
+  # deferred for `pg_graph_adapter` — a statement about the graph adapter, not
+  # about test lanes. There is no such conflict here: these are the same crate,
+  # the same feature set, and the same server, so a second job would only pay a
+  # second container start and a second build of the same crate. The span-scope
+  # note that used to live here is preserved in the `pggraph-postgres` lane below,
+  # which is where it is now relevant.
+  #
+  # Both variables point at the same database. `DB_*` drives
+  # `cognee_test_utils::pg_test_url()` (the span tests); `PGVECTOR_TEST_URL` is
+  # read directly (integration + inline). Nothing in this lane provisions its own
+  # database except the two inline migration cases, so the steps below run
+  # sequentially and share one.
+  #
+  # `cargo test`, not `cargo nextest`, and that is load-bearing: the 24
+  # integration cases share one database and coordinate through `#[serial]`,
+  # which only serializes within a single process. nextest gives each test its own
+  # process, where the attribute cannot help — exactly the failure that made #136
+  # give the pggraph suites per-test databases before its lane could move to
+  # nextest. `--nocapture` is equally load-bearing: a skipped case still prints
+  # `ok`, so the skip line is the only runtime signal, and the guard needs it.
+  pgvector-postgres:
+    name: Test (Postgres pgvector lane)
     needs: lint
     runs-on: ubuntu-latest
 
     services:
       postgres:
+        # pgvector/pgvector, not stock postgres: `PgVectorAdapter::new` runs
+        # `CREATE EXTENSION IF NOT EXISTS vector` on startup, which fails on an
+        # image that does not ship the extension.
         image: pgvector/pgvector:pg16
         env:
           POSTGRES_USER: postgres
@@ -663,6 +690,9 @@ jobs:
       DB_NAME: cognee_test
       DB_USERNAME: postgres
       DB_PASSWORD: postgres
+      # Named directly in POSTGRES_DB above rather than created by an extra
+      # `CREATE DATABASE` step — a service container creates exactly one database.
+      PGVECTOR_TEST_URL: postgres://postgres:postgres@localhost:5432/cognee_test
 
     steps:
       - name: Checkout
@@ -702,8 +732,195 @@ jobs:
           path: target/ort-cache
           key: ort-v2.0.0-rc.12-cpu-linux-x86_64
 
+      - name: Run PgVectorAdapter integration tests
+        run: |
+          set -o pipefail
+          cargo test -p cognee-vector --features pgvector,testing \
+            --test pgvector_integration -- --nocapture 2>&1 | tee pgvector-integration.log
+
+      # The shared-DB migration and legacy-purge cases live inline in the crate,
+      # not in the integration file, so they need their own invocation.
+      - name: Run PgVectorAdapter inline (lib) tests
+        run: |
+          set -o pipefail
+          cargo test -p cognee-vector --features pgvector,testing \
+            --lib -- --nocapture 2>&1 | tee pgvector-lib.log
+
       - name: Run pgvector span instrumentation tests
-        run: cargo test -p cognee-vector --test pgvector_span_instrumentation -- --nocapture
+        run: |
+          set -o pipefail
+          cargo test -p cognee-vector --features pgvector,testing \
+            --test pgvector_span_instrumentation -- --nocapture 2>&1 | tee pgvector-spans.log
+
+      # Without this, dropping `--features pgvector` (back to the zero-test state
+      # this lane shipped in) or losing the URL would leave the lane green while
+      # executing nothing. The logic lives in a script so this lane and its
+      # community.yml mirror cannot drift, and so it can be tested against
+      # captured logs.
+      #
+      # Only the integration log carries a real count floor, and it has headroom
+      # (20 against 24 cases): those 24 come from a `pgvector_test!` macro and are
+      # not named individually below, so the floor is the only thing standing
+      # between a feature-flag regression and a green lane. The other two logs get
+      # `--min-tests 1` — enough to catch the compiles-to-zero case, which is the
+      # floor's actual job — because every case that matters in them IS named
+      # below, and a floor tight enough to notice one disappearing would fire on
+      # unrelated churn instead. That is not hypothetical for the `--lib` target:
+      # 32 of its 34 tests are brute-force/mock/node-filter unit tests with no
+      # connection to Postgres, so a floor near the total would fail this lane for
+      # someone relocating a mock test, and blame "the feature flags have probably
+      # stopped applying". The deleted `assert_pggraph_suite_ran.sh` reached the
+      # same conclusion ("the lib target holds 20-odd unrelated unit tests, so a
+      # count floor would not notice these two disappearing") and the
+      # `pggraph-postgres` lane below still passes `--min-tests 1` for it.
+      - name: Assert the suite really executed
+        run: |
+          bash scripts/ci/assert_pg_suite_ran.sh --label PgVector \
+            --log pgvector-integration.log --min-tests 20 \
+            --log pgvector-lib.log         --min-tests 1 \
+            --log pgvector-spans.log       --min-tests 1 \
+            --require-test pgvector_coexists_with_relational_migrator_in_shared_db \
+            --require-test pgvector_purges_legacy_row_from_default_table_on_upgrade \
+            --require-test upsert_emits_pgvector_span \
+            --require-test search_emits_pgvector_span \
+            --require-test delete_emits_pgvector_span
+
+  # ── Stage 2.5: single-database Postgres stack (depends on lint, parallel with `test`) ──
+  # The `TEST_POSTGRES_URL` suites, which no CI job ever supplied that variable
+  # to, so all four cases below had never executed:
+  #
+  #   crates/database/tests/provenance_batch.rs      (2 Postgres cases)
+  #   crates/lib/tests/pg_shared_db_single_stack.rs  (1 case)
+  #   crates/lib/tests/pg_full_stack_e2e.rs          (1 case, needs an LLM)
+  #
+  # `TEST_POSTGRES_URL` is deliberately distinct from the `DB_*` vars that drive
+  # `pg_test_url()`: these suites target one Postgres *server* for the
+  # "everything in one database" deployment (relational + pgvector +
+  # Postgres-graph sharing a single database), and each case provisions its own
+  # throwaway database off that server via
+  # `cognee_test_utils::create_temp_postgres_db`.
+  #
+  # A sibling of `pgvector-postgres` rather than more steps in it: that lane
+  # builds only `cognee-vector` with two features, whereas these suites build
+  # `cognee` with its full default feature set (onnx/ort, lancedb, pdfium) — the
+  # long pole. Sequencing them behind the small build would add the whole
+  # `cognee` compile to this stage's wall clock instead of overlapping it, and a
+  # second service container costs nothing (a public image, no secrets).
+  #
+  # The pgvector image again: `pg_shared_db_single_stack` and `pg_full_stack_e2e`
+  # both initialize `PgVectorAdapter`, which runs `CREATE EXTENSION ... vector`.
+  pg-single-db-postgres:
+    name: Test (Postgres single-database lane)
+    needs: lint
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          # Not the database the tests write to: it is the one the URL connects
+          # *through* to reach the server, from where each case creates a
+          # throwaway database of its own and drops it again. The default
+          # `postgres` superuser has the `CREATEDB` right that
+          # `create_temp_postgres_db` requires.
+          POSTGRES_DB: cognee_test_single
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      TEST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/cognee_test_single
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install mold linker
+        uses: rui314/setup-mold@v1
+        with:
+          make-default: true
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: ccache (lbug bundled C++, restore-only)
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: lbug-cxx
+          max-size: 1G
+          save: false
+
+      - name: Cache cargo/target (test, restore-only)
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-test-v6
+          save-if: "false"
+
+      # Unlike the pggraph lane, this one DOES need the ORT cache: `cognee`'s
+      # default features include `onnx`, so `ort-sys` is in the dep graph and the
+      # link step needs the downloaded runtime. Same key as the `test` lane.
+      - name: Cache ORT binary
+        uses: actions/cache@v4
+        with:
+          path: target/ort-cache
+          key: ort-v2.0.0-rc.12-cpu-linux-x86_64
+
+      # `--features sqlite,postgres`, not `--features postgres`: `cognee-database`
+      # declares no default features, and the third (non-Postgres) case in this
+      # file connects to `sqlite::memory:`, which fails with "has no supporting
+      # driver" when only the Postgres driver is compiled in. The workspace `test`
+      # lane never noticed because feature unification with `cognee` turns both on.
+      - name: Run provenance batch tests (Postgres cases)
+        run: |
+          set -o pipefail
+          cargo test -p cognee-database --features sqlite,postgres \
+            --test provenance_batch -- --nocapture 2>&1 | tee pg-provenance.log
+
+      - name: Run single-database coexistence test
+        run: |
+          set -o pipefail
+          cargo test -p cognee --test pg_shared_db_single_stack \
+            -- --nocapture 2>&1 | tee pg-single-stack.log
+
+      # Keyed step: the only one of these suites that needs an LLM. It is absent
+      # from the community.yml mirror rather than allowed to skip there, because a
+      # skip would print the marker the guard below treats as a failure — and
+      # rightly so: "the key is missing" and "the URL never arrived" are
+      # indistinguishable in a log.
+      #
+      # Embeddings come from the same OPENAI_KEY account. This test used to
+      # additionally require COGNEE_E2E_EMBED_MODEL_PATH / _TOKENIZER_PATH
+      # (BGE-Small ONNX), which no job downloads — that requirement is what kept
+      # it unrunnable in CI, and it is now optional (see the test's module doc).
+      - name: Run full-stack Postgres e2e (LLM)
+        env:
+          OPENAI_URL: https://api.openai.com/v1
+          OPENAI_TOKEN: ${{ secrets.OPENAI_KEY }}
+          OPENAI_MODEL: gpt-4o-mini
+        run: |
+          set -o pipefail
+          cargo test -p cognee --test pg_full_stack_e2e \
+            -- --nocapture 2>&1 | tee pg-full-stack.log
+
+      - name: Assert the suites really executed
+        run: |
+          bash scripts/ci/assert_pg_suite_ran.sh --label "Postgres single-database" \
+            --log pg-provenance.log   --min-tests 3 \
+            --log pg-single-stack.log --min-tests 1 \
+            --log pg-full-stack.log   --min-tests 1 \
+            --require-test upsert_batch_with_duplicate_ids_dedups_keeping_last \
+            --require-test temp_database_supports_back_to_back_initialize \
+            --require-test relational_pgvector_pggraph_coexist_in_one_database \
+            --require-test pg_full_stack_add_and_cognify
 
   # ── Stage 2.5: Postgres graph adapter tests (depends on lint, parallel with `test`) ──
   # `crates/graph/tests/pg_graph_integration.rs` and the two inline
@@ -713,11 +930,13 @@ jobs:
   # `created_at` plumbing that the visualization Memory tab depends on was
   # proven only for the Ladybug backend.
   #
-  # Deliberately a sibling of `pgvector-spans` rather than extra steps in it:
-  # that lane's comment records a decision about per-method *span*
-  # instrumentation being deferred, which says nothing about the adapter's
-  # integration tests. Folding these in would falsify that comment and make the
-  # "span lane" name wrong.
+  # Deliberately a sibling of `pgvector-postgres` rather than extra steps in it:
+  # `pg_graph_adapter` has no per-method span instrumentation to exercise —
+  # that was deferred in 04-08 pending a fan-in refactor, since the public
+  # `query` is a stub returning `QueryError("not supported")`. Its lane also runs
+  # nextest against per-test databases where the pgvector lane must stay on
+  # `cargo test` for `#[serial]`, and needs no `vector` extension, so stock
+  # `postgres:16` is enough.
   #
   # No secrets and no extensions: a service container spins up from a public
   # image on every runner (forks included), and `PgGraphAdapter` is plain
@@ -778,7 +997,7 @@ jobs:
           max-size: 1G
           save: false
 
-      # Restore-only for the same reason as `pgvector-spans`: this lane builds
+      # Restore-only for the same reason as `pgvector-postgres`: this lane builds
       # one crate with a non-default feature set, so saving under the shared key
       # would only fork a divergent copy of workspace-test-v6.
       - name: Cache cargo/target (test, restore-only)
@@ -842,7 +1061,12 @@ jobs:
       # lives in a script rather than inline so this lane and its community.yml
       # mirror cannot drift, and so it can be tested against captured logs.
       - name: Assert the suite really executed
-        run: bash scripts/ci/assert_pggraph_suite_ran.sh pggraph-integration.log pggraph-lib.log
+        run: |
+          bash scripts/ci/assert_pg_suite_ran.sh --label PgGraph \
+            --log pggraph-integration.log --min-tests 30 \
+            --log pggraph-lib.log         --min-tests 1 \
+            --require-test pggraph_coexists_with_relational_migrator_in_shared_db \
+            --require-test pggraph_purges_legacy_row_from_default_table_on_upgrade
 
   # ── Stage 3: Language binding checks (depend on lint, parallel with `test`) ──
   # Gated on `lint` (not `test`) so the binding builds run concurrently with the
@@ -1094,7 +1318,7 @@ jobs:
   # cognee `notify` aggregator.
   notify:
     name: Test Suite Status
-    needs: [ lint, msrv, wasm, test, docs-and-extras, pgvector-spans, pggraph-postgres, capi-check, python-check, ts-check, java-check ]
+    needs: [ lint, msrv, wasm, test, docs-and-extras, pgvector-postgres, pg-single-db-postgres, pggraph-postgres, capi-check, python-check, ts-check, java-check ]
     runs-on: ubuntu-latest
     if: >-
       !cancelled() &&
@@ -1108,7 +1332,8 @@ jobs:
                 "${{ needs.wasm.result }}" == "success" &&
                 "${{ needs.test.result }}" == "success" &&
                 "${{ needs.docs-and-extras.result }}" == "success" &&
-                "${{ needs.pgvector-spans.result }}" == "success" &&
+                "${{ needs.pgvector-postgres.result }}" == "success" &&
+                "${{ needs.pg-single-db-postgres.result }}" == "success" &&
                 "${{ needs.pggraph-postgres.result }}" == "success" &&
                 "${{ needs.capi-check.result }}" == "success" &&
                 "${{ needs.python-check.result }}" == "success" &&
