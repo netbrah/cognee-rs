@@ -2,7 +2,7 @@
 
 This guide ties together the record/replay mock LLM, the deterministic mock
 embeddings, and the `cognee-cli bench` driver into a single offline workflow: a
-benchmark of the full `add → cognify → search` pipeline that runs with **no API
+benchmark of the full `add → cognify → search → dataset delete` pipeline that runs with **no API
 key**.
 
 For the design rationale (why we mock both the LLM and the embeddings, and the
@@ -112,12 +112,14 @@ the shared orchestrator can drive either SDK unchanged:
   "prune_time_s": 0.0,
   "db_setup_time_s": 0.0,
   "search_time": 0.0,
+  "dataset_delete_time_s": 0.0,
   "status": {                 // per-phase: "success" or "failed: <msg>"
     "prune": "success",
     "db_setup": "success",
     "add": "success",
     "cognify": "success",
-    "search": "success"
+    "search": "success",
+    "dataset_delete": "success"
   },
   "success": true,
   "config": {
@@ -132,8 +134,9 @@ the shared orchestrator can drive either SDK unchanged:
 }
 ```
 
-The ingest/prune/db-setup phase times are rounded to 3 decimals (Python
-`round(x, 3)` parity); `search_time` is reported unrounded, matching Python. Once a run
+The ingest/prune/db-setup/dataset-delete phase times are rounded to 3 decimals
+(Python `round(x, 3)` parity); `search_time` is reported unrounded, matching
+Python. Once a run
 completes and the result file is written the process exits `0` even if individual
 phases failed — failures are captured in `status` / `success`. The process exits
 nonzero only for catastrophic errors (bad arguments, unreadable corpus,

@@ -13,8 +13,8 @@ This directory holds the offline (zero-API) benchmark harness for the
   cassette lookup hashes — are stable across runs.
 - `fixtures/cassette.json` — recorded LLM responses for that corpus
   (`LlmCassette`, version 1, recorded against `gpt-4o-mini`). Committed so that
-  anyone — and CI — can replay the full `add → cognify → search` pipeline with
-  **no API key**.
+  anyone — and CI — can replay the full
+  `add → cognify → search → dataset delete` pipeline with **no API key**.
 - `run_mock_bench.sh` — drives the shared Python percentile orchestrator against
   the Rust `cognee-cli bench` in offline `--mock-llm` mode (deterministic mock
   embeddings + the committed cassette). See the script header for env-var

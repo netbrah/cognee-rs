@@ -1,7 +1,7 @@
 # Mock-LLM Percentile Benchmark — Python Approach & Rust Porting Strategy
 
 This document explains, in detail, how the Python `cognee` repository benchmarks
-the `add → cognify → search` pipeline with **mocked LLM and embedding backends**,
+the `add → cognify → search → dataset delete` pipeline with **mocked LLM and embedding backends**,
 why that design is valuable, and how we intend to port it to `cognee-rust`.
 
 It is the design-rationale document behind the offline mock benchmark. The
@@ -18,7 +18,7 @@ The Python reference lives in the sibling checkout at `../cognee` (i.e.
 | File | Role |
 |---|---|
 | [`statistics_percentile_report.py`](../../../cognee/cognee/tests/performance/statistics_percentile_report.py) | **Orchestrator / reporter.** Runs the bench N times, computes percentiles, prints a table, emits a Chart.js HTML report. |
-| [`statistics_percentile/bench_cognee.py`](../../../cognee/cognee/tests/performance/statistics_percentile/bench_cognee.py) | **Bench driver.** One full pipeline run (prune → setup → add → cognify → search), phase-timed, writes a JSON result. |
+| [`statistics_percentile/bench_cognee.py`](../../../cognee/cognee/tests/performance/statistics_percentile/bench_cognee.py) | **Bench driver.** One full pipeline run (prune → setup → add → cognify → search → dataset delete), phase-timed, writes a JSON result. |
 | [`statistics_percentile/memories.json`](../../../cognee/cognee/tests/performance/statistics_percentile/memories.json) | Input corpus: array of `{title, content, references}` memories. |
 | [`statistics_percentile/mock_memories.json`](../../../cognee/cognee/tests/performance/statistics_percentile/mock_memories.json) | Hand-authored mock responses: per-title `knowledge_graph` + `summary`. |
 
@@ -58,17 +58,24 @@ Two details matter for the port:
   to avoid rate limits (`if i != 1 and not args.mock_llm: time.sleep(60)`,
   line ~363). In `--mock-llm` mode the sleep is skipped — runs are back-to-back.
 
-The required JSON contract (what the bench must emit) — `build_report` reads each
-key with `r[metric]` (not `.get`), so **all of these must be present**:
+The JSON contract (what the bench emits) — the metric keys both SDKs produce:
 
 ```
 add_time_s, cognify_time_s, total_ingest_time_s,
-search_time, prune_time_s, db_setup_time_s
+search_time, prune_time_s, db_setup_time_s,
+dataset_delete_time_s
 ```
 
 plus `config` (`llm_model`, `embedding_model`, `embedding_dimensions`),
 `status` (object: phase → `"success"` | `"failed: …"`), `success` (bool), and
 `memories_count`. `wall_time_s` is added by the orchestrator, not the bench.
+
+`build_report` first filters `METRICS` down to the keys **run 1** actually
+emitted, then reads every run with `r[metric]` (not `.get`). So a metric no run
+emits is simply skipped — that is how the cloud-only `tenant_*` metrics coexist
+with the local ones — but a key present in run 1 and missing later raises. A
+bench must therefore emit its metric set *consistently across runs*, not
+necessarily completely.
 
 ### 2.2 Bench driver — `bench_cognee.py`
 
@@ -78,7 +85,21 @@ One pipeline run, timing each phase with `time.time()`:
 2. `setup` — DB setup, timed as `db_setup_time_s`.
 3. `add` — `cognee.add(text_list)`, timed as `add_time_s`.
 4. `cognify` — `cognee.cognify(...)`, timed as `cognify_time_s`.
-5. `search` — one `cognee.search(...)`, timed as `search_time`.
+5. `search` — one `cognee.search(query_text=..., only_context=True)`, timed as
+   `search_time`. Exactly one query: the Rust bench mirrors this so the two
+   `search_time` series measure the same unit of work.
+6. `dataset delete` — `datasets.empty_dataset(...)` over the *populated*
+   dataset (it runs after cognify and search, so nodes, edges and vectors are
+   all present), timed as `dataset_delete_time_s`.
+
+   Caveat on this one metric: the Rust bench reaches `empty_dataset` with
+   `DeleteMode::Hard`, which also runs an orphan-node/edge-type sweep that
+   Python's `empty_dataset` never performs (Python's degree-one sweep sits in
+   `legacy_delete`, reachable only from `delete_data`). The sweep runs after
+   the dataset's own nodes are gone, so on a single-dataset bench it scans a
+   near-empty graph — a small near-constant Rust-side overhead, not something
+   that scales with the corpus. Compare the two `dataset_delete_time_s` series
+   by trend rather than by absolute level.
 
 Each phase is wrapped in try/except so a failure is recorded in `status` rather
 than aborting the run. Results are serialized to `--output`.

@@ -74,7 +74,7 @@ fn test_bench_mock_offline_smoke() {
     let raw = fs::read_to_string(&output).expect("result file written");
     let v: serde_json::Value = serde_json::from_str(&raw).expect("result is valid JSON");
 
-    // All six metric keys present and numeric / >= 0.
+    // All seven metric keys present and numeric / >= 0.
     for key in [
         "add_time_s",
         "cognify_time_s",
@@ -82,6 +82,7 @@ fn test_bench_mock_offline_smoke() {
         "prune_time_s",
         "db_setup_time_s",
         "search_time",
+        "dataset_delete_time_s",
     ] {
         let n = v[key]
             .as_f64()
@@ -110,7 +111,14 @@ fn test_bench_mock_offline_smoke() {
 
     // Status block: every phase "success".
     let status = &v["status"];
-    for phase in ["prune", "db_setup", "add", "cognify", "search"] {
+    for phase in [
+        "prune",
+        "db_setup",
+        "add",
+        "cognify",
+        "search",
+        "dataset_delete",
+    ] {
         assert_eq!(
             status[phase].as_str(),
             Some("success"),

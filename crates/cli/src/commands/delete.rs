@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use cognee::PipelineContext;
 use cognee::api::DatasetRef;
-use cognee::database::{IngestDb, PipelineRunRepository, SeaOrmPipelineRunRepository};
-use cognee::delete::{DeleteMode, DeleteRequest, DeleteScope, DeleteService};
+use cognee::database::IngestDb;
+use cognee::delete::{DeleteMode, DeleteRequest, DeleteScope};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -37,40 +37,15 @@ pub fn run(args: DeleteArgs, cm: Arc<cognee::ComponentManager>) -> Result<(), Cl
         .map_err(|error| CliError::Runtime(format!("Failed to create async runtime: {error}")))?;
 
     runtime.block_on(async {
-        let storage = cm
-            .storage()
-            .await
-            .map_err(|e| CliError::Runtime(format!("{e}")))?;
         let database = cm
             .database()
-            .await
-            .map_err(|e| CliError::Runtime(format!("{e}")))?;
-        let graph_db = cm
-            .graph_db()
-            .await
-            .map_err(|e| CliError::Runtime(format!("{e}")))?;
-        let vector_db = cm
-            .vector_db()
             .await
             .map_err(|e| CliError::Runtime(format!("{e}")))?;
 
         let request =
             build_request_async(args, owner_id, database.clone() as Arc<dyn IngestDb>).await?;
 
-        // Python parity (gap 08-05): wire the pipeline-runs repository so a
-        // dataset deletion writes a fresh `INITIATED` row for every pipeline
-        // registered against it. Without this a subsequent re-cognify would
-        // be short-circuited by `check_pipeline_run_qualification` (08-08).
-        let pipeline_run_repo: Arc<dyn PipelineRunRepository> =
-            Arc::new(SeaOrmPipelineRunRepository::new(database.clone()));
-
-        let service = DeleteService::new(
-            storage,
-            database.clone() as Arc<dyn cognee::database::DeleteDb>,
-        )
-        .with_graph_db(graph_db)
-        .with_vector_db(vector_db)
-        .with_pipeline_run_repo(pipeline_run_repo);
+        let service = super::build_delete_service(&cm).await?;
 
         if enforce_acl {
             return Err(CliError::Validation(
