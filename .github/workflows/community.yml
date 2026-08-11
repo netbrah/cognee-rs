@@ -189,7 +189,7 @@ jobs:
   # accepts `skipped` for this job.
   #
   # The steps are a mirror of the ci.yml job; the part that actually matters,
-  # the skip guard, is shared as `scripts/ci/assert_pggraph_suite_ran.sh` so it
+  # the skip guard, is shared as `scripts/ci/assert_pg_suite_ran.sh` so it
   # cannot drift between the two copies.
   pggraph-postgres:
     name: Test (Postgres graph lane)
@@ -276,24 +276,230 @@ jobs:
             2>&1 | tee pggraph-lib.log
 
       - name: Assert the suite really executed
-        run: bash scripts/ci/assert_pggraph_suite_ran.sh pggraph-integration.log pggraph-lib.log
+        run: |
+          bash scripts/ci/assert_pg_suite_ran.sh --label PgGraph \
+            --log pggraph-integration.log --min-tests 30 \
+            --log pggraph-lib.log         --min-tests 1 \
+            --require-test pggraph_coexists_with_relational_migrator_in_shared_db \
+            --require-test pggraph_purges_legacy_row_from_default_table_on_upgrade
+
+  # ── pgvector adapter tests (mirror of ci.yml's `pgvector-postgres`) ──
+  # Keyless for the same reason as the graph lane above: a pgvector service
+  # container starts from a public image on a fork runner exactly as it does
+  # in-repo, and nothing here touches an LLM. Fork PRs only, and the `notify`
+  # aggregator below therefore accepts `skipped` — see the graph lane's comment
+  # for the full rationale.
+  #
+  # See the ci.yml twin for why this needs `--features pgvector,testing` (without
+  # it the targets compile to zero tests and the lane reports green having run
+  # nothing), why it stays on `cargo test` rather than nextest (the 24 integration
+  # cases share one database and coordinate through `#[serial]`, which nextest's
+  # per-test processes defeat), and why the image must be pgvector/pgvector.
+  pgvector-postgres:
+    name: Test (Postgres pgvector lane)
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.head.repo.full_name != github.repository
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: cognee_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DB_PROVIDER: postgres
+      DB_HOST: localhost
+      DB_PORT: "5432"
+      DB_NAME: cognee_test
+      DB_USERNAME: postgres
+      DB_PASSWORD: postgres
+      PGVECTOR_TEST_URL: postgres://postgres:postgres@localhost:5432/cognee_test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install mold linker
+        uses: rui314/setup-mold@v1
+        with:
+          make-default: true
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: ccache (lbug bundled C++, restore-only)
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: lbug-cxx
+          max-size: 1G
+          save: false
+
+      - name: Cache cargo/target (test, restore-only)
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-test-v6
+          save-if: "false"
+
+      - name: Cache ORT binary
+        uses: actions/cache@v4
+        with:
+          path: target/ort-cache
+          key: ort-v2.0.0-rc.12-cpu-linux-x86_64
+
+      - name: Run PgVectorAdapter integration tests
+        run: |
+          set -o pipefail
+          cargo test -p cognee-vector --features pgvector,testing \
+            --test pgvector_integration -- --nocapture 2>&1 | tee pgvector-integration.log
+
+      - name: Run PgVectorAdapter inline (lib) tests
+        run: |
+          set -o pipefail
+          cargo test -p cognee-vector --features pgvector,testing \
+            --lib -- --nocapture 2>&1 | tee pgvector-lib.log
+
+      - name: Run pgvector span instrumentation tests
+        run: |
+          set -o pipefail
+          cargo test -p cognee-vector --features pgvector,testing \
+            --test pgvector_span_instrumentation -- --nocapture 2>&1 | tee pgvector-spans.log
+
+      - name: Assert the suite really executed
+        run: |
+          bash scripts/ci/assert_pg_suite_ran.sh --label PgVector \
+            --log pgvector-integration.log --min-tests 24 \
+            --log pgvector-lib.log        --min-tests 30 \
+            --log pgvector-spans.log      --min-tests 3 \
+            --require-test pgvector_coexists_with_relational_migrator_in_shared_db \
+            --require-test pgvector_purges_legacy_row_from_default_table_on_upgrade \
+            --require-test upsert_emits_pgvector_span \
+            --require-test search_emits_pgvector_span \
+            --require-test delete_emits_pgvector_span
+
+  # ── Single-database Postgres stack (mirror of ci.yml's `pg-single-db-postgres`) ──
+  # Two of the three suites in the keyed twin; `pg_full_stack_e2e` is deliberately
+  # absent because it needs an LLM. Letting it run and skip here is not an option:
+  # the skip line it prints is exactly what the guard treats as a failed lane, and
+  # weakening the guard to tolerate that would reopen the hole this whole change
+  # closes. Fork PRs only; `notify` accepts `skipped`.
+  pg-single-db-postgres:
+    name: Test (Postgres single-database lane)
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.head.repo.full_name != github.repository
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: cognee_test_single
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      TEST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/cognee_test_single
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install mold linker
+        uses: rui314/setup-mold@v1
+        with:
+          make-default: true
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: ccache (lbug bundled C++, restore-only)
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: lbug-cxx
+          max-size: 1G
+          save: false
+
+      - name: Cache cargo/target (test, restore-only)
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-test-v6
+          save-if: "false"
+
+      # Needed here (unlike the graph lane): `cognee`'s default features include
+      # `onnx`, so `ort-sys` is in the dep graph and the link step needs the
+      # downloaded runtime.
+      - name: Cache ORT binary
+        uses: actions/cache@v4
+        with:
+          path: target/ort-cache
+          key: ort-v2.0.0-rc.12-cpu-linux-x86_64
+
+      # `--features sqlite,postgres` — see the ci.yml twin: the non-Postgres case
+      # in this file uses `sqlite::memory:`, and `cognee-database` has no default
+      # features, so `--features postgres` alone fails it with "no supporting
+      # driver".
+      - name: Run provenance batch tests (Postgres cases)
+        run: |
+          set -o pipefail
+          cargo test -p cognee-database --features sqlite,postgres \
+            --test provenance_batch -- --nocapture 2>&1 | tee pg-provenance.log
+
+      - name: Run single-database coexistence test
+        run: |
+          set -o pipefail
+          cargo test -p cognee --test pg_shared_db_single_stack \
+            -- --nocapture 2>&1 | tee pg-single-stack.log
+
+      - name: Assert the suites really executed
+        run: |
+          bash scripts/ci/assert_pg_suite_ran.sh --label "Postgres single-database" \
+            --log pg-provenance.log   --min-tests 3 \
+            --log pg-single-stack.log --min-tests 1 \
+            --require-test upsert_batch_with_duplicate_ids_dedups_keeping_last \
+            --require-test temp_database_supports_back_to_back_initialize \
+            --require-test relational_pgvector_pggraph_coexist_in_one_database
 
   # ── Aggregate status (single required check for branch protection) ────
   notify:
     name: Community Checks Status
-    needs: [ lint, test-no-secrets, pggraph-postgres ]
+    needs: [ lint, test-no-secrets, pggraph-postgres, pgvector-postgres, pg-single-db-postgres ]
     runs-on: ubuntu-latest
     if: ${{ !cancelled() }}
     steps:
       - name: Check status
         run: |
-          # `skipped` is the expected result for pggraph-postgres on an in-repo
-          # PR, where the job is gated off because ci.yml runs the same lane.
-          # Any other non-success value (failure / cancelled) must still fail.
+          # `skipped` is the expected result for the three Postgres lanes on an
+          # in-repo PR, where they are gated off because ci.yml runs the same
+          # lanes. Any other non-success value (failure / cancelled) must still
+          # fail.
           if [[ "${{ needs.lint.result }}" == "success" &&
                 "${{ needs.test-no-secrets.result }}" == "success" &&
                 ( "${{ needs.pggraph-postgres.result }}" == "success" ||
-                  "${{ needs.pggraph-postgres.result }}" == "skipped" ) ]]; then
+                  "${{ needs.pggraph-postgres.result }}" == "skipped" ) &&
+                ( "${{ needs.pgvector-postgres.result }}" == "success" ||
+                  "${{ needs.pgvector-postgres.result }}" == "skipped" ) &&
+                ( "${{ needs.pg-single-db-postgres.result }}" == "success" ||
+                  "${{ needs.pg-single-db-postgres.result }}" == "skipped" ) ]]; then
             echo "All community checks passed!"
           else
             echo "One or more community checks failed."

@@ -1079,6 +1079,17 @@ mod migrator {
 // (rather than under `tests/`) so they can reuse the crate's own optional
 // `sea-orm`/`sea-orm-migration` dependencies without forcing a heavy
 // dev-dependency onto the default (feature-off) build.
+//
+// Each case provisions its OWN throwaway database via
+// `cognee_test_utils::create_temp_postgres_db` and drops it again, so no
+// `#[serial]` is needed. They used to share the `PGVECTOR_TEST_URL` database and
+// call a `reset()` helper that dropped `_vector_collections` and the
+// `seaql_migrations*` tables — which left the collection tables it did not know
+// about (`UUID_f`, `Meta_f`, …) orphaned in the database, invisible to
+// `list_collections`, and therefore undeletable by the integration suite's
+// cleanup. The next `pgvector_integration` run against that server then failed
+// with `relation "UUID_f" already exists`. That only became reachable in CI once
+// both targets ran in one lane against one server, which is what surfaced it.
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 #[allow(
@@ -1088,12 +1099,13 @@ mod migrator {
 )]
 mod shared_db_migration_tests {
     use super::PgVectorAdapter;
-    use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
+    use sea_orm::{ConnectionTrait, Database, Statement};
     use sea_orm_migration::prelude::*;
-    use serial_test::serial;
 
     fn test_url() -> Option<String> {
-        std::env::var("PGVECTOR_TEST_URL").ok()
+        std::env::var("PGVECTOR_TEST_URL")
+            .ok()
+            .filter(|v| !v.is_empty())
     }
 
     /// A stand-in for the downstream relational / auth migrator. It writes its
@@ -1148,26 +1160,11 @@ mod shared_db_migration_tests {
         }
     }
 
-    /// Drop every table and bookkeeping table so each run starts clean.
-    async fn reset(db: &DatabaseConnection) {
-        for stmt in [
-            "DROP TABLE IF EXISTS _vector_collections CASCADE",
-            "DROP TABLE IF EXISTS rel_baseline_marker CASCADE",
-            "DROP TABLE IF EXISTS rel_auth_marker CASCADE",
-            "DROP TABLE IF EXISTS seaql_migrations CASCADE",
-            "DROP TABLE IF EXISTS seaql_migrations_pgvector CASCADE",
-        ] {
-            db.execute(Statement::from_string(db.get_database_backend(), stmt))
-                .await
-                .unwrap();
-        }
-    }
-
     /// Count rows in a bookkeeping table. Returns 0 **only** when the table does
     /// not exist; any other DB error panics so it fails the test rather than
     /// masquerading as an empty table (`table` is a fixed test literal, so
     /// interpolating it carries no injection risk).
-    async fn version_count(db: &DatabaseConnection, table: &str) -> i64 {
+    async fn version_count(db: &sea_orm::DatabaseConnection, table: &str) -> i64 {
         let exists = db
             .query_one(Statement::from_string(
                 db.get_database_backend(),
@@ -1194,15 +1191,17 @@ mod shared_db_migration_tests {
     /// The relational migrator and the pgvector adapter migrator must coexist in
     /// one Postgres DB without colliding on the default `seaql_migrations` table.
     #[tokio::test]
-    #[serial]
     async fn pgvector_coexists_with_relational_migrator_in_shared_db() {
-        let Some(url) = test_url() else {
+        let Some(base_url) = test_url() else {
             eprintln!("PGVECTOR_TEST_URL not set — skipping shared-DB migration test");
             return;
         };
+        let tmp = cognee_test_utils::create_temp_postgres_db(&base_url)
+            .await
+            .expect("create temp Postgres database");
+        let url = tmp.url().to_string();
 
         let db = Database::connect(&url).await.unwrap();
-        reset(&db).await;
 
         // 1. Relational / auth migrator runs first and populates the default
         //    `seaql_migrations` with versions the vector migrator does not own.
@@ -1227,21 +1226,24 @@ mod shared_db_migration_tests {
         assert_eq!(version_count(&db, "seaql_migrations").await, 2);
         assert_eq!(version_count(&db, "seaql_migrations_pgvector").await, 1);
 
-        reset(&db).await;
+        drop(db);
+        tmp.cleanup().await;
     }
 
     /// Upgrade path: a legacy pgvector row left in the default `seaql_migrations`
     /// by an older build must be purged so the core migrator no longer chokes.
     #[tokio::test]
-    #[serial]
     async fn pgvector_purges_legacy_row_from_default_table_on_upgrade() {
-        let Some(url) = test_url() else {
+        let Some(base_url) = test_url() else {
             eprintln!("PGVECTOR_TEST_URL not set — skipping legacy-purge test");
             return;
         };
+        let tmp = cognee_test_utils::create_temp_postgres_db(&base_url)
+            .await
+            .expect("create temp Postgres database");
+        let url = tmp.url().to_string();
 
         let db = Database::connect(&url).await.unwrap();
-        reset(&db).await;
 
         // Simulate an older build that recorded the pgvector version into the
         // DEFAULT `seaql_migrations` table (aux-ran-before-core ordering).
@@ -1275,6 +1277,7 @@ mod shared_db_migration_tests {
             .await
             .expect("core migrator must not choke after legacy row is purged");
 
-        reset(&db).await;
+        drop(db);
+        tmp.cleanup().await;
     }
 }

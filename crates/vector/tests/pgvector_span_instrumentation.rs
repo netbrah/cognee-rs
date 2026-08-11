@@ -8,6 +8,14 @@
 //! Skipped silently when `cognee_test_utils::pg_test_url()` returns `None`
 //! (i.e. `DB_PROVIDER` is not set to `postgres`). Mirrors the gating
 //! pattern in `pgvector_integration.rs`.
+//!
+//! Run with (note `--features pgvector`: without it the `cfg` below compiles the
+//! whole file away and libtest reports a green `running 0 tests`):
+//!
+//!   DB_PROVIDER=postgres DB_HOST=localhost DB_PORT=5432 \
+//!   DB_NAME=cognee_test DB_USERNAME=postgres DB_PASSWORD=postgres \
+//!     cargo test -p cognee-vector --features pgvector,testing \
+//!       --test pgvector_span_instrumentation -- --nocapture
 #![cfg(feature = "pgvector")]
 
 use cognee_test_utils::SpanCapture;
@@ -16,16 +24,38 @@ use serial_test::serial;
 use std::collections::HashMap;
 use uuid::Uuid;
 
-/// Returns a fresh adapter (with stale collections cleaned up) when a
-/// Postgres URL is configured, or `None` to silently skip.
+/// Dimension of the `DocumentChunk_text` collection every case below writes to.
+/// Matches the 4-element vectors the tests build.
+const DIM: usize = 4;
+
+/// Returns a fresh adapter (with stale collections cleaned up, and the
+/// collection the tests write to created) when a Postgres URL is configured, or
+/// `None` to silently skip.
 async fn make_adapter() -> Option<PgVectorAdapter> {
     let url = cognee_test_utils::pg_test_url()?;
-    let adapter = PgVectorAdapter::new(&url, 4).await.ok()?;
+    let adapter = PgVectorAdapter::new(&url, DIM).await.ok()?;
     if let Ok(cols) = adapter.list_collections().await {
         for (dt, fname) in cols {
             let _ = adapter.delete_collection(&dt, &fname).await;
         }
     }
+    // `index_points` deliberately does NOT create the collection: every
+    // `VectorDB` impl in the workspace requires it to exist first (the
+    // in-memory adapter returns `CollectionNotFound`, LanceDB fails to open the
+    // table, pgvector's INSERT hits a missing relation), and the production
+    // callers in `cognee-cognify` all do `has_collection` → `create_collection`
+    // before indexing. Python's `create_data_points` auto-creates instead, but
+    // that is a difference in where the responsibility sits, not in observable
+    // pipeline behaviour. So the precondition is the test's job to establish —
+    // omitting it is why all three cases here failed the first time they ever
+    // executed with `--features pgvector` (see the module doc above).
+    //
+    // `expect` rather than `.ok()?`: a create failure must fail the test, not
+    // silently degrade into the skip path this lane exists to detect.
+    adapter
+        .create_collection("DocumentChunk", "text", DIM)
+        .await
+        .expect("create DocumentChunk_text collection");
     Some(adapter)
 }
 
@@ -33,7 +63,7 @@ async fn make_adapter() -> Option<PgVectorAdapter> {
 #[serial]
 async fn upsert_emits_pgvector_span() {
     let Some(adapter) = make_adapter().await else {
-        eprintln!("DB_PROVIDER!=postgres — skipping upsert_emits_pgvector_span");
+        eprintln!("DB_PROVIDER not set to postgres — skipping upsert_emits_pgvector_span");
         return;
     };
     let capture = SpanCapture::install();
@@ -67,7 +97,7 @@ async fn upsert_emits_pgvector_span() {
 #[serial]
 async fn search_emits_pgvector_span() {
     let Some(adapter) = make_adapter().await else {
-        eprintln!("DB_PROVIDER!=postgres — skipping search_emits_pgvector_span");
+        eprintln!("DB_PROVIDER not set to postgres — skipping search_emits_pgvector_span");
         return;
     };
     let capture = SpanCapture::install();
@@ -109,7 +139,7 @@ async fn search_emits_pgvector_span() {
 #[serial]
 async fn delete_emits_pgvector_span() {
     let Some(adapter) = make_adapter().await else {
-        eprintln!("DB_PROVIDER!=postgres — skipping delete_emits_pgvector_span");
+        eprintln!("DB_PROVIDER not set to postgres — skipping delete_emits_pgvector_span");
         return;
     };
     let capture = SpanCapture::install();
