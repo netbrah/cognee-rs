@@ -21,7 +21,15 @@ use tracing::error;
 /// [`close_components`].
 const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Close the relational connection pool before the process exits.
+/// How long to wait for already-dispatched telemetry POSTs to leave the process.
+///
+/// Small on purpose: an exit code must never wait on an analytics collector.
+/// `send_telemetry` is fire-and-forget, so without this the CLI's last event —
+/// the one describing the command that just ran — is discarded when the runtime
+/// goes away (measured: 0 of 1 delivered without a flush, 1 of 1 with one).
+const TELEMETRY_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Close the components and flush telemetry before the process exits.
 ///
 /// Exiting without closing leaves a SQLite database's `-wal`/`-shm` sidecars
 /// behind: dropping the pool only flags it closed and lets its connections tear
@@ -57,6 +65,15 @@ fn close_components(cm: &ComponentManager) {
             tracing::debug!(
                 "closing the relational database timed out after {CLOSE_TIMEOUT:?}; \
                  its WAL sidecars may be left for the next run to recover"
+            );
+        }
+        // Then let the analytics POSTs that are already in flight finish. Done
+        // after the close, not before: the close is the part with a user-visible
+        // consequence, and telemetry must never delay or fail it.
+        if !cognee::cognee_telemetry::flush(TELEMETRY_FLUSH_TIMEOUT).await {
+            tracing::debug!(
+                "telemetry still in flight after {TELEMETRY_FLUSH_TIMEOUT:?}; \
+                 dropping the remainder rather than delaying the exit"
             );
         }
     });

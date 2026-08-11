@@ -22,6 +22,12 @@ pub enum LifecycleError {
 /// All-zero UUID — matches Python's `default_user_id`.
 const DEFAULT_USER_ID_HEX: &str = "00000000000000000000000000000000";
 
+/// How long [`on_shutdown`] waits for already-dispatched telemetry POSTs to leave
+/// the process. Deliberately short: a SIGTERM must not be held up by an analytics
+/// collector.
+#[cfg(feature = "telemetry")]
+const TELEMETRY_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Called once before the router is handed to `axum::serve`.
 ///
 /// OSS-side bootstrap is a no-op: the synthetic default user is
@@ -39,6 +45,35 @@ pub fn default_user_id() -> Uuid {
 }
 
 /// Called on graceful shutdown (SIGTERM / SIGINT).
+///
+/// Order is the whole design here, and it is the reverse of startup: **drain the
+/// work first, then close the stores.** Closing a store while the pipeline
+/// registry still has tasks running would make every in-flight cognify fail
+/// against a closed handle and emit a burst of errors indistinguishable from a
+/// crash — the exact failure the relational-close comment below was written to
+/// avoid. So the registry shutdown and the sync abort stay first, and the graph /
+/// vector / relational closes come after.
+///
+/// Closing through `&self` is what makes this possible at all: `lib.graph_db` and
+/// `lib.vector_db` are `Arc` clones held by handlers and pipeline builders, so
+/// there is nothing here to drop — and for a Postgres store a retained `Arc` is
+/// precisely the case where the pool would otherwise stay open for the life of
+/// the process.
+///
+/// # Deliberate limitation
+///
+/// [`crate::components::ComponentHandles`] stores its slots as plain
+/// `Option<Arc<…>>`, so this hook **cannot** release the `reqwest` connection
+/// pools behind `llm` / `embedding_engine` / `transcriber` / `responses_client`,
+/// nor an ONNX session: doing so needs interior mutability in those fields, which
+/// is a breaking change for embedders. The standalone binary exits immediately
+/// after this returns, so the OS reclaims them; an **in-process embedder that
+/// rebuilds the router without exiting keeps that gap**. Recorded here rather than
+/// papered over with an interior-mutability layer.
+///
+/// Also pre-existing and worth knowing: without the `bin` feature there is no
+/// graceful-shutdown wiring at all (see `lib.rs`), so this function never runs and
+/// nothing is closed.
 pub async fn on_shutdown(state: &crate::state::AppState) {
     tracing::info!("Backend server is shutting down");
 
@@ -58,6 +93,29 @@ pub async fn on_shutdown(state: &crate::state::AppState) {
         );
     }
 
+    // Close the knowledge stores now that the work using them has drained.
+    //
+    // Same mechanism as the relational close below, different resources: an
+    // embedded graph leaves an un-checkpointed `<db>.wal` and a write lock on its
+    // database file, and a Postgres graph/vector adapter owns a pool of its own
+    // that a drop would not close — and there is no drop here anyway, because
+    // these are `Arc` clones. Both are no-ops for backends that own nothing
+    // closable (the in-memory brute-force store, LanceDB).
+    if let Some(lib) = state.lib.as_ref() {
+        if let Some(graph) = lib.graph_db.as_ref() {
+            match graph.close().await {
+                Ok(()) => tracing::info!("graph database closed"),
+                Err(e) => tracing::warn!("closing the graph database failed (non-fatal): {e}"),
+            }
+        }
+        if let Some(vector) = lib.vector_db.as_ref() {
+            match vector.close().await {
+                Ok(()) => tracing::info!("vector database closed"),
+                Err(e) => tracing::warn!("closing the vector database failed (non-fatal): {e}"),
+            }
+        }
+    }
+
     // Close the relational pool last, once the work that uses it has stopped.
     //
     // Exiting without closing leaves a SQLite database's `-wal`/`-shm` sidecars
@@ -71,5 +129,18 @@ pub async fn on_shutdown(state: &crate::state::AppState) {
             Ok(()) => tracing::info!("relational database closed"),
             Err(e) => tracing::warn!("closing the relational database failed (non-fatal): {e}"),
         }
+    }
+
+    // Last of all, let the analytics POSTs that are already in flight finish.
+    // `send_telemetry` is fire-and-forget, so the shutdown event itself — the one
+    // that says why the server stopped — is otherwise discarded when the process
+    // exits (measured: 0 of 1 delivered without a flush, 1 of 1 with one).
+    // Hard-bounded: a slow or blackholed collector must never hold up a SIGTERM.
+    #[cfg(feature = "telemetry")]
+    if !cognee_telemetry::flush(TELEMETRY_FLUSH_TIMEOUT).await {
+        tracing::debug!(
+            "telemetry still in flight after {TELEMETRY_FLUSH_TIMEOUT:?}; \
+             dropping the remainder rather than delaying shutdown"
+        );
     }
 }

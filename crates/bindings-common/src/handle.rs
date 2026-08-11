@@ -26,6 +26,11 @@ use cognee::models::User;
 use crate::SdkError;
 use crate::services::CogneeServices;
 
+/// How long a teardown waits for already-dispatched telemetry POSTs to leave the
+/// process. Small on purpose: a binding's `close()` must never block on an
+/// analytics collector.
+const TELEMETRY_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Optional bootstrap seam for resolving (and persisting) the default user.
 ///
 /// OSS has no `users`-table writer, so the default binding behaviour is
@@ -272,6 +277,19 @@ impl HandleState {
         drop(guard.take());
         *self.owner_id.lock().await = None;
         self.cm.close().await;
+
+        // Finally, let the analytics POSTs already in flight finish. `send_telemetry`
+        // is fire-and-forget, so a binding whose embedder exits (or drops its
+        // runtime) right after closing otherwise discards its last event —
+        // measured 0 of 1 delivered without a flush, 1 of 1 with one. Hard-bounded
+        // and ignored on timeout: a slow collector must never make a `close()` hang,
+        // and telemetry must never make one fail.
+        if !cognee::cognee_telemetry::flush(TELEMETRY_FLUSH_TIMEOUT).await {
+            tracing::debug!(
+                "telemetry still in flight after {TELEMETRY_FLUSH_TIMEOUT:?}; \
+                 dropping the remainder rather than delaying teardown"
+            );
+        }
     }
 
     /// Blocking [`close`](Self::close), for a synchronous binding teardown hook
