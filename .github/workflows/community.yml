@@ -267,8 +267,16 @@ jobs:
           cargo test -p cognee-graph --features postgres,testing \
             --lib -- --nocapture 2>&1 | tee pggraph-lib.log
 
+      # Mirror of ci.yml: the pool-teardown regression tests need their own
+      # `--test` invocation or they never execute.
+      - name: Run PgGraphAdapter pool-close tests
+        run: |
+          set -o pipefail
+          cargo test -p cognee-graph --features postgres,testing \
+            --test pg_graph_close -- --nocapture 2>&1 | tee pggraph-close.log
+
       - name: Assert the suite really executed
-        run: bash scripts/ci/assert_pggraph_suite_ran.sh pggraph-integration.log pggraph-lib.log
+        run: bash scripts/ci/assert_pggraph_suite_ran.sh pggraph-integration.log pggraph-lib.log pggraph-close.log
 
   # ── Aggregate status (single required check for branch protection) ────
   notify:

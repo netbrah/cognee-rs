@@ -705,6 +705,15 @@ jobs:
       - name: Run pgvector span instrumentation tests
         run: cargo test -p cognee-vector --test pgvector_span_instrumentation -- --nocapture
 
+      # Pool-teardown regression tests (topoteretes/cognee-rs#132). Named
+      # explicitly because this lane invokes individual `--test` targets: a new
+      # file is otherwise compiled by nobody and run nowhere, which for a leak
+      # test means the leak comes back silently. `pgvector_close.rs` reads
+      # `PGVECTOR_TEST_URL` first and falls back to the `DB_*` set this lane
+      # already exports, so no new service container or env is needed.
+      - name: Run PgVectorAdapter pool-close tests
+        run: cargo test -p cognee-vector --test pgvector_close -- --nocapture
+
   # ── Stage 2.5: Postgres graph adapter tests (depends on lint, parallel with `test`) ──
   # `crates/graph/tests/pg_graph_integration.rs` and the two inline
   # `shared_db_migration_tests` cases in `pg_graph_adapter.rs` all return early
@@ -818,13 +827,25 @@ jobs:
           cargo test -p cognee-graph --features postgres,testing \
             --lib -- --nocapture 2>&1 | tee pggraph-lib.log
 
+      # Pool-teardown regression tests (topoteretes/cognee-rs#132). A separate
+      # invocation for the same reason as the two above: this lane names its
+      # `--test` targets, so a new file runs nowhere until it is listed here.
+      # `#[serial]` inside the file keeps its own cases ordered; it uses its own
+      # `application_name` tags rather than the shared tables, so it does not
+      # race the integration suite's wipe-on-entry.
+      - name: Run PgGraphAdapter pool-close tests
+        run: |
+          set -o pipefail
+          cargo test -p cognee-graph --features postgres,testing \
+            --test pg_graph_close -- --nocapture 2>&1 | tee pggraph-close.log
+
       # Without this, a future change that stops the URL reaching the test
       # process (renamed env var, service container failing to bind) would leave
       # this lane reporting green while every case inside it skips. The logic
       # lives in a script rather than inline so this lane and its community.yml
       # mirror cannot drift, and so it can be tested against captured logs.
       - name: Assert the suite really executed
-        run: bash scripts/ci/assert_pggraph_suite_ran.sh pggraph-integration.log pggraph-lib.log
+        run: bash scripts/ci/assert_pggraph_suite_ran.sh pggraph-integration.log pggraph-lib.log pggraph-close.log
 
   # ── Stage 3: Language binding checks (depend on lint, parallel with `test`) ──
   # Gated on `lint` (not `test`) so the binding builds run concurrently with the

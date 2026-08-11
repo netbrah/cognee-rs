@@ -18,7 +18,22 @@ use crate::types::DatabaseError;
 /// branch sets `min` explicitly (see [`connect_sqlite`]).
 ///
 /// The pool serves only the relational database: the Postgres graph and vector
-/// adapters (`PgGraphAdapter`, `PgVectorAdapter`) open their own separate pools.
+/// adapters (`PgGraphAdapter`, `PgVectorAdapter`) open their own separate pools,
+/// each with sqlx's default ceiling of 10 rather than this constant. So a single
+/// warm `ComponentManager` on an all-Postgres layout can hold **three pools × 10
+/// = up to 30 server connections** (measured: 10 per pool, all three against the
+/// same server in the shared-database configuration).
+///
+/// All three are now closable, which matters because that ceiling is only safe if
+/// teardown actually gives the connections back: `PgGraphAdapter::close` /
+/// `PgVectorAdapter::close` close their own pools, and `ComponentManager::close`
+/// calls both plus [`close`] here. Before that, a handle that was closed but
+/// still referenced left 20 of the 30 open for the lifetime of the process — 5
+/// such handles exhaust a stock `max_connections = 100` server
+/// (topoteretes/cognee-rs#132). Budgeting the two adapter pools explicitly, the
+/// way [`connect`] budgets this one, is deliberately left as separate work: it
+/// changes capacity, where closing only stops the leak.
+///
 /// `POOL_ACQUIRE_TIMEOUT` surfaces pool exhaustion as a prompt error instead of
 /// a silent hang.
 const POOL_MAX_CONNECTIONS: u32 = 10;

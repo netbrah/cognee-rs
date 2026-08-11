@@ -15,16 +15,32 @@
 # inline in both YAML files so the two copies cannot drift, and so it can be
 # tested against captured logs without a CI round-trip.
 #
-# Usage: assert_pggraph_suite_ran.sh <integration-log> <lib-log>
+# Usage: assert_pggraph_suite_ran.sh <integration-log> <lib-log> [close-log]
+#
+# <close-log> is the pool-teardown suite (crates/graph/tests/pg_graph_close.rs,
+# topoteretes/cognee-rs#132). Optional so an older caller keeps working, but the
+# CI lanes pass it: those tests skip on a missing URL exactly like the rest, and
+# a leak regression test that silently skipped would be worse than none at all.
 
 set -uo pipefail
 
-INTEGRATION_LOG="${1:?usage: $0 <integration-log> <lib-log>}"
-LIB_LOG="${2:?usage: $0 <integration-log> <lib-log>}"
+INTEGRATION_LOG="${1:?usage: $0 <integration-log> <lib-log> [close-log]}"
+LIB_LOG="${2:?usage: $0 <integration-log> <lib-log> [close-log]}"
+CLOSE_LOG="${3:-}"
 
 # A floor rather than an exact count, so adding cases does not break the guard.
 # The integration suite had 32 cases when this was written.
 MIN_INTEGRATION_TESTS="${MIN_INTEGRATION_TESTS:-30}"
+
+# Cases in the pool-teardown suite that must have run by name. A count floor is
+# not enough here: these are the assertions that separate "the pool was closed"
+# from "the process happened to exit", so each one disappearing has to fail the
+# lane rather than lower a total.
+CLOSE_TESTS=(
+  close_releases_the_pool_while_the_adapter_is_still_held
+  close_reclaims_idle_connections_that_a_drop_would_pin
+  close_does_not_touch_a_caller_owned_connection
+)
 
 # The two cases that live inline in crates/graph/src/pg_graph_adapter.rs rather
 # than in the integration file, and so need their own assertion.
@@ -43,7 +59,10 @@ fail() {
 # open B") identically to exit 1 ("no match"), i.e. as proof of success. An
 # unreadable log means the run produced no evidence, which is a failure, not a
 # pass.
-for log in "$INTEGRATION_LOG" "$LIB_LOG"; do
+LOGS=("$INTEGRATION_LOG" "$LIB_LOG")
+[[ -n "$CLOSE_LOG" ]] && LOGS+=("$CLOSE_LOG")
+
+for log in "${LOGS[@]}"; do
   [[ -s "$log" ]] ||
     fail "$log is missing or empty — the test step produced no output, so nothing can be asserted about this run."
 done
@@ -59,7 +78,7 @@ done
 # future warning pointing at one of the three `eprintln!` call sites would
 # otherwise fail a run in which every test passed. Runtime skip output never
 # contains `eprintln!`; a compiler-rendered source snippet always does.
-matches="$(grep -hE '[A-Z_]+ not set .* skipping' "$INTEGRATION_LOG" "$LIB_LOG")"
+matches="$(grep -hE '[A-Z_]+ not set .* skipping' "${LOGS[@]}")"
 grep_status=$?
 
 case "$grep_status" in
@@ -96,5 +115,14 @@ for test_name in "${INLINE_TESTS[@]}"; do
   grep -qF -- "$test_name ... ok" "$LIB_LOG" ||
     fail "inline test $test_name did not run (or did not pass) — see $LIB_LOG."
 done
+
+# ── 4. The pool-teardown cases ran by name ──────────────────────────────────
+if [[ -n "$CLOSE_LOG" ]]; then
+  for test_name in "${CLOSE_TESTS[@]}"; do
+    grep -qF -- "$test_name ... ok" "$CLOSE_LOG" ||
+      fail "pool-teardown test $test_name did not run (or did not pass) — see $CLOSE_LOG. This is the suite that proves the Postgres pools are closed rather than leaked (topoteretes/cognee-rs#132); a green lane without it means nothing."
+  done
+  echo "PgGraph pool-teardown suite verified: ${#CLOSE_TESTS[@]} cases ran against a live Postgres."
+fi
 
 echo "PgGraph suite verified: $passed integration tests ran against a live Postgres, both inline migration tests passed, no skip markers."
