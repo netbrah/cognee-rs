@@ -111,6 +111,92 @@ async fn close_releases_sqlite_sidecars_and_marks_the_handle_closed() {
     assert!(!wal.exists() && !shm.exists(), "close must be idempotent");
 }
 
+/// Every `*.wal` under `root` — the embedded graph's sidecar (SQLite's is
+/// `<db>-wal`, matched by [`sidecars`] instead).
+fn graph_wal_files(root: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("wal") {
+                found.push(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    found
+}
+
+/// The relational pool was never the only OS resource a warm handle holds: the
+/// embedded graph keeps its own un-checkpointed `.wal` under the system root, and
+/// a write lock on the graph file behind it.
+///
+/// Both were leaked by the #135 teardown, which closed the relational connection
+/// and left every other slot in the manager's cache — i.e. never dropped, so
+/// never released. This test is the binding-surface half of that fix: it fails
+/// before it with `sys/graph.wal` still on disk after `close()` returned.
+///
+/// The re-open at the end is the other half: `close()` must not leave the graph
+/// file locked, or the next handle on the same path (a binding test suite that
+/// reuses its temp dir, a CLI invoked twice) fails to warm.
+#[tokio::test(flavor = "multi_thread")]
+async fn close_releases_the_embedded_graph_wal_and_unlocks_the_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _db_path) = handle_under(dir.path());
+    let sys = dir.path().join("sys");
+
+    {
+        let services = state.services().await.expect("warm");
+        let nodes: Vec<_> = (0..500)
+            .map(|i| {
+                serde_json::json!({
+                    "id": format!("n{i}"),
+                    "name": format!("Node {i}"),
+                    "type": "TestNode",
+                    "properties": {"idx": i, "pad": "x".repeat(64)},
+                })
+            })
+            .collect();
+        services
+            .graph_db
+            .add_nodes_raw(nodes)
+            .await
+            .expect("write to the embedded graph");
+        assert!(
+            !graph_wal_files(&sys).is_empty(),
+            "precondition: the writes must leave an un-checkpointed graph WAL under {}",
+            sys.display(),
+        );
+    }
+
+    state.close().await;
+
+    let leftover = graph_wal_files(&sys);
+    assert!(
+        leftover.is_empty(),
+        "close() must release the embedded graph's WAL too, found: {leftover:?}",
+    );
+
+    // A second handle on the same graph path must warm — the lock is gone.
+    let (second, _) = handle_under(dir.path());
+    let services = second.services().await.expect("re-warm on the same path");
+    assert!(
+        services
+            .graph_db
+            .has_node("n1")
+            .await
+            .expect("query the reopened graph"),
+        "the checkpointed nodes must be readable by the second handle",
+    );
+    second.close().await;
+    assert!(graph_wal_files(&sys).is_empty());
+}
+
 /// The implicit teardown (what a GC finalizer calls): releases the sidecars but
 /// leaves the handle usable, because the user never asked for a close — anything
 /// still holding a clone of the state, like a Python `cognee.datasets` sub-handle

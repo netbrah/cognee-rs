@@ -258,6 +258,16 @@ impl HandleState {
         // in between and have it closed underneath it. Lock order (services →
         // owner id → the manager's caches) is the same one `services()` takes, so
         // this cannot deadlock.
+        //
+        // **This ordering is load-bearing and must not be reversed.** The bundle
+        // holds an `Arc` clone of *every* engine, not just the connection, so
+        // dropping it first is what leaves the manager's own cache as the last
+        // strong reference — which is the reference `cm.close()` releases, and
+        // therefore the only reason the engines' destructors run at all (measured:
+        // exactly one live relational connection at this point, and the embedded
+        // graph's `.wal` released by the `cm.close()` below rather than at process
+        // exit). Calling `cm.close()` while the bundle is still cached would close
+        // the stores underneath a live bundle and leak the rest.
         let mut guard = self.services.lock().await;
         drop(guard.take());
         *self.owner_id.lock().await = None;
