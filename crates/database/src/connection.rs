@@ -26,6 +26,20 @@ const POOL_MIN_CONNECTIONS: u32 = 0;
 const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// How long [`close`] keeps working at emptying the pool after sqlx's own
+/// `Pool::close` has returned, and the ceiling on its retry interval.
+///
+/// The work only ever happens when sqlx left a connection behind (see
+/// [`drain_sqlite_pool`] for the two ways it does), and it normally finishes in
+/// a millisecond or two. The ceiling is generous because the alternative to
+/// waiting a moment longer is an orphaned `-wal`/`-shm` pair, and because the
+/// only way to exhaust it is a connection held by an operation still in flight —
+/// which teardown never promised to wait for anyway.
+#[cfg(feature = "sqlite")]
+const POOL_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(feature = "sqlite")]
+const POOL_DRAIN_RETRY_MAX: Duration = Duration::from_millis(25);
+
 /// SQLite lock-wait ceiling, matching Python's `SqlAlchemyAdapter`
 /// (`busy_timeout=120000`, added for the "database is locked" fix in
 /// topoteretes/cognee#2717). sqlx defaults to 5s, which `upsert_provenance_graph`
@@ -330,20 +344,113 @@ fn sqlite_parent_dir_is_writable(path: &std::path::Path) -> bool {
 /// happens to clean up; with more than one it is a race, which is why relying on
 /// `Drop` is not enough.
 ///
-/// [`sea_orm::DatabaseConnection::close_by_ref`] runs sqlx's real close: pooled
-/// connections are closed one at a time and checked-out ones are awaited, so
-/// exactly one connection observes itself as the last and the sidecars are gone
-/// before this future resolves.
+/// [`sea_orm::DatabaseConnection::close_by_ref`] runs sqlx's real close, which
+/// closes the connections it can see one at a time so exactly one of them
+/// observes itself as the last. That is necessary but **not sufficient**: it can
+/// return while a connection is still open, and it can leave one behind
+/// permanently. `drain_sqlite_pool` documents both cases and finishes the job.
 ///
 /// Idempotent, and safe to call while other `Arc` clones of the connection are
 /// still alive: they observe a closed pool and fail their next query rather than
 /// silently reconnecting. Callers that may be reused (e.g.
 /// `ComponentManager::close`) drop their cached connection so the next access
 /// builds a fresh one.
+///
+/// **When this returns, every connection the pool owned is closed and a file
+/// SQLite database's sidecars are gone** — unless an operation elsewhere is still
+/// holding a connection, in which case the wait gives up after
+/// `POOL_DRAIN_TIMEOUT` (2s) and logs a warning rather than blocking teardown on
+/// work it never promised to wait for.
 pub async fn close(db: &DatabaseConnection) -> Result<(), DatabaseError> {
-    db.close_by_ref()
-        .await
-        .map_err(|e| DatabaseError::ConnectionError(e.to_string()))
+    let closed = db.close_by_ref().await;
+
+    // Only SQLite gets the drain: it is the one backend where an on-disk
+    // artifact outlives the pool if a connection has not closed yet. A server
+    // backend's straggler costs nothing observable.
+    #[cfg(feature = "sqlite")]
+    if matches!(db, DatabaseConnection::SqlxSqlitePoolConnection(_)) {
+        drain_sqlite_pool(db.get_sqlite_connection_pool()).await;
+    }
+
+    closed.map_err(|e| DatabaseError::ConnectionError(e.to_string()))
+}
+
+/// Finish what sqlx's `Pool::close` starts: leave the closed pool with no open
+/// connections, so SQLite has actually unlinked `-wal`/`-shm` by the time the
+/// caller looks.
+///
+/// **`Pool::close` returning does not mean the pool is empty.** Two independent
+/// sqlx behaviours leave a connection behind, and both are ordinary rather than
+/// exotic — between them they orphaned the sidecars in five runs out of six on
+/// one core against five spinning processes (topoteretes/cognee-rs#132, the
+/// recipe that flaked `ts/__tests__/sdk_handle.test.ts`).
+///
+/// Both start from the same place: `PoolConnection::drop` does not return the
+/// connection to the pool inline, it *spawns* a task to do it. So when teardown
+/// begins, a connection whose last query has finished is typically still checked
+/// out — counted in `size()`, absent from the idle queue — with its return task
+/// either not yet polled or partway through.
+///
+/// 1. **`close` returns too early.** Its barrier is `semaphore.acquire(n)` for
+///    `n` in `1..=max_connections`, which only barriers if the permit count is
+///    honest. It is not: a connection releases its permit when it is *returned*
+///    to the pool (`PoolInner::release` → `release_permit`), and then `close`
+///    floats each idle connection it pops with a fresh `DecrementSizeGuard`,
+///    whose `Drop` releases a permit for that connection a second time. Closing
+///    k idle connections leaves the semaphore k permits over capacity, so
+///    `acquire(max_connections)` succeeds with a connection still checked out and
+///    the bounded loop simply runs out. Retrying `close` once the straggler's
+///    return task has run reaps it.
+/// 2. **`close` stops watching the idle queue.** `Floating::return_to_pool`
+///    checks `is_closed()` once, at its top, and then does a `ping()` round-trip
+///    to the connection's worker thread before calling `release()`
+///    unconditionally. A return task that passed that check just before the pool
+///    was marked closed therefore pushes its connection **into the idle queue of
+///    an already-closed pool**, after `close` has drained that queue for the last
+///    time. Nothing ever closes it: the connection stays open, its sqlite worker
+///    thread sits parked, and the sidecars survive until the pool itself is
+///    dropped. Only another `close` looks at the idle queue again.
+///
+/// So the loop below re-runs `Pool::close` rather than merely waiting: waiting
+/// alone fixes (1) and can never fix (2). `close` is idempotent and cheap when
+/// there is nothing to reap, and this converges because once the pool is marked
+/// closed only the finitely many return tasks already past their `is_closed()`
+/// check can strand another connection.
+///
+/// `size()` is the right completion signal: it is decremented by
+/// `DecrementSizeGuard::drop`, which runs after that connection's own
+/// `close().await` has returned, so `size() == 0` means every connection has
+/// finished `sqlite3_close`. The fast path — the uncontended teardown, which is
+/// every teardown on an idle machine — costs one atomic load and returns.
+#[cfg(feature = "sqlite")]
+async fn drain_sqlite_pool(pool: &sea_orm::sqlx::SqlitePool) {
+    if pool.size() == 0 {
+        return;
+    }
+
+    let deadline = std::time::Instant::now() + POOL_DRAIN_TIMEOUT;
+    let mut retry_in = Duration::from_millis(1);
+    loop {
+        // Reaps a connection stranded in the idle queue by case (2), and is a
+        // no-op when there is nothing there.
+        pool.close().await;
+        if pool.size() == 0 {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(retry_in).await;
+        retry_in = (retry_in * 2).min(POOL_DRAIN_RETRY_MAX);
+    }
+
+    tracing::warn!(
+        open_connections = pool.size(),
+        timeout = ?POOL_DRAIN_TIMEOUT,
+        "the relational pool still holds open connections after close; an operation is \
+         probably still in flight. A file SQLite database keeps its -wal/-shm sidecars \
+         until those connections close."
+    );
 }
 
 /// Run all pending migrations on an existing connection.

@@ -137,6 +137,28 @@ async fn release_frees_the_sidecars_without_closing_the_handle() {
     assert!(!wal.exists() && !shm.exists(), "release must be idempotent");
 }
 
+/// Wait for an off-runtime teardown thread **without** blocking the runtime.
+///
+/// `JoinHandle::join` would block the calling task's worker thread, and on a
+/// single-core machine (CI, or a `taskset`-pinned run) there is only one worker —
+/// so joining inline wedges the runtime for the duration of the teardown. The
+/// teardown needs it: releasing the last relational connection means polling the
+/// task sqlx spawned from `PoolConnection::drop`, and only a worker can do that.
+/// A real embedder does not have that problem, because the thread it closes from
+/// (Node's main thread, a JVM `Cleaner`) is not one of the runtime's workers —
+/// so awaiting a signal, which yields the worker, is what models it faithfully.
+async fn join_off_runtime<F>(work: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        work();
+        let _ = tx.send(());
+    });
+    rx.await.expect("the off-runtime teardown thread panicked");
+}
+
 /// `close_blocking` is what the synchronous binding teardown hooks call, and both
 /// of its deterministic branches must leave nothing behind by the time they
 /// return: from a thread with no runtime of its own (a Java `close()` call, the
@@ -152,12 +174,11 @@ async fn close_blocking_releases_the_sidecars_on_either_thread() {
     let (wal, shm) = sidecars(&db_path);
     state.services().await.expect("warm");
     assert!(wal.exists() && shm.exists());
-    let off_thread = {
+    {
         let state = std::sync::Arc::clone(&state);
         let handle = handle.clone();
-        std::thread::spawn(move || state.close_blocking(&handle))
-    };
-    off_thread.join().expect("closing thread");
+        join_off_runtime(move || state.close_blocking(&handle)).await;
+    }
     assert!(
         !wal.exists() && !shm.exists(),
         "close_blocking from an off-runtime thread must release the sidecars",
@@ -182,15 +203,136 @@ async fn close_blocking_releases_the_sidecars_on_either_thread() {
     let (wal, shm) = sidecars(&db_path);
     state.services().await.expect("warm");
     assert!(wal.exists() && shm.exists());
-    let off_thread = {
+    {
         let state = std::sync::Arc::clone(&state);
         let handle = handle.clone();
-        std::thread::spawn(move || state.release_blocking(&handle))
-    };
-    off_thread.join().expect("releasing thread");
+        join_off_runtime(move || state.release_blocking(&handle)).await;
+    }
     assert!(
         !wal.exists() && !shm.exists(),
         "release_blocking must release the sidecars",
     );
     assert!(!state.is_closed());
+}
+
+/// The blocking close must hold its contract even when sqlx's own `Pool::close`
+/// returns while a connection is still open — which is what it does whenever the
+/// task sqlx spawns from `PoolConnection::drop` has not been polled yet, i.e.
+/// routinely, on any loaded machine. Left unhandled this is what kept
+/// `ts/__tests__/sdk_handle.test.ts` flaking after issue #132's first fix: it
+/// failed twice in a row on CI on 2026-08-11, on a different test in the block
+/// each time, and blocked an unrelated PR from merging.
+///
+/// `cognee_database::close` carries the mechanism and a deterministic test of it
+/// (`crates/database/tests/connection_pool.rs`). This test is the same forced
+/// ordering driven through the real binding entry point — a warmed handle, torn
+/// down by `close_blocking` from a thread with no runtime of its own, exactly as
+/// `cogneeClose` / `cg_sdk_close` / the JNI `destroy` do it.
+#[test]
+fn close_blocking_waits_for_a_straggling_connection() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    // One worker thread, so "the task sqlx spawned cannot run yet" is a fact we
+    // control rather than a race we hope for. The teardown itself runs on a
+    // thread of its own, so it still makes progress while the worker is busy.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let (state, db_path) = handle_under(dir.path());
+    let (wal, shm) = sidecars(&db_path);
+
+    let services = rt.block_on(state.services()).expect("warm");
+    let pool = services.database.get_sqlite_connection_pool().clone();
+    drop(services);
+    assert!(wal.exists() && shm.exists());
+
+    // Park idle connections: closing them is what pushes sqlx's semaphore over
+    // capacity and lets its close barrier pass with a connection still out.
+    rt.block_on(async {
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(pool.acquire().await.unwrap());
+        }
+        drop(held);
+        for _ in 0..500 {
+            if pool.num_idle() >= 4 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    });
+    assert!(
+        pool.num_idle() >= 4,
+        "the setup needs several genuinely idle connections, got {}",
+        pool.num_idle(),
+    );
+
+    // Occupy the only worker, then strand a checked-out connection behind it.
+    let release = Arc::new(AtomicBool::new(false));
+    let occupied = Arc::new(AtomicBool::new(false));
+    {
+        let release = Arc::clone(&release);
+        let occupied = Arc::clone(&occupied);
+        rt.spawn(async move {
+            occupied.store(true, Ordering::Release);
+            while !release.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+    }
+    while !occupied.load(Ordering::Acquire) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    rt.block_on(async {
+        let conn = pool.acquire().await.unwrap();
+        drop(conn);
+    });
+
+    // Free the worker a beat after the close starts, so a close that waits can
+    // finish and a close that returns with sqlx's cannot have.
+    let releaser = {
+        let release = Arc::clone(&release);
+        let pool = pool.clone();
+        std::thread::spawn(move || {
+            while !pool.is_closed() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            std::thread::sleep(Duration::from_millis(150));
+            release.store(true, Ordering::Release);
+        })
+    };
+
+    {
+        let state = Arc::clone(&state);
+        let handle = rt.handle().clone();
+        std::thread::spawn(move || state.close_blocking(&handle))
+            .join()
+            .expect("closing thread");
+    }
+
+    // Sample the contract at the instant `close_blocking` returns. Looking any
+    // later — even just long enough to join a thread — would let the straggler
+    // finish on its own, and the test would pass with or without the fix.
+    let (size, wal_left, shm_left) = (pool.size(), wal.exists(), shm.exists());
+
+    // Unblock unconditionally so a failed assertion cannot hide behind a hang.
+    release.store(true, Ordering::Release);
+    releaser.join().unwrap();
+
+    assert_eq!(
+        size, 0,
+        "close_blocking must not return while the pool still owns a connection",
+    );
+    assert!(
+        !wal_left,
+        "-wal must be gone when close_blocking returns, even when sqlx's own close returned early",
+    );
+    assert!(!shm_left, "-shm must be gone when close_blocking returns");
+    assert!(state.is_closed());
 }
