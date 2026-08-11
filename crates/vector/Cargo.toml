@@ -56,6 +56,18 @@ cognee-utils = { path = "../utils", version = "0.2.0" }
 tempfile.workspace = true
 serial_test.workspace = true
 cognee-test-utils = { path = "../test-utils" }
+# `create_temp_postgres_db` (used by the inline `shared_db_migration_tests` cases
+# for their per-test databases) opens its maintenance connection through
+# `cognee_database::connect`, which needs an sqlx driver at *runtime* — sea-orm
+# returns "URL scheme not supported" without one. `cognee-database` declares no
+# default features, and `cognee-test-utils` pulls it in bare, so the driver would
+# otherwise arrive only by feature unification with this crate's own `pgvector`
+# feature (which enables `sea-orm/sqlx-postgres`). That happens to hold today (one
+# shared sea-orm 1.1), but it is invisible and would break the moment the two
+# crates resolve to different sea-orm versions, with a runtime error rather than a
+# compile one. Spell it out instead — same reasoning, same helper, as
+# `crates/graph/Cargo.toml`.
+cognee-database = { path = "../database", features = ["postgres"] }
 cognee-models = { path = "../models" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 

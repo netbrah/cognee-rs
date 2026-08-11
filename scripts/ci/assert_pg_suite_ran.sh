@@ -148,7 +148,14 @@ esac
 skips="$(printf '%s\n' "$matches" | grep -v 'eprintln!' | sed '/^[[:space:]]*$/d' || true)"
 if [[ -n "$skips" ]]; then
   printf '%s\n' "$skips"
-  fail "$LABEL tests skipped — the suite never reached a live Postgres. The URL is unset or empty in the test process; a broken adapter would panic with its own error instead."
+  # The message names no specific cause. The marker lines printed just above say
+  # which variable the test process found missing, and it is not always a Postgres
+  # URL — `pg_full_stack_e2e` also skips on an absent LLM key. Asserting "the URL
+  # is unset" here would send whoever reads the log to debug a healthy service
+  # container. What IS safe to assert is the category: every suite behind this
+  # guard panics with the underlying error when a configured backend misbehaves,
+  # so a *skip* means an environment variable never arrived.
+  fail "$LABEL tests skipped — a case returned early instead of running. See the marker line(s) above for which environment variable the test process found missing or empty. These suites panic with the underlying error when a configured backend fails, so a skip is a missing variable, not a broken backend."
 fi
 
 # ── 2. A plausible number of cases actually ran, per log ────────────────────

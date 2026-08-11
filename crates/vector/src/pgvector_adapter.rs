@@ -1108,6 +1108,52 @@ mod shared_db_migration_tests {
             .filter(|v| !v.is_empty())
     }
 
+    /// Run `body` against a throwaway database of this test's own, dropped again
+    /// afterwards — even if `body` panics.
+    ///
+    /// Both cases below are about two migrators *coexisting inside one database*,
+    /// so the isolation is at the database level and nothing inside it is reset.
+    ///
+    /// `body` runs on a spawned task so a failed assertion surfaces as a
+    /// `JoinError` instead of unwinding past the drop. `TempPostgresDb::cleanup`
+    /// is `async`, so it cannot be a `Drop` impl; without this the database would
+    /// leak on every red run. The panic is re-raised unchanged afterwards, so
+    /// libtest still reports the original failure and message. Mirrors
+    /// `with_temp_db` in `crates/graph/src/pg_graph_adapter.rs`, which solved the
+    /// same problem for the same helper.
+    ///
+    /// The one leak this cannot cover is a test hard-killed rather than unwound
+    /// (a `SIGKILL`, or nextest's `slow-timeout` terminate-after), which no async
+    /// cleanup can survive; the databases are uniquely named, so the fallback is
+    /// dropping stragglers by hand.
+    async fn with_temp_db<F, Fut>(what: &str, body: F)
+    where
+        F: FnOnce(String) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let Some(base_url) = test_url() else {
+            eprintln!("PGVECTOR_TEST_URL not set — skipping {what}");
+            return;
+        };
+        let tmp = cognee_test_utils::create_temp_postgres_db(&base_url)
+            .await
+            .expect("PGVECTOR_TEST_URL is set, so CREATE DATABASE must succeed on that server");
+        let outcome = tokio::spawn(body(tmp.url().to_string())).await;
+        tmp.cleanup().await;
+        if let Err(join_err) = outcome {
+            // A `JoinError` here can only be a panic: the task is never aborted
+            // and its handle is awaited immediately, so there is no cancellation
+            // path. Assert that rather than leaning on it — `into_panic()` panics
+            // on a cancelled task, which would replace the real failure with a
+            // confusing one.
+            assert!(
+                join_err.is_panic(),
+                "the {what} task was cancelled instead of panicking, which this helper never does: {join_err}"
+            );
+            std::panic::resume_unwind(join_err.into_panic());
+        }
+    }
+
     /// A stand-in for the downstream relational / auth migrator. It writes its
     /// versions into the DEFAULT `seaql_migrations` table — exactly what the core
     /// schema does in an all-Postgres deployment.
@@ -1192,92 +1238,82 @@ mod shared_db_migration_tests {
     /// one Postgres DB without colliding on the default `seaql_migrations` table.
     #[tokio::test]
     async fn pgvector_coexists_with_relational_migrator_in_shared_db() {
-        let Some(base_url) = test_url() else {
-            eprintln!("PGVECTOR_TEST_URL not set — skipping shared-DB migration test");
-            return;
-        };
-        let tmp = cognee_test_utils::create_temp_postgres_db(&base_url)
-            .await
-            .expect("create temp Postgres database");
-        let url = tmp.url().to_string();
+        with_temp_db("shared-DB migration test", |url| async move {
+            let db = Database::connect(&url).await.unwrap();
 
-        let db = Database::connect(&url).await.unwrap();
+            // 1. Relational / auth migrator runs first and populates the default
+            //    `seaql_migrations` with versions the vector migrator does not own.
+            RelationalMigrator::up(&db, None)
+                .await
+                .expect("relational migrator should succeed");
+            assert_eq!(version_count(&db, "seaql_migrations").await, 2);
 
-        // 1. Relational / auth migrator runs first and populates the default
-        //    `seaql_migrations` with versions the vector migrator does not own.
-        RelationalMigrator::up(&db, None)
-            .await
-            .expect("relational migrator should succeed");
-        assert_eq!(version_count(&db, "seaql_migrations").await, 2);
+            // 2. Initialising the vector adapter against the SAME database must
+            //    succeed. Before the fix it aborted with "Migration file of version
+            //    'm20260914_000002_auth' is missing ...".
+            let adapter = PgVectorAdapter::new(&url, 384).await;
+            assert!(
+                adapter.is_ok(),
+                "PgVectorAdapter init must not collide with the relational \
+                 seaql_migrations table; got: {:?}",
+                adapter.err()
+            );
 
-        // 2. Initialising the vector adapter against the SAME database must
-        //    succeed. Before the fix it aborted with "Migration file of version
-        //    'm20260914_000002_auth' is missing ...".
-        let adapter = PgVectorAdapter::new(&url, 384).await;
-        assert!(
-            adapter.is_ok(),
-            "PgVectorAdapter init must not collide with the relational \
-             seaql_migrations table; got: {:?}",
-            adapter.err()
-        );
+            // 3. The vector migrator tracks its version in its OWN table and leaves
+            //    the relational bookkeeping untouched.
+            assert_eq!(version_count(&db, "seaql_migrations").await, 2);
+            assert_eq!(version_count(&db, "seaql_migrations_pgvector").await, 1);
 
-        // 3. The vector migrator tracks its version in its OWN table and leaves
-        //    the relational bookkeeping untouched.
-        assert_eq!(version_count(&db, "seaql_migrations").await, 2);
-        assert_eq!(version_count(&db, "seaql_migrations_pgvector").await, 1);
-
-        drop(db);
-        tmp.cleanup().await;
+            // Hand the pooled connections back before the database is dropped, so
+            // cleanup does not have to lean on `WITH (FORCE)`.
+            drop(adapter);
+            drop(db);
+        })
+        .await;
     }
 
     /// Upgrade path: a legacy pgvector row left in the default `seaql_migrations`
     /// by an older build must be purged so the core migrator no longer chokes.
     #[tokio::test]
     async fn pgvector_purges_legacy_row_from_default_table_on_upgrade() {
-        let Some(base_url) = test_url() else {
-            eprintln!("PGVECTOR_TEST_URL not set — skipping legacy-purge test");
-            return;
-        };
-        let tmp = cognee_test_utils::create_temp_postgres_db(&base_url)
+        with_temp_db("legacy-purge test", |url| async move {
+            let db = Database::connect(&url).await.unwrap();
+
+            // Simulate an older build that recorded the pgvector version into the
+            // DEFAULT `seaql_migrations` table (aux-ran-before-core ordering).
+            db.execute(Statement::from_string(
+                db.get_database_backend(),
+                "CREATE TABLE seaql_migrations (version VARCHAR PRIMARY KEY, applied_at BIGINT NOT NULL)",
+            ))
             .await
-            .expect("create temp Postgres database");
-        let url = tmp.url().to_string();
-
-        let db = Database::connect(&url).await.unwrap();
-
-        // Simulate an older build that recorded the pgvector version into the
-        // DEFAULT `seaql_migrations` table (aux-ran-before-core ordering).
-        db.execute(Statement::from_string(
-            db.get_database_backend(),
-            "CREATE TABLE seaql_migrations (version VARCHAR PRIMARY KEY, applied_at BIGINT NOT NULL)",
-        ))
-        .await
-        .unwrap();
-        db.execute(Statement::from_string(
-            db.get_database_backend(),
-            "INSERT INTO seaql_migrations (version, applied_at) \
-             VALUES ('m20250101_000001_create_pgvector_extension', 0)",
-        ))
-        .await
-        .unwrap();
-
-        // Upgraded build initialises the vector adapter.
-        PgVectorAdapter::new(&url, 384)
+            .unwrap();
+            db.execute(Statement::from_string(
+                db.get_database_backend(),
+                "INSERT INTO seaql_migrations (version, applied_at) \
+                 VALUES ('m20250101_000001_create_pgvector_extension', 0)",
+            ))
             .await
-            .expect("vector adapter should initialise on upgrade");
+            .unwrap();
 
-        // The stale vector row is gone, so the core/relational migrator can now
-        // run against the default table without aborting.
-        assert_eq!(
-            version_count(&db, "seaql_migrations").await,
-            0,
-            "legacy pgvector row must be purged from the default seaql_migrations"
-        );
-        RelationalMigrator::up(&db, None)
-            .await
-            .expect("core migrator must not choke after legacy row is purged");
+            // Upgraded build initialises the vector adapter.
+            let adapter = PgVectorAdapter::new(&url, 384)
+                .await
+                .expect("vector adapter should initialise on upgrade");
 
-        drop(db);
-        tmp.cleanup().await;
+            // The stale vector row is gone, so the core/relational migrator can now
+            // run against the default table without aborting.
+            assert_eq!(
+                version_count(&db, "seaql_migrations").await,
+                0,
+                "legacy pgvector row must be purged from the default seaql_migrations"
+            );
+            RelationalMigrator::up(&db, None)
+                .await
+                .expect("core migrator must not choke after legacy row is purged");
+
+            drop(adapter);
+            drop(db);
+        })
+        .await;
     }
 }

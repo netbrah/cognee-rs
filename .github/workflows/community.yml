@@ -376,12 +376,17 @@ jobs:
           cargo test -p cognee-vector --features pgvector,testing \
             --test pgvector_span_instrumentation -- --nocapture 2>&1 | tee pgvector-spans.log
 
+      # Floors: only the integration log carries a real count floor (20 against 24
+      # macro-generated cases that are not named below). The other two get
+      # `--min-tests 1` — enough to catch compiles-to-zero — because every case
+      # that matters in them is named below, and 32 of the `--lib` target's 34
+      # tests are unrelated unit tests. See the ci.yml twin for the full reasoning.
       - name: Assert the suite really executed
         run: |
           bash scripts/ci/assert_pg_suite_ran.sh --label PgVector \
-            --log pgvector-integration.log --min-tests 24 \
-            --log pgvector-lib.log        --min-tests 30 \
-            --log pgvector-spans.log      --min-tests 3 \
+            --log pgvector-integration.log --min-tests 20 \
+            --log pgvector-lib.log         --min-tests 1 \
+            --log pgvector-spans.log       --min-tests 1 \
             --require-test pgvector_coexists_with_relational_migrator_in_shared_db \
             --require-test pgvector_purges_legacy_row_from_default_table_on_upgrade \
             --require-test upsert_emits_pgvector_span \

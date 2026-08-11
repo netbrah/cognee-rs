@@ -33,11 +33,25 @@ const DIM: usize = 4;
 /// `None` to silently skip.
 async fn make_adapter() -> Option<PgVectorAdapter> {
     let url = cognee_test_utils::pg_test_url()?;
-    let adapter = PgVectorAdapter::new(&url, DIM).await.ok()?;
-    if let Ok(cols) = adapter.list_collections().await {
-        for (dt, fname) in cols {
-            let _ = adapter.delete_collection(&dt, &fname).await;
-        }
+    // `expect`, not `.ok()?`: past this point the URL *is* configured, so a
+    // connect/migrate failure is a real defect. Collapsing it into `None` would
+    // print the "DB_PROVIDER not set" skip line below and send whoever reads the
+    // CI log hunting a broken service container instead of the adapter bug — and
+    // it would make the guard's own claim that "a broken adapter would panic with
+    // its own error instead" untrue. Same reasoning, same fix as
+    // `crates/graph/tests/pg_graph_integration.rs`.
+    let adapter = PgVectorAdapter::new(&url, DIM)
+        .await
+        .expect("DB_PROVIDER=postgres, so the adapter must connect and migrate");
+    let cols = adapter
+        .list_collections()
+        .await
+        .expect("listing collections must succeed against a live Postgres");
+    for (dt, fname) in cols {
+        adapter
+            .delete_collection(&dt, &fname)
+            .await
+            .expect("dropping a stale collection must succeed");
     }
     // `index_points` deliberately does NOT create the collection: every
     // `VectorDB` impl in the workspace requires it to exist first (the

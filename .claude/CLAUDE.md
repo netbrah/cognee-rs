@@ -89,14 +89,17 @@ Most integration tests require an OpenAI-compatible LLM and locally-downloaded e
 
 ### Postgres-gated suites
 
-Several suites need a live Postgres and are **silently skipped** without it — a skipped case still prints `ok`, so pass `-- --nocapture` and read the `running N tests` line rather than the exit status. Each is also behind a non-default cargo feature, so omitting `--features` compiles the target down to zero tests and still exits 0. All of them provision their own throwaway database off the server the URL names, so pointing these at a real database is safe.
+Several suites need a live Postgres and are **silently skipped** without it — a skipped case still prints `ok`, so pass `-- --nocapture` and read the `running N tests` line rather than the exit status. Each is also behind a non-default cargo feature, so omitting `--features` compiles the target down to zero tests and still exits 0.
 
-| Variable | Suites | Image | Command |
-|---|---|---|---|
-| `PGVECTOR_TEST_URL` | `crates/vector/tests/pgvector_integration.rs` (24), `pgvector_adapter.rs` inline (2) | `pgvector/pgvector:pg16` | `cargo test -p cognee-vector --features pgvector,testing --test pgvector_integration -- --nocapture` |
-| `DB_PROVIDER=postgres` + `DB_HOST`/`DB_PORT`/`DB_NAME`/`DB_USERNAME`/`DB_PASSWORD` | `pgvector_span_instrumentation.rs` (3), plus `crates/ingestion/tests/{integration_deduplication,tenant_isolation,image_audio_add}.rs` and `crates/database/tests/migration_compat.rs` — **the ingestion/migration ones are still unwired in CI** | `pgvector/pgvector:pg16` | `cargo test -p cognee-vector --features pgvector,testing --test pgvector_span_instrumentation -- --nocapture` |
-| `TEST_POSTGRES_URL` | `crates/lib/tests/pg_shared_db_single_stack.rs` (1), `crates/lib/tests/pg_full_stack_e2e.rs` (1, needs an LLM), `crates/database/tests/provenance_batch.rs` (2 of 3) | `pgvector/pgvector:pg16` | `cargo test -p cognee --test pg_shared_db_single_stack -- --nocapture` |
-| `PGGRAPH_TEST_URL` | `crates/graph/tests/pg_graph_integration.rs` (32), `pg_graph_adapter.rs` inline (2) | `postgres:16` | `cargo nextest run -p cognee-graph --features postgres,testing --test pg_graph_integration --success-output immediate` |
+> **⚠️ Point these at a throwaway server, not a database you care about.** Isolation is *not* uniform. The `TEST_POSTGRES_URL` and `PGGRAPH_TEST_URL` suites, and the two inline `pgvector_adapter.rs` cases, each create their own throwaway database off the server the URL names and drop it again — safe against an existing instance. **The two suites in the first two rows below do not.** They connect straight to the database the URL names, and their `make_adapter()` helper iterates `list_collections()` calling `delete_collection()` on every entry, which issues a real `DROP TABLE` — so running them against a working cognee database destroys every vector collection table in it. The `DB_*`-gated ingestion and `migration_compat` suites likewise operate directly on the named database.
+
+| Variable | Suites | Own DB? | Image | Command |
+|---|---|---|---|---|
+| `PGVECTOR_TEST_URL` | `crates/vector/tests/pgvector_integration.rs` (24) | **no — drops all collections** | `pgvector/pgvector:pg16` | `cargo test -p cognee-vector --features pgvector,testing --test pgvector_integration -- --nocapture` |
+| `DB_PROVIDER=postgres` + `DB_HOST`/`DB_PORT`/`DB_NAME`/`DB_USERNAME`/`DB_PASSWORD` | `pgvector_span_instrumentation.rs` (3), plus `crates/ingestion/tests/{integration_deduplication,tenant_isolation,image_audio_add}.rs` and `crates/database/tests/migration_compat.rs` — **the ingestion/migration ones are still unwired in CI** | **no** | `pgvector/pgvector:pg16` | `cargo test -p cognee-vector --features pgvector,testing --test pgvector_span_instrumentation -- --nocapture` |
+| `PGVECTOR_TEST_URL` | `crates/vector/src/pgvector_adapter.rs` inline (2) | yes | `pgvector/pgvector:pg16` | `cargo test -p cognee-vector --features pgvector,testing --lib -- --nocapture` |
+| `TEST_POSTGRES_URL` | `crates/lib/tests/pg_shared_db_single_stack.rs` (1), `crates/lib/tests/pg_full_stack_e2e.rs` (1, needs an LLM), `crates/database/tests/provenance_batch.rs` (2 of 3) | yes | `pgvector/pgvector:pg16` | `cargo test -p cognee --test pg_shared_db_single_stack -- --nocapture` |
+| `PGGRAPH_TEST_URL` | `crates/graph/tests/pg_graph_integration.rs` (32), `pg_graph_adapter.rs` inline (2) | yes | `postgres:16` | `cargo nextest run -p cognee-graph --features postgres,testing --test pg_graph_integration --success-output immediate` |
 
 ```bash
 docker run --rm -d --name cognee-pgv-test \

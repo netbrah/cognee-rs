@@ -21,19 +21,34 @@ use serial_test::serial;
 
 /// Read the connection URL or skip the test.
 fn test_url() -> Option<String> {
-    std::env::var("PGVECTOR_TEST_URL").ok()
+    std::env::var("PGVECTOR_TEST_URL")
+        .ok()
+        .filter(|v| !v.is_empty())
 }
 
 /// Create an adapter and clean up all vector collections from previous runs.
+///
+/// Only an absent `PGVECTOR_TEST_URL` yields `None` (the skip path). Once the URL
+/// is known to be set, failing to connect, migrate or clean up panics with the
+/// underlying error: collapsing those into `None` would print the
+/// "PGVECTOR_TEST_URL not set" line instead, which the CI guard reports as "the
+/// suite never reached a live Postgres" — sending whoever reads the log after a
+/// real adapter regression to debug a service container that was fine.
 async fn make_adapter() -> Option<PgVectorAdapter> {
     let url = test_url()?;
-    let db = PgVectorAdapter::new(&url, 384).await.ok()?;
+    let db = PgVectorAdapter::new(&url, 384)
+        .await
+        .expect("PGVECTOR_TEST_URL is set, so the adapter must connect and migrate");
 
-    // Best-effort cleanup of any leftover collections from prior runs.
-    if let Ok(cols) = db.list_collections().await {
-        for (dt, fn_) in cols {
-            let _ = db.delete_collection(&dt, &fn_).await;
-        }
+    // Clear any leftover collections from prior runs.
+    let cols = db
+        .list_collections()
+        .await
+        .expect("listing collections must succeed against a live Postgres");
+    for (dt, fn_) in cols {
+        db.delete_collection(&dt, &fn_)
+            .await
+            .expect("dropping a stale collection must succeed");
     }
     Some(db)
 }

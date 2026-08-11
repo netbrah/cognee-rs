@@ -757,12 +757,28 @@ jobs:
       # executing nothing. The logic lives in a script so this lane and its
       # community.yml mirror cannot drift, and so it can be tested against
       # captured logs.
+      #
+      # Only the integration log carries a real count floor, and it has headroom
+      # (20 against 24 cases): those 24 come from a `pgvector_test!` macro and are
+      # not named individually below, so the floor is the only thing standing
+      # between a feature-flag regression and a green lane. The other two logs get
+      # `--min-tests 1` — enough to catch the compiles-to-zero case, which is the
+      # floor's actual job — because every case that matters in them IS named
+      # below, and a floor tight enough to notice one disappearing would fire on
+      # unrelated churn instead. That is not hypothetical for the `--lib` target:
+      # 32 of its 34 tests are brute-force/mock/node-filter unit tests with no
+      # connection to Postgres, so a floor near the total would fail this lane for
+      # someone relocating a mock test, and blame "the feature flags have probably
+      # stopped applying". The deleted `assert_pggraph_suite_ran.sh` reached the
+      # same conclusion ("the lib target holds 20-odd unrelated unit tests, so a
+      # count floor would not notice these two disappearing") and the
+      # `pggraph-postgres` lane below still passes `--min-tests 1` for it.
       - name: Assert the suite really executed
         run: |
           bash scripts/ci/assert_pg_suite_ran.sh --label PgVector \
-            --log pgvector-integration.log --min-tests 24 \
-            --log pgvector-lib.log        --min-tests 30 \
-            --log pgvector-spans.log      --min-tests 3 \
+            --log pgvector-integration.log --min-tests 20 \
+            --log pgvector-lib.log         --min-tests 1 \
+            --log pgvector-spans.log       --min-tests 1 \
             --require-test pgvector_coexists_with_relational_migrator_in_shared_db \
             --require-test pgvector_purges_legacy_row_from_default_table_on_upgrade \
             --require-test upsert_emits_pgvector_span \

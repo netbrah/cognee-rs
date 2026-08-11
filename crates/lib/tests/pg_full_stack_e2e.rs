@@ -207,17 +207,40 @@ async fn pg_full_stack_add_and_cognify() {
     }
 
     // Own throwaway database, like the sibling `pg_shared_db_single_stack` suite.
-    // Two reasons it matters more here than elsewhere: the assertions below are
-    // "the graph/vector stores are non-empty", which leftover rows from an earlier
-    // run would satisfy without this run writing anything at all; and the cleanup
-    // this replaces was a bare `delete_graph()` against whatever database
+    // Two reasons it matters more here than elsewhere: the assertions in the body
+    // are "the graph/vector stores are non-empty", which leftover rows from an
+    // earlier run would satisfy without this run writing anything at all; and the
+    // cleanup this replaces was a bare `delete_graph()` against whatever database
     // `TEST_POSTGRES_URL` named, which on a developer's own instance wiped real
     // data.
     let tmp = cognee_test_utils::create_temp_postgres_db(&base_url)
         .await
         .expect("create temp Postgres database");
-    let pg_url = tmp.url().to_string();
 
+    // The body runs on a spawned task so a failed assertion surfaces as a
+    // `JoinError` instead of unwinding past the cleanup below.
+    // `TempPostgresDb::cleanup` is `async`, so it cannot be a `Drop` impl; without
+    // this the database would leak on every red run — and this test panics readily,
+    // since it depends on a live LLM. The panic is re-raised unchanged afterwards,
+    // so libtest still reports the original failure. Mirrors `with_temp_db` in
+    // `crates/graph/src/pg_graph_adapter.rs` and the `pggraph_test!` harness.
+    let outcome = tokio::spawn(run_full_stack(tmp.url().to_string())).await;
+    tmp.cleanup().await;
+    if let Err(join_err) = outcome {
+        // A `JoinError` here can only be a panic: the task is never aborted and its
+        // handle is awaited immediately, so there is no cancellation path. Assert
+        // that rather than leaning on it — `into_panic()` panics on a cancelled
+        // task, which would replace the real failure with a confusing one.
+        assert!(
+            join_err.is_panic(),
+            "the case task was cancelled instead of panicking, which this test never does: {join_err}"
+        );
+        std::panic::resume_unwind(join_err.into_panic());
+    }
+}
+
+/// The test body proper, against the throwaway database at `pg_url`.
+async fn run_full_stack(pg_url: String) {
     let settings = make_all_postgres_settings(&pg_url);
     let system_root = settings.system_root_directory.clone();
     let cm = Arc::new(ComponentManager::new(ConfigManager::new(settings)));
@@ -335,10 +358,9 @@ async fn pg_full_stack_add_and_cognify() {
     );
 
     // ---- Cleanup. -----------------------------------------------------------
-    // Best-effort; errors are non-fatal for the test result. Dropping the whole
-    // throwaway database subsumes the `delete_graph()` this used to do, and
-    // `TempPostgresDb::cleanup` issues `DROP DATABASE ... WITH (FORCE)`, so the
-    // pools this test still holds open do not block it.
+    // Only the on-disk system root: the caller drops the whole throwaway database
+    // afterwards (which subsumes the `delete_graph()` this used to do), and does so
+    // even if anything above panicked. Best-effort; a failure here is non-fatal for
+    // the test result.
     let _ = std::fs::remove_dir_all(&system_root);
-    tmp.cleanup().await;
 }
