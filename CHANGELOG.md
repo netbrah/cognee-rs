@@ -18,6 +18,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking changes
 
+- **Teardown now closes every backend, not just the relational pool — and a
+  closed graph/vector store rejects later operations.** `ComponentManager::close`
+  (reached by every binding's handle teardown and by the CLI on exit) used to
+  release the relational connection and leave every other component in its cache,
+  on the documented premise that they "release everything on drop". They do —
+  but the cache is the last strong reference, so a slot that is never emptied is
+  a destructor that never runs. It now takes every slot out and closes what is
+  closable.
+
+  Three consequences for callers:
+
+  1. **`close()` is no longer a cheap relational reset.** A caller that closes and
+     then keeps using the manager pays a full re-warm: a fresh TLS handshake per
+     HTTP-backed engine, and for the ONNX provider a re-read of the model file.
+  2. **Operations after a close now fail** on the graph and vector stores
+     (`graph database is closed`, or a closed-pool error from Postgres) where they
+     previously succeeded by silently reopening. This extends the relational
+     contract introduced in the previous release rather than inventing a new one,
+     but it is user-visible. The `release` tier is unchanged: the handle stays
+     re-warmable.
+  3. **`GraphDBTrait::close` / `VectorDB::close` are new trait methods** with
+     default no-op bodies, so every existing implementation — including
+     out-of-tree adapters — keeps compiling untouched. That default means "this
+     backend owns nothing closable beyond memory". **An external adapter that does
+     own OS resources will now leak invisibly until it overrides `close`.** The
+     in-tree pattern to copy is `crates/graph/tests/ladybug_close.rs`: assert no
+     sidecar file survives an awaited `close()`. In-tree, LanceDB and the
+     in-memory brute-force store keep the default deliberately — both were
+     measured to hold no descriptor open between calls.
+
+  `PgGraphAdapter::from_connection` / `PgVectorAdapter::from_connection` gain a
+  documented guarantee alongside this: an adapter wrapping a **caller-supplied**
+  connection never closes it. In the shared-Postgres layout that connection is the
+  relational pool, so closing it from a store teardown would turn a leak fix into
+  an outage.
+
 - **`cognee-core`: `PipelineContext::current_data` changed meaning.** It is now
   pinned, once per data item, to the value that *entered* the pipeline, and is
   never rebound as that item flows through the task chain. Previously the
