@@ -147,6 +147,8 @@ jobs:
 
       # Prove the freshly-recorded cassette actually replays offline: a HIT
       # reconstructs the graph and logs "Stored N entity types as graph nodes".
+      # Capture BOTH streams: that line goes to stdout, so a stderr-only
+      # redirect greps an empty file and fails every recording, however good.
       # Fail the job if recording produced a cassette that replays empty.
       - name: Verify replay (small)
         env:
@@ -160,7 +162,7 @@ jobs:
             --mock-memories scripts/perf/fixtures/cassette.json \
             --memories scripts/perf/fixtures/memories.json \
             --num-memories 8 \
-            --output /tmp/verify_small.json 2>"$log" || { cat "$log"; exit 1; }
+            --output /tmp/verify_small.json >"$log" 2>&1 || { cat "$log"; exit 1; }
           n="$(grep -oE 'Stored [0-9]+ entity types as graph nodes' "$log" | grep -oE '[0-9]+' | head -1 || true)"
           echo "entity-type nodes on replay (8 docs): ${n:-0}"
           if [ -z "${n:-}" ] || [ "${n:-0}" -lt 1 ]; then
@@ -181,7 +183,7 @@ jobs:
             --mock-memories scripts/perf/fixtures/war_and_peace/cassette.json \
             --memories scripts/perf/fixtures/war_and_peace/memories.json \
             --num-memories 8 \
-            --output /tmp/verify_wap.json 2>"$log" || { cat "$log"; exit 1; }
+            --output /tmp/verify_wap.json >"$log" 2>&1 || { cat "$log"; exit 1; }
           n="$(grep -oE 'Stored [0-9]+ entity types as graph nodes' "$log" | grep -oE '[0-9]+' | head -1 || true)"
           echo "entity-type nodes on replay (8 docs): ${n:-0}"
           if [ -z "${n:-}" ] || [ "${n:-0}" -lt 1 ]; then
