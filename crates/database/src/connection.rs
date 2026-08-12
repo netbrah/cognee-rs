@@ -483,12 +483,26 @@ async fn drain_sqlite_pool(pool: &sea_orm::sqlx::SqlitePool) -> u32 {
         return 0;
     }
 
-    // The scheduler-proof backstop. Cheap, and only ever spawned on the path
-    // where sqlx already left us something to clean up.
+    // The scheduler-proof backstop, only ever spawned on the path where sqlx
+    // already left us something to clean up.
+    //
+    // It has to be a thread of its own rather than `spawn_blocking`: the blocking
+    // pool is tokio-managed and can be saturated, and a backstop that can be
+    // queued behind other work is the same class of dependency as the runtime
+    // clock this exists to avoid. The cost that buys is one thread per contended
+    // teardown, so it must not outlive the drain — `_finished` disconnects the
+    // channel on every return path below, which wakes the thread out of
+    // `recv_timeout` immediately. A host that opens and closes handles in a tight
+    // loop therefore accumulates threads for as long as its drains actually run,
+    // not for `POOL_DRAIN_TIMEOUT` apiece.
     let (bail_tx, mut bail_rx) = tokio::sync::oneshot::channel();
+    let (_finished, finished_rx) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {
-        std::thread::sleep(POOL_DRAIN_TIMEOUT);
-        let _ = bail_tx.send(());
+        if finished_rx.recv_timeout(POOL_DRAIN_TIMEOUT)
+            == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        {
+            let _ = bail_tx.send(());
+        }
     });
 
     let backoff = cognee_utils::RetryConfig::new(0, 1, POOL_DRAIN_RETRY_MAX.as_millis() as u64);
