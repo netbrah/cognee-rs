@@ -411,3 +411,422 @@ async fn close_releases_wal_sidecars() {
     assert!(!wal.exists(), "-wal must be removed by close");
     assert!(!shm.exists(), "-shm must be removed by close");
 }
+
+/// The same guarantee when sqlx's own `Pool::close` returns *early* — the case
+/// that kept `-wal`/`-shm` orphaned after issue #132 was first fixed, and that
+/// flaked `ts/__tests__/sdk_handle.test.ts` on any loaded machine.
+///
+/// The ordering is forced rather than raced, so this test does not depend on the
+/// machine being slow (the bug itself is an instance of that mistake — it was
+/// invisible on an idle host and reproduced on demand under CPU starvation):
+///
+/// 1. Four connections are parked as idle. Closing them is what pushes sqlx's
+///    semaphore over capacity, which is what lets the close barrier pass while a
+///    connection is still checked out — see `drain_sqlite_pool`.
+/// 2. The runtime is given exactly one worker thread, and that thread is
+///    occupied. Now the task sqlx spawns from `PoolConnection::drop` to return a
+///    connection to the pool provably cannot run.
+/// 3. A connection is checked out and dropped, so it is checked out — counted in
+///    `size()`, absent from `idle_conns` — for the whole of the close.
+/// 4. `close` is driven from a *different* thread, so it makes progress on its
+///    own (the sqlite worker threads wake it directly, no tokio worker needed),
+///    exactly as a binding's blocking `close()` does from the embedder's thread.
+/// 5. The worker is freed 150ms after the close begins. A close that waits for
+///    the pool to empty therefore finishes; a close that returns as soon as
+///    sqlx's does cannot have — it has already returned with the straggler open
+///    and both sidecars still on disk.
+#[test]
+fn close_waits_for_a_straggling_connection() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("straggler.db");
+    let wal = path.with_file_name("straggler.db-wal");
+    let shm = path.with_file_name("straggler.db-shm");
+    let url = format!("sqlite://{}?mode=rwc", path.display());
+
+    let db = rt.block_on(connect(&url)).expect("connect");
+    rt.block_on(db.execute(Statement::from_string(
+        DatabaseBackend::Sqlite,
+        "CREATE TABLE t (x INTEGER)",
+    )))
+    .unwrap();
+    let pool = db.get_sqlite_connection_pool().clone();
+
+    // (1) Park four idle connections.
+    rt.block_on(async {
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(pool.acquire().await.unwrap());
+        }
+        drop(held);
+        for _ in 0..500 {
+            if pool.num_idle() >= 4 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    });
+    assert_eq!(
+        pool.num_idle(),
+        4,
+        "the setup needs four genuinely idle connections",
+    );
+    assert!(
+        wal.exists() && shm.exists(),
+        "WAL mode creates both sidecars"
+    );
+
+    // (2) Occupy the only worker thread.
+    let release = Arc::new(AtomicBool::new(false));
+    let occupied = Arc::new(AtomicBool::new(false));
+    {
+        let release = Arc::clone(&release);
+        let occupied = Arc::clone(&occupied);
+        rt.spawn(async move {
+            occupied.store(true, Ordering::Release);
+            while !release.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+    }
+    while !occupied.load(Ordering::Acquire) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // (3) Strand a checked-out connection: its return-to-pool task is queued
+    // behind the blocker.
+    rt.block_on(async {
+        let conn = pool.acquire().await.unwrap();
+        drop(conn);
+    });
+    assert_eq!(
+        pool.num_idle(),
+        3,
+        "one of the idle connections should now be stranded mid-return",
+    );
+
+    // (5) Free the worker, but *ordered against the close* rather than after a
+    // wall-clock delay. An earlier draft slept 150ms here, which made the whole
+    // test a race it could lose in the safe direction: on the loaded machine this
+    // bug lives on, the straggler could be reaped inside those 150ms and the test
+    // passed with the drain reverted. Instead the releaser waits until the close
+    // has been *observed to return*; only if it has not returned within a grace
+    // period — which means it is waiting, i.e. the fix is present — does it free
+    // the worker so the close can finish.
+    //
+    // Without the drain the close returns in microseconds, so `sampled` is set
+    // long before the grace expires, the worker is never freed early, and the
+    // assertions below see the leak. The grace only has to exceed the handful of
+    // instructions between the close returning and the sample being taken — it is
+    // a ~1000x margin over that, rather than the old 150ms racing the straggler's
+    // reap. It must also stay comfortably *inside* the drain's no-progress
+    // ceiling, or the drain would rightly give up before the worker is freed and
+    // this test would be asserting the wrong contract (see
+    // `close_returns_even_when_no_worker_can_drive_the_runtime_clock`, which
+    // covers deliberately never freeing it).
+    let sampled = Arc::new(AtomicBool::new(false));
+    let releaser = {
+        let release = Arc::clone(&release);
+        let sampled = Arc::clone(&sampled);
+        let pool = pool.clone();
+        std::thread::spawn(move || {
+            while !pool.is_closed() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let grace = std::time::Instant::now() + Duration::from_millis(100);
+            while !sampled.load(Ordering::Acquire) && std::time::Instant::now() < grace {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            release.store(true, Ordering::Release);
+        })
+    };
+
+    // (4) Close from a thread of its own, as a binding's blocking close does.
+    rt.block_on(cognee_database::close(&db)).expect("close");
+
+    // Sample the contract at the instant `close` returns, before anything else
+    // gets a chance to run — the assertions below must judge that moment, not a
+    // later one.
+    let (size, wal_left, shm_left) = (pool.size(), wal.exists(), shm.exists());
+    sampled.store(true, Ordering::Release);
+
+    // Unblock unconditionally, so an assertion failure cannot leave the runtime
+    // wedged and hide itself behind a hang.
+    release.store(true, Ordering::Release);
+    releaser.join().unwrap();
+
+    assert_eq!(
+        size, 0,
+        "close must not return while the pool still owns a connection",
+    );
+    assert!(
+        !wal_left,
+        "-wal must be gone when close returns, even when sqlx's own close returned early",
+    );
+    assert!(!shm_left, "-shm must be gone when close returns");
+}
+
+/// `close` must always return, including when no worker thread is available to
+/// drive the runtime's clock — which is exactly the state that makes the drain
+/// necessary in the first place.
+///
+/// tokio's time driver on a multi-thread runtime is only polled by its workers.
+/// `Handle::block_on` from an outside thread (`teardown_blocking`'s
+/// no-current-runtime branch, what every binding's synchronous `close()` uses)
+/// drives only its own future, so with every worker busy a `tokio::time::sleep`
+/// inside the drain never fires and any deadline checked *after* awaiting one is
+/// never reached. The first version of this fix did exactly that and would block
+/// forever here: a wedged embedder thread, which is a worse outcome than the
+/// orphaned sidecars it was preventing. The backstop therefore runs on a plain OS
+/// thread that no scheduler can starve.
+///
+/// The worker is never freed, so nothing can reap the connection and the drain
+/// *must* give up on its own. The close is driven on a separate thread and its
+/// return is reported over a channel, so the pre-fix behaviour surfaces as a
+/// bounded timeout rather than hanging the test process.
+#[test]
+fn close_returns_even_when_no_worker_can_drive_the_runtime_clock() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nodriver.db");
+    let url = format!("sqlite://{}?mode=rwc", path.display());
+
+    let db = Arc::new(rt.block_on(connect(&url)).expect("connect"));
+    rt.block_on(db.execute(Statement::from_string(
+        DatabaseBackend::Sqlite,
+        "CREATE TABLE t (x INTEGER)",
+    )))
+    .unwrap();
+    let pool = db.get_sqlite_connection_pool().clone();
+
+    // Park idle connections, so closing them inflates sqlx's semaphore and its
+    // own close returns with the straggler still out.
+    rt.block_on(async {
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(pool.acquire().await.unwrap());
+        }
+        drop(held);
+        for _ in 0..500 {
+            if pool.num_idle() >= 4 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    });
+
+    // Occupy the only worker for the rest of the test. From here on the runtime
+    // clock is dead: no worker will poll the time driver.
+    let release = Arc::new(AtomicBool::new(false));
+    let occupied = Arc::new(AtomicBool::new(false));
+    {
+        let release = Arc::clone(&release);
+        let occupied = Arc::clone(&occupied);
+        rt.spawn(async move {
+            occupied.store(true, Ordering::Release);
+            while !release.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+    }
+    while !occupied.load(Ordering::Acquire) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    rt.block_on(async {
+        let conn = pool.acquire().await.unwrap();
+        drop(conn);
+    });
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let closer = {
+        let handle = rt.handle().clone();
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            handle.block_on(cognee_database::close(&db)).expect("close");
+            let _ = done_tx.send(started.elapsed());
+        })
+    };
+
+    // Generous margin over the 2s backstop; the point is bounded, not fast.
+    let outcome = done_rx.recv_timeout(Duration::from_secs(15));
+
+    release.store(true, Ordering::Release);
+    closer.join().expect("closing thread");
+
+    let elapsed = outcome.expect(
+        "close() must give up and return with no worker available to drive the runtime clock",
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "close() should give up near its backstop, took {elapsed:?}",
+    );
+}
+
+/// The other half of the same bug, and the worse half: a connection that is
+/// pushed back into the idle queue *after* sqlx's close has drained it for the
+/// last time is never closed at all. Not "closed a moment later" — never. The
+/// pool is closed, so nothing acquires from it again; `Pool::close` has finished,
+/// so nothing drains it again; the connection stays open and the sidecars stay on
+/// disk until the pool itself is dropped, which for a cached
+/// `ComponentManager` connection can be the rest of the process's life.
+///
+/// `Floating::return_to_pool` checks `is_closed()` once at its top and then calls
+/// `release()` unconditionally at the bottom, with an `after_release` hook and a
+/// `ping()` round-trip in between. A return task that passes that check just
+/// before the pool is marked closed therefore strands its connection. This test
+/// pins the ordering open with an `after_release` hook that parks in exactly that
+/// window, so the strand is constructed rather than raced — a pool built here
+/// rather than by [`connect`], because the hook is a test instrument and has no
+/// business in production options.
+#[test]
+fn close_reaps_a_connection_stranded_after_the_pool_was_closed() {
+    use std::str::FromStr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use sea_orm::SqlxSqliteConnector;
+    use sea_orm::sqlx::sqlite::{
+        SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
+    };
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stranded.db");
+    let wal = path.with_file_name("stranded.db-wal");
+    let shm = path.with_file_name("stranded.db-shm");
+
+    // `hold` parks a returning connection inside `after_release`; `parked` tells
+    // the test it is actually in there.
+    let hold = Arc::new(AtomicBool::new(false));
+    let parked = Arc::new(AtomicBool::new(false));
+
+    let db = {
+        let hold = Arc::clone(&hold);
+        let parked = Arc::clone(&parked);
+        let conn_opts =
+            SqliteConnectOptions::from_str(&format!("sqlite://{}?mode=rwc", path.display()))
+                .unwrap()
+                .journal_mode(SqliteJournalMode::Wal)
+                .synchronous(SqliteSynchronous::Full);
+
+        let pool = rt
+            .block_on(
+                SqlitePoolOptions::new()
+                    .max_connections(5)
+                    .min_connections(0)
+                    .after_release(move |_conn, _meta| {
+                        let hold = Arc::clone(&hold);
+                        let parked = Arc::clone(&parked);
+                        Box::pin(async move {
+                            if hold.load(Ordering::Acquire) {
+                                parked.store(true, Ordering::Release);
+                                while hold.load(Ordering::Acquire) {
+                                    tokio::time::sleep(Duration::from_millis(1)).await;
+                                }
+                            }
+                            Ok(true)
+                        })
+                    })
+                    .connect_with(conn_opts),
+            )
+            .expect("connect");
+        SqlxSqliteConnector::from_sqlx_sqlite_pool(pool)
+    };
+
+    rt.block_on(db.execute(Statement::from_string(
+        DatabaseBackend::Sqlite,
+        "CREATE TABLE t (x INTEGER)",
+    )))
+    .unwrap();
+    let pool = db.get_sqlite_connection_pool().clone();
+
+    // Park two idle connections, while the hook still lets releases through.
+    rt.block_on(async {
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            held.push(pool.acquire().await.unwrap());
+        }
+        drop(held);
+        for _ in 0..500 {
+            if pool.num_idle() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    });
+    assert!(pool.num_idle() >= 2, "the setup needs idle connections");
+    assert!(
+        wal.exists() && shm.exists(),
+        "WAL mode creates both sidecars"
+    );
+
+    // Now arm the hook and send a connection back through it. When `parked` is
+    // set, that connection has passed `return_to_pool`'s `is_closed()` check and
+    // is waiting to be released — the exact window the bug lives in.
+    hold.store(true, Ordering::Release);
+    rt.block_on(async {
+        let conn = pool.acquire().await.unwrap();
+        drop(conn);
+    });
+    for _ in 0..5_000 {
+        if parked.load(Ordering::Acquire) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        parked.load(Ordering::Acquire),
+        "a returning connection should be parked inside after_release",
+    );
+
+    // Let it finish releasing once the pool is closed, so it lands in the idle
+    // queue of a pool that sqlx has already stopped draining.
+    let releaser = {
+        let hold = Arc::clone(&hold);
+        let pool = pool.clone();
+        std::thread::spawn(move || {
+            while !pool.is_closed() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            hold.store(false, Ordering::Release);
+        })
+    };
+
+    rt.block_on(cognee_database::close(&db)).expect("close");
+    let (size, wal_left, shm_left) = (pool.size(), wal.exists(), shm.exists());
+
+    hold.store(false, Ordering::Release);
+    releaser.join().unwrap();
+
+    assert_eq!(
+        size, 0,
+        "a connection released into a closed pool must still be reaped by close",
+    );
+    assert!(!wal_left, "-wal must be gone when close returns");
+    assert!(!shm_left, "-shm must be gone when close returns");
+}

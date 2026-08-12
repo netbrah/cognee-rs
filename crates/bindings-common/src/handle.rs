@@ -227,10 +227,14 @@ impl HandleState {
     ///   `cg_sdk_close`). It additionally marks the handle closed, so later ops
     ///   fail with a clear error instead of silently reopening the database.
     ///
-    /// Both are idempotent. Neither waits for concurrent operations: an op that is
-    /// mid-flight holds its own `Arc<CogneeServices>` and will see a closed pool on
-    /// its next query, so a binding should only tear down when its own contract
-    /// says the handle is done.
+    /// Both are idempotent. Neither waits for concurrent operations to *finish*: an
+    /// op that is mid-flight holds its own `Arc<CogneeServices>` and will see a
+    /// closed pool on its next query, so a binding should only tear down when its
+    /// own contract says the handle is done. What the teardown does wait for — and
+    /// has to, or the SQLite sidecars outlive it — is the pool's connections coming
+    /// back and closing. That is normally microseconds; a connection genuinely held
+    /// by an in-flight op bounds it at `cognee_database`'s drain timeout, after
+    /// which the teardown gives up on that connection and logs rather than hanging.
     pub async fn release(&self) {
         self.teardown(false).await;
     }

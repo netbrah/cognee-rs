@@ -26,6 +26,23 @@ const POOL_MIN_CONNECTIONS: u32 = 0;
 const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// Ceilings on the work [`close`] does to empty the pool after sqlx's own
+/// `Pool::close` has returned. See [`drain_sqlite_pool`], which explains why
+/// there are two of them and why the hard one is enforced off the runtime clock.
+///
+/// The work only ever happens when sqlx left a connection behind, and normally
+/// finishes in a millisecond or two, so neither ceiling is reached on any
+/// ordinary teardown.
+#[cfg(feature = "sqlite")]
+const POOL_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long the drain keeps trying after the last connection it managed to reap.
+/// Short, because a stalled drain is almost always a connection held by a live
+/// operation, which will not come back at all and is not teardown's to wait for.
+#[cfg(feature = "sqlite")]
+const POOL_DRAIN_STALL_TIMEOUT: Duration = Duration::from_millis(400);
+#[cfg(feature = "sqlite")]
+const POOL_DRAIN_RETRY_MAX: Duration = Duration::from_millis(25);
+
 /// SQLite lock-wait ceiling, matching Python's `SqlAlchemyAdapter`
 /// (`busy_timeout=120000`, added for the "database is locked" fix in
 /// topoteretes/cognee#2717). sqlx defaults to 5s, which `upsert_provenance_graph`
@@ -330,20 +347,200 @@ fn sqlite_parent_dir_is_writable(path: &std::path::Path) -> bool {
 /// happens to clean up; with more than one it is a race, which is why relying on
 /// `Drop` is not enough.
 ///
-/// [`sea_orm::DatabaseConnection::close_by_ref`] runs sqlx's real close: pooled
-/// connections are closed one at a time and checked-out ones are awaited, so
-/// exactly one connection observes itself as the last and the sidecars are gone
-/// before this future resolves.
+/// [`sea_orm::DatabaseConnection::close_by_ref`] runs sqlx's real close, which
+/// closes the connections it can see one at a time so exactly one of them
+/// observes itself as the last. That is necessary but **not sufficient**: it can
+/// return while a connection is still open, and it can leave one behind
+/// permanently. `drain_sqlite_pool` documents both cases and finishes the job.
 ///
 /// Idempotent, and safe to call while other `Arc` clones of the connection are
 /// still alive: they observe a closed pool and fail their next query rather than
 /// silently reconnecting. Callers that may be reused (e.g.
 /// `ComponentManager::close`) drop their cached connection so the next access
 /// builds a fresh one.
+///
+/// **When this returns, every connection the pool owned is closed and a file
+/// SQLite database's sidecars are gone** — unless a connection is held by an
+/// operation still in flight, which teardown never promised to wait for. In that
+/// case the wait gives up (see `drain_sqlite_pool` for the two ceilings, ~400ms
+/// in practice and 2s absolute) and logs at debug rather than blocking teardown
+/// on someone else's work.
 pub async fn close(db: &DatabaseConnection) -> Result<(), DatabaseError> {
-    db.close_by_ref()
-        .await
-        .map_err(|e| DatabaseError::ConnectionError(e.to_string()))
+    let closed = db.close_by_ref().await;
+
+    // Only SQLite gets the drain: it is the one backend where an on-disk
+    // artifact outlives the pool if a connection has not closed yet. A server
+    // backend's straggler costs nothing observable.
+    #[cfg(feature = "sqlite")]
+    if matches!(db, DatabaseConnection::SqlxSqlitePoolConnection(_)) {
+        // Report the count the drain actually decided to give up on, not a fresh
+        // `pool.size()`: re-reading it here can observe a straggler that landed in
+        // the meantime and log "still holds open connections ... open=0".
+        let open = drain_sqlite_pool(db.get_sqlite_connection_pool()).await;
+        if open > 0 {
+            tracing::debug!(
+                open_connections = open,
+                stall_timeout = ?POOL_DRAIN_STALL_TIMEOUT,
+                timeout = ?POOL_DRAIN_TIMEOUT,
+                "gave up waiting for the relational pool to empty; a connection is either \
+                 held by an operation still in flight or was released into the pool after it \
+                 closed. A file SQLite database keeps its -wal/-shm sidecars until the pool \
+                 is dropped."
+            );
+        }
+    }
+
+    closed.map_err(|e| DatabaseError::ConnectionError(e.to_string()))
+}
+
+/// Finish what sqlx's `Pool::close` starts: leave the closed pool with no open
+/// connections, so SQLite has actually unlinked `-wal`/`-shm` by the time the
+/// caller looks.
+///
+/// **`Pool::close` returning does not mean the pool is empty.** Two independent
+/// sqlx behaviours leave a connection behind, and both are ordinary rather than
+/// exotic — between them they orphaned the sidecars in five runs out of six on
+/// one core against five spinning processes (topoteretes/cognee-rs#132, the
+/// recipe that flaked `ts/__tests__/sdk_handle.test.ts`).
+///
+/// Both start from the same place: `PoolConnection::drop` does not return the
+/// connection to the pool inline, it *spawns* a task to do it. So when teardown
+/// begins, a connection whose last query has finished is typically still checked
+/// out — counted in `size()`, absent from the idle queue — with its return task
+/// either not yet polled or partway through.
+///
+/// 1. **`close` returns too early.** Its barrier is `semaphore.acquire(n)` for
+///    `n` in `1..=max_connections`, which only barriers if the permit count is
+///    honest. It is not: a connection releases its permit when it is *returned*
+///    to the pool (`PoolInner::release` → `release_permit`), and then `close`
+///    floats each idle connection it pops with a fresh `DecrementSizeGuard`,
+///    whose `Drop` releases a permit for that connection a second time. Closing
+///    k idle connections leaves the semaphore k permits over capacity, so
+///    `acquire(max_connections)` succeeds with a connection still checked out and
+///    the bounded loop simply runs out. Retrying `close` once the straggler's
+///    return task has run reaps it.
+/// 2. **`close` stops watching the idle queue.** `Floating::return_to_pool`
+///    checks `is_closed()` once, at its top, and then does a `ping()` round-trip
+///    to the connection's worker thread before calling `release()`
+///    unconditionally. A return task that passed that check just before the pool
+///    was marked closed therefore pushes its connection **into the idle queue of
+///    an already-closed pool**, after `close` has drained that queue for the last
+///    time. Nothing ever closes it: the connection stays open, its sqlite worker
+///    thread sits parked, and the sidecars survive until the pool itself is
+///    dropped. Only another `close` looks at the idle queue again.
+///
+/// So the loop below re-runs `Pool::close` rather than merely waiting: waiting
+/// alone fixes (1) and can never fix (2). `close` is idempotent and cheap when
+/// there is nothing to reap, and this converges because once the pool is marked
+/// closed only the finitely many return tasks already past their `is_closed()`
+/// check can strand another connection.
+///
+/// `size()` is the right completion signal: it is decremented by
+/// `DecrementSizeGuard::drop`, which runs after that connection's own
+/// `close().await` has returned, so `size() == 0` means every connection has
+/// finished `sqlite3_close`. The fast path — the uncontended teardown, which is
+/// every teardown on an idle machine — costs one atomic load and returns.
+///
+/// # Giving up
+///
+/// Two ceilings bound the work, because the two reasons a connection is still
+/// there have very different prospects:
+///
+/// - A connection whose return task simply has not run yet *will* come back, and
+///   normally within a millisecond or two. Every reap resets
+///   `POOL_DRAIN_STALL_TIMEOUT`, so a pool that is making progress keeps its
+///   budget up to the overall ceiling.
+/// - A connection genuinely checked out by an operation still in flight will
+///   *never* come back before that operation finishes, and teardown does not
+///   promise to wait for it. Waiting the full ceiling for it would be pure
+///   latency, so `POOL_DRAIN_STALL_TIMEOUT` gives up once nothing has been
+///   reaped for that long.
+///
+/// `POOL_DRAIN_TIMEOUT` is the hard backstop, and it is enforced from a **plain
+/// OS thread**, not the runtime clock. tokio's time driver is only polled by
+/// worker threads: on a multi-thread runtime with every worker busy — precisely
+/// the situation that leaves a return task unpolled and makes this function
+/// necessary — `tokio::time::sleep` never fires, so a deadline checked after
+/// awaiting one is never reached and the teardown blocks forever. That is a
+/// worse failure than the orphaned sidecars it was trying to prevent (a
+/// synchronous `close()` would wedge the embedder's thread), so the backstop
+/// wakes us through a `oneshot` fired by a thread that no scheduler can starve,
+/// and every await here races it.
+///
+/// Giving up abandons that connection: `ComponentManager::close` has already
+/// taken it out of its cache, so nothing looks at this pool's idle queue again
+/// until the last `Arc` to it drops, at which point sqlx's destructor drops the
+/// idle queue and the connections close with it. Until then a file database
+/// keeps its sidecars. That is logged at debug, not warn: it is the documented
+/// consequence of tearing down around a live operation, there is nothing for the
+/// operator to act on, and the teardown otherwise succeeded.
+///
+/// Returns the number of connections still open, for the caller to log.
+#[cfg(feature = "sqlite")]
+async fn drain_sqlite_pool(pool: &sea_orm::sqlx::SqlitePool) -> u32 {
+    let mut open = pool.size();
+    if open == 0 {
+        return 0;
+    }
+
+    // The scheduler-proof backstop, only ever spawned on the path where sqlx
+    // already left us something to clean up.
+    //
+    // It has to be a thread of its own rather than `spawn_blocking`: the blocking
+    // pool is tokio-managed and can be saturated, and a backstop that can be
+    // queued behind other work is the same class of dependency as the runtime
+    // clock this exists to avoid. The cost that buys is one thread per contended
+    // teardown, so it must not outlive the drain — `_finished` disconnects the
+    // channel on every return path below, which wakes the thread out of
+    // `recv_timeout` immediately. A host that opens and closes handles in a tight
+    // loop therefore accumulates threads for as long as its drains actually run,
+    // not for `POOL_DRAIN_TIMEOUT` apiece.
+    let (bail_tx, mut bail_rx) = tokio::sync::oneshot::channel();
+    let (_finished, finished_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        if finished_rx.recv_timeout(POOL_DRAIN_TIMEOUT)
+            == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        {
+            let _ = bail_tx.send(());
+        }
+    });
+
+    let backoff = cognee_utils::RetryConfig::new(0, 1, POOL_DRAIN_RETRY_MAX.as_millis() as u64);
+    let mut attempt = 0u32;
+    let mut fewest = open;
+    let mut last_reap = std::time::Instant::now();
+
+    loop {
+        // Reaps a connection stranded in the idle queue by case (2), and is a
+        // no-op when there is nothing there. Raced against the backstop because
+        // `Pool::close` awaits its own untimed semaphore.
+        tokio::select! {
+            biased;
+            _ = &mut bail_rx => break,
+            () = pool.close() => {}
+        }
+
+        open = pool.size();
+        if open == 0 {
+            return 0;
+        }
+        if open < fewest {
+            fewest = open;
+            last_reap = std::time::Instant::now();
+        }
+        if last_reap.elapsed() >= POOL_DRAIN_STALL_TIMEOUT {
+            break;
+        }
+
+        tokio::select! {
+            biased;
+            _ = &mut bail_rx => break,
+            () = tokio::time::sleep(backoff.calculate_delay(attempt)) => {}
+        }
+        attempt += 1;
+    }
+
+    open
 }
 
 /// Run all pending migrations on an existing connection.
