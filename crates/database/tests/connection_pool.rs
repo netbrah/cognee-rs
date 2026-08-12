@@ -514,17 +514,38 @@ fn close_waits_for_a_straggling_connection() {
         "one of the idle connections should now be stranded mid-return",
     );
 
-    // (5) Free the worker a beat after the close starts. `is_closed()` flips at
-    // the very top of sqlx's close, so this waits for the close to be under way
-    // rather than guessing when it starts.
+    // (5) Free the worker, but *ordered against the close* rather than after a
+    // wall-clock delay. An earlier draft slept 150ms here, which made the whole
+    // test a race it could lose in the safe direction: on the loaded machine this
+    // bug lives on, the straggler could be reaped inside those 150ms and the test
+    // passed with the drain reverted. Instead the releaser waits until the close
+    // has been *observed to return*; only if it has not returned within a grace
+    // period — which means it is waiting, i.e. the fix is present — does it free
+    // the worker so the close can finish.
+    //
+    // Without the drain the close returns in microseconds, so `sampled` is set
+    // long before the grace expires, the worker is never freed early, and the
+    // assertions below see the leak. The grace only has to exceed the handful of
+    // instructions between the close returning and the sample being taken — it is
+    // a ~1000x margin over that, rather than the old 150ms racing the straggler's
+    // reap. It must also stay comfortably *inside* the drain's no-progress
+    // ceiling, or the drain would rightly give up before the worker is freed and
+    // this test would be asserting the wrong contract (see
+    // `close_returns_even_when_no_worker_can_drive_the_runtime_clock`, which
+    // covers deliberately never freeing it).
+    let sampled = Arc::new(AtomicBool::new(false));
     let releaser = {
         let release = Arc::clone(&release);
+        let sampled = Arc::clone(&sampled);
         let pool = pool.clone();
         std::thread::spawn(move || {
             while !pool.is_closed() {
                 std::thread::sleep(Duration::from_millis(1));
             }
-            std::thread::sleep(Duration::from_millis(150));
+            let grace = std::time::Instant::now() + Duration::from_millis(100);
+            while !sampled.load(Ordering::Acquire) && std::time::Instant::now() < grace {
+                std::thread::sleep(Duration::from_millis(1));
+            }
             release.store(true, Ordering::Release);
         })
     };
@@ -534,9 +555,9 @@ fn close_waits_for_a_straggling_connection() {
 
     // Sample the contract at the instant `close` returns, before anything else
     // gets a chance to run — the assertions below must judge that moment, not a
-    // later one. Waiting to look (even long enough to join a thread) would let
-    // the straggler finish on its own and the test would pass either way.
+    // later one.
     let (size, wal_left, shm_left) = (pool.size(), wal.exists(), shm.exists());
+    sampled.store(true, Ordering::Release);
 
     // Unblock unconditionally, so an assertion failure cannot leave the runtime
     // wedged and hide itself behind a hang.
@@ -552,6 +573,112 @@ fn close_waits_for_a_straggling_connection() {
         "-wal must be gone when close returns, even when sqlx's own close returned early",
     );
     assert!(!shm_left, "-shm must be gone when close returns");
+}
+
+/// `close` must always return, including when no worker thread is available to
+/// drive the runtime's clock — which is exactly the state that makes the drain
+/// necessary in the first place.
+///
+/// tokio's time driver on a multi-thread runtime is only polled by its workers.
+/// `Handle::block_on` from an outside thread (`teardown_blocking`'s
+/// no-current-runtime branch, what every binding's synchronous `close()` uses)
+/// drives only its own future, so with every worker busy a `tokio::time::sleep`
+/// inside the drain never fires and any deadline checked *after* awaiting one is
+/// never reached. The first version of this fix did exactly that and would block
+/// forever here: a wedged embedder thread, which is a worse outcome than the
+/// orphaned sidecars it was preventing. The backstop therefore runs on a plain OS
+/// thread that no scheduler can starve.
+///
+/// The worker is never freed, so nothing can reap the connection and the drain
+/// *must* give up on its own. The close is driven on a separate thread and its
+/// return is reported over a channel, so the pre-fix behaviour surfaces as a
+/// bounded timeout rather than hanging the test process.
+#[test]
+fn close_returns_even_when_no_worker_can_drive_the_runtime_clock() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nodriver.db");
+    let url = format!("sqlite://{}?mode=rwc", path.display());
+
+    let db = Arc::new(rt.block_on(connect(&url)).expect("connect"));
+    rt.block_on(db.execute(Statement::from_string(
+        DatabaseBackend::Sqlite,
+        "CREATE TABLE t (x INTEGER)",
+    )))
+    .unwrap();
+    let pool = db.get_sqlite_connection_pool().clone();
+
+    // Park idle connections, so closing them inflates sqlx's semaphore and its
+    // own close returns with the straggler still out.
+    rt.block_on(async {
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(pool.acquire().await.unwrap());
+        }
+        drop(held);
+        for _ in 0..500 {
+            if pool.num_idle() >= 4 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    });
+
+    // Occupy the only worker for the rest of the test. From here on the runtime
+    // clock is dead: no worker will poll the time driver.
+    let release = Arc::new(AtomicBool::new(false));
+    let occupied = Arc::new(AtomicBool::new(false));
+    {
+        let release = Arc::clone(&release);
+        let occupied = Arc::clone(&occupied);
+        rt.spawn(async move {
+            occupied.store(true, Ordering::Release);
+            while !release.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+    }
+    while !occupied.load(Ordering::Acquire) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    rt.block_on(async {
+        let conn = pool.acquire().await.unwrap();
+        drop(conn);
+    });
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let closer = {
+        let handle = rt.handle().clone();
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            handle.block_on(cognee_database::close(&db)).expect("close");
+            let _ = done_tx.send(started.elapsed());
+        })
+    };
+
+    // Generous margin over the 2s backstop; the point is bounded, not fast.
+    let outcome = done_rx.recv_timeout(Duration::from_secs(15));
+
+    release.store(true, Ordering::Release);
+    closer.join().expect("closing thread");
+
+    let elapsed = outcome.expect(
+        "close() must give up and return with no worker available to drive the runtime clock",
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "close() should give up near its backstop, took {elapsed:?}",
+    );
 }
 
 /// The other half of the same bug, and the worse half: a connection that is

@@ -294,16 +294,28 @@ fn close_blocking_waits_for_a_straggling_connection() {
         drop(conn);
     });
 
-    // Free the worker a beat after the close starts, so a close that waits can
-    // finish and a close that returns with sqlx's cannot have.
+    // Free the worker, ordered against the close rather than after a wall-clock
+    // delay: the releaser waits until the close has been observed to *return* and
+    // sampled, and only frees the worker if that has not happened within a grace
+    // period — i.e. only when the close is still waiting. Without the drain the
+    // close returns in microseconds, so the worker is never freed before the
+    // sample and the assertions see the leak. (An earlier draft just slept 150ms,
+    // which let the straggler be reaped inside the window on a loaded machine and
+    // pass with the fix reverted.) The grace stays inside the drain's no-progress
+    // ceiling so the drain does not rightly give up first.
+    let sampled = Arc::new(AtomicBool::new(false));
     let releaser = {
         let release = Arc::clone(&release);
+        let sampled = Arc::clone(&sampled);
         let pool = pool.clone();
         std::thread::spawn(move || {
             while !pool.is_closed() {
                 std::thread::sleep(Duration::from_millis(1));
             }
-            std::thread::sleep(Duration::from_millis(150));
+            let grace = std::time::Instant::now() + Duration::from_millis(100);
+            while !sampled.load(Ordering::Acquire) && std::time::Instant::now() < grace {
+                std::thread::sleep(Duration::from_millis(1));
+            }
             release.store(true, Ordering::Release);
         })
     };
@@ -320,6 +332,7 @@ fn close_blocking_waits_for_a_straggling_connection() {
     // later — even just long enough to join a thread — would let the straggler
     // finish on its own, and the test would pass with or without the fix.
     let (size, wal_left, shm_left) = (pool.size(), wal.exists(), shm.exists());
+    sampled.store(true, Ordering::Release);
 
     // Unblock unconditionally so a failed assertion cannot hide behind a hang.
     release.store(true, Ordering::Release);
