@@ -28,6 +28,34 @@ const DEFAULT_USER_ID_HEX: &str = "00000000000000000000000000000000";
 #[cfg(feature = "telemetry")]
 const TELEMETRY_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// How long any single store close may take before shutdown moves on.
+///
+/// Generous — a large embedded checkpoint is legitimately slow — but finite. A
+/// pool close waits for its checked-out connections to come back, so a task
+/// parked in a driver read, or a handler that escaped the pipeline registry, would
+/// otherwise hold SIGTERM open until the supervisor loses patience and sends
+/// SIGKILL. Being killed is strictly worse than skipping one close: the kill
+/// skips *every* remaining close, plus the telemetry flush.
+const STORE_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Await one store's close under [`STORE_CLOSE_TIMEOUT`], logging the outcome.
+///
+/// Never propagates: shutdown continues to the next store either way, which is the
+/// whole reason each one is bounded separately rather than the sequence as a whole.
+async fn bounded<E: std::fmt::Display>(
+    what: &str,
+    close: impl std::future::Future<Output = Result<(), E>>,
+) {
+    match tokio::time::timeout(STORE_CLOSE_TIMEOUT, close).await {
+        Ok(Ok(())) => tracing::info!("{what} closed"),
+        Ok(Err(e)) => tracing::warn!("closing the {what} failed (non-fatal): {e}"),
+        Err(_) => tracing::warn!(
+            "closing the {what} did not finish within {STORE_CLOSE_TIMEOUT:?}; \
+             continuing shutdown so the remaining resources still get their turn"
+        ),
+    }
+}
+
 /// Called once before the router is handed to `axum::serve`.
 ///
 /// OSS-side bootstrap is a no-op: the synthetic default user is
@@ -93,41 +121,25 @@ pub async fn on_shutdown(state: &crate::state::AppState) {
         );
     }
 
-    // Close the knowledge stores now that the work using them has drained.
+    // Close the stores now that the work using them has drained.
     //
-    // Same mechanism as the relational close below, different resources: an
-    // embedded graph leaves an un-checkpointed `<db>.wal` and a write lock on its
-    // database file, and a Postgres graph/vector adapter owns a pool of its own
-    // that a drop would not close — and there is no drop here anyway, because
-    // these are `Arc` clones. Both are no-ops for backends that own nothing
+    // Dropping is not closing, and here there is nothing to drop anyway: these are
+    // `Arc` clones held by handlers and pipeline builders, so a store has to be
+    // closed through `&self` or not at all. The relational pool orphans its
+    // `-wal`/`-shm` sidecars (topoteretes/cognee-rs#132), an embedded graph leaves
+    // an un-checkpointed `<db>.wal` and a write lock on its file, and a Postgres
+    // graph/vector adapter owns a pool that a retained `Arc` keeps open for the
+    // life of the process. All three are no-ops for backends that own nothing
     // closable (the in-memory brute-force store, LanceDB).
     if let Some(lib) = state.lib.as_ref() {
+        // Relational first, and every close bounded — see STORE_CLOSE_TIMEOUT and
+        // the ordering note in this function's docs.
+        bounded("relational database", cognee_database::close(&lib.database)).await;
         if let Some(graph) = lib.graph_db.as_ref() {
-            match graph.close().await {
-                Ok(()) => tracing::info!("graph database closed"),
-                Err(e) => tracing::warn!("closing the graph database failed (non-fatal): {e}"),
-            }
+            bounded("graph database", graph.close()).await;
         }
         if let Some(vector) = lib.vector_db.as_ref() {
-            match vector.close().await {
-                Ok(()) => tracing::info!("vector database closed"),
-                Err(e) => tracing::warn!("closing the vector database failed (non-fatal): {e}"),
-            }
-        }
-    }
-
-    // Close the relational pool last, once the work that uses it has stopped.
-    //
-    // Exiting without closing leaves a SQLite database's `-wal`/`-shm` sidecars
-    // on disk: dropping the pool only flags it closed and lets its connections
-    // tear down concurrently, and SQLite unlinks the sidecars only when the
-    // *last* connection closes (issue #132). The next start recovers them, so
-    // nothing is corrupt, but a server whose data directory is ephemeral (a
-    // container, a test harness) leaves litter behind and looks like it crashed.
-    if let Some(lib) = state.lib.as_ref() {
-        match cognee_database::close(&lib.database).await {
-            Ok(()) => tracing::info!("relational database closed"),
-            Err(e) => tracing::warn!("closing the relational database failed (non-fatal): {e}"),
+            bounded("vector database", vector.close()).await;
         }
     }
 

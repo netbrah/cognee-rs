@@ -24,6 +24,37 @@ use crate::config::{ConfigManager, Settings};
 use crate::context::PipelineContext;
 use crate::error::ComponentError;
 
+/// Whether a teardown may call `close()` on state that surviving clones can
+/// observe.
+///
+/// A store's `close()` mutates the object behind the `Arc` (an embedded graph
+/// empties its inner handle, a pool flags itself closed), so it is visible to
+/// every clone. The explicit teardown is entitled to that; the implicit one is
+/// not, and closes a component only when the cache holds its last reference —
+/// the case where nobody can tell the difference. See
+/// [`ComponentManager::close`] and [`ComponentManager::release`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloseSharedStores {
+    Yes,
+    No,
+}
+
+impl CloseSharedStores {
+    /// Whether `component` may be closed under this policy.
+    ///
+    /// `strong_count == 1` means the reference passed in (already taken out of the
+    /// cache) is the only one left, so a `close()` is unobservable. The count can
+    /// only be raced *upwards* by a task that already holds a clone, and such a
+    /// task is exactly the one we are protecting, so a stale-high count errs
+    /// toward leaving the component open — the safe direction.
+    fn may_close<T: ?Sized>(self, component: &Arc<T>) -> bool {
+        match self {
+            CloseSharedStores::Yes => true,
+            CloseSharedStores::No => Arc::strong_count(component) == 1,
+        }
+    }
+}
+
 /// Manages shared, lazily-initialized pipeline components.
 ///
 /// Each component is created on first access and cached for subsequent calls.
@@ -216,7 +247,7 @@ impl ComponentManager {
     /// destructor only flags the pool closed and lets its connections tear down
     /// concurrently, which for SQLite orphans the `-wal`/`-shm` sidecars (see
     /// [`cognee_database::close`], topoteretes/cognee-rs#132). It is closed
-    /// explicitly, last.
+    /// explicitly, **first** — see the ordering note below.
     ///
     /// The other slots do release their resources on drop — but this cache **is
     /// the last strong reference**, so leaving them cached means they are never
@@ -255,6 +286,23 @@ impl ComponentManager {
     /// once and none is held across an `.await`: the lock order against
     /// `services()` / `build_context` is unchanged and this cannot deadlock.
     ///
+    /// **The relational close goes first, and that ordering is load-bearing.**
+    /// Callers bound this teardown — the CLI wraps it in a `timeout` because a
+    /// pool close waits for connections to come back and a command's runtime may
+    /// have been dropped with one still checked out. Whatever runs first is the
+    /// part that survives a budget that runs out, so the slot whose leak started
+    /// all of this (the SQLite sidecars of #132) is closed before the graph
+    /// checkpoint, the vector pool, and the ONNX thread join get their turn.
+    /// Putting it last, as the first version of this did, let a timeout skip
+    /// exactly the close the fix existed for.
+    ///
+    /// Nothing is mid-write against the relational pool by this point: the caller
+    /// has already dropped the service bundle (see `HandleState::teardown`), and
+    /// the HTTP server drains its pipeline registry before calling this. The
+    /// stores are independent systems — the graph and vector backends do not write
+    /// through this pool — so closing it first cannot cut a store's own teardown
+    /// short.
+    ///
     /// # Cost
     ///
     /// This is no longer a cheap relational reset. A caller that closes and then
@@ -264,6 +312,65 @@ impl ComponentManager {
     /// Failures are logged rather than returned: the caller is tearing the manager
     /// down and has no remedy, and the component is unusable either way.
     pub async fn close(&self) {
+        self.teardown(CloseSharedStores::Yes).await;
+    }
+
+    /// Whether any component is currently cached — i.e. whether a teardown would
+    /// have anything to release.
+    ///
+    /// Cheap and **non-blocking**, for a synchronous finalizer deciding whether to
+    /// spin up a runtime at all. Every slot is probed, not just one: warming is
+    /// slot-by-slot and can fail part-way (a bad LLM key fails after the SQLite
+    /// pool and the embedded graph are already cached), and a probe that only
+    /// looked at one slot would report "nothing to release" for a handle holding
+    /// an open database.
+    ///
+    /// A contended lock counts as occupied: the safe direction is to attempt a
+    /// teardown that turns out to be a no-op rather than to skip a real one.
+    pub fn has_cached_components(&self) -> bool {
+        fn occupied<T>(slot: &TokioRwLock<Option<T>>) -> bool {
+            match slot.try_read() {
+                Ok(guard) => guard.is_some(),
+                Err(_) => true,
+            }
+        }
+
+        occupied(&self.database)
+            || occupied(&self.graph_db)
+            || occupied(&self.vector_db)
+            || occupied(&self.embedding_engine)
+            || occupied(&self.llm)
+            || occupied(&self.transcriber)
+            || occupied(&self.storage)
+    }
+
+    /// Evict every cached component **without** closing anything that is still
+    /// shared, for the implicit teardown paths (a GC finalizer reclaiming a handle
+    /// the program dropped on the floor).
+    ///
+    /// The difference from [`close`](Self::close) is only about *shared* state. A
+    /// store's `close()` mutates the object behind the `Arc` — `LadybugAdapter`
+    /// empties its inner slot, a Postgres adapter closes its pool, sqlx flags
+    /// `PoolInner` closed — so it is visible to **every** surviving clone, and an
+    /// in-flight operation holding one would fail its next query. `close()` is
+    /// entitled to do that because the user asked; a finalizer is not.
+    ///
+    /// So this closes a component only when the cache holds its **last** strong
+    /// reference, which is precisely the case where nobody can observe the
+    /// difference. In the ordinary finalizer case — no operation in flight — that
+    /// is every slot, so the resources (including the SQLite sidecars) are
+    /// released exactly as `close()` would release them. When an operation *is* in
+    /// flight, its components are left open and released when it finishes and its
+    /// clone drops.
+    ///
+    /// The one thing not covered by that rule is the drop itself: a slot whose
+    /// last reference this evicts is dropped on the blocking pool as usual.
+    pub async fn release(&self) {
+        self.teardown(CloseSharedStores::No).await;
+    }
+
+    /// Shared body of [`close`](Self::close) / [`release`](Self::release).
+    async fn teardown(&self, shared: CloseSharedStores) {
         // Take each slot out sequentially. Never two guards at once, never a
         // guard across an `.await`.
         let graph = self.graph_db.write().await.take();
@@ -277,15 +384,35 @@ impl ComponentManager {
         // outlive the config version it was built for; clear it with the rest.
         let _ = self.context.write().await.take();
 
+        // Relational FIRST: the caller may be bounding this whole teardown with a
+        // timeout, and the SQLite sidecars are the leak the bound exists to fix,
+        // so they must not be queued behind a graph checkpoint or an ONNX thread
+        // join. See the ordering note in this method's docs.
+        if let Some((_, db)) = database {
+            if shared.may_close(&db)
+                && let Err(e) = cognee_database::close(&db).await
+            {
+                tracing::warn!(error = %e, "failed to close the relational connection pool");
+            }
+            // The connection has no blocking destructor of its own; dropping it
+            // inline is fine, and doing so here (rather than at the end of the
+            // function) keeps the "take, close, release" shape uniform.
+            drop(db);
+        }
+
         if let Some((_, graph)) = graph {
-            if let Err(e) = graph.close().await {
+            if shared.may_close(&graph)
+                && let Err(e) = graph.close().await
+            {
                 tracing::warn!(error = %e, "failed to close the graph database");
             }
             Self::drop_off_runtime(graph, "graph database").await;
         }
 
         if let Some((_, vector)) = vector {
-            if let Err(e) = vector.close().await {
+            if shared.may_close(&vector)
+                && let Err(e) = vector.close().await
+            {
                 tracing::warn!(error = %e, "failed to close the vector database");
             }
             Self::drop_off_runtime(vector, "vector database").await;
@@ -302,14 +429,6 @@ impl ComponentManager {
         }
         if let Some((_, storage)) = storage {
             Self::drop_off_runtime(storage, "storage").await;
-        }
-
-        // Relational last: it is the slot with a real `close`, and closing it
-        // after the stores means nothing is still mid-write against it.
-        if let Some((_, db)) = database
-            && let Err(e) = cognee_database::close(&db).await
-        {
-            tracing::warn!(error = %e, "failed to close the relational connection pool");
         }
     }
 

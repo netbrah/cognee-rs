@@ -346,9 +346,20 @@ fn sqlite_parent_dir_is_writable(path: &std::path::Path) -> bool {
 /// `Drop` is not enough.
 ///
 /// [`sea_orm::DatabaseConnection::close_by_ref`] runs sqlx's real close: pooled
-/// connections are closed one at a time and checked-out ones are awaited, so
-/// exactly one connection observes itself as the last and the sidecars are gone
-/// before this future resolves.
+/// connections are closed one at a time, so exactly one of them observes itself
+/// as the last and the sidecars are gone before this future resolves.
+///
+/// **With one caveat, which is why [`settle_sqlite_pool`] runs first.** sqlx's
+/// close only closes the connections it can *pop from the idle queue*. A
+/// connection that is between uses at that instant — dropped by its last user,
+/// but with its `return_to_pool` task not yet run — is not in the queue, so
+/// sqlx's close never sees it and that task closes it independently, concurrently
+/// with the close we are driving. That is the same two-connections-closing-at-once
+/// race as above, reached through a different door, and it is easy to hit in
+/// practice: any code that finishes a query and closes in the same task without an
+/// intervening await (`initialize(&db)` then `close(&db)`, measured leaving both
+/// sidecars behind) does exactly that. Waiting for the returns to land first is
+/// what keeps the close sequential.
 ///
 /// Idempotent, and safe to call while other `Arc` clones of the connection are
 /// still alive: they observe a closed pool and fail their next query rather than
@@ -356,9 +367,54 @@ fn sqlite_parent_dir_is_writable(path: &std::path::Path) -> bool {
 /// `ComponentManager::close`) drop their cached connection so the next access
 /// builds a fresh one.
 pub async fn close(db: &DatabaseConnection) -> Result<(), DatabaseError> {
+    #[cfg(feature = "sqlite")]
+    settle_sqlite_pool(db).await;
+
     db.close_by_ref()
         .await
         .map_err(|e| DatabaseError::ConnectionError(e.to_string()))
+}
+
+/// Number of cooperative yields [`settle_sqlite_pool`] will spend waiting for
+/// in-flight connection returns.
+///
+/// A `return_to_pool` task does no I/O of its own in the common case, so it needs
+/// a scheduling slot rather than time — one or two yields is the observed cost.
+/// The ceiling only exists so a pathological case (a connection genuinely checked
+/// out by another task that never finishes) degrades to today's behaviour instead
+/// of hanging a teardown that callers deliberately bound.
+#[cfg(feature = "sqlite")]
+const SETTLE_YIELDS: usize = 64;
+
+/// Give in-flight `return_to_pool` tasks a chance to land, so the close that
+/// follows is the only thing closing connections.
+///
+/// The condition is "every live connection is parked in the idle queue"
+/// (`size == num_idle`), which is exactly what makes sqlx's close sequential.
+/// Cooperative yields rather than timers on purpose: a returning task only needs
+/// to be scheduled, and `yield_now` needs no time driver — this runs on whatever
+/// runtime a teardown hook happens to have, including a current-thread one built
+/// solely to drive the close.
+///
+/// `num_idle` is documented as approximate, so this is best-effort by
+/// construction: it is a scheduling nudge, not a lock, and the close is correct
+/// (just non-deterministic about the sidecars) if the wait gives up.
+#[cfg(feature = "sqlite")]
+async fn settle_sqlite_pool(db: &DatabaseConnection) {
+    if !matches!(db, DatabaseConnection::SqlxSqlitePoolConnection(_)) {
+        return;
+    }
+    for _ in 0..SETTLE_YIELDS {
+        let pool = db.get_sqlite_connection_pool();
+        if pool.size() as usize == pool.num_idle() {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    tracing::debug!(
+        "SQLite connections were still in flight after {SETTLE_YIELDS} yields; closing anyway \
+         (the WAL sidecars may be left for the next open to recover)"
+    );
 }
 
 /// Run all pending migrations on an existing connection.

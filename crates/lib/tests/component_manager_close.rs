@@ -403,3 +403,180 @@ async fn close_releases_the_http_client_connection_pools() {
 
     drop(server);
 }
+
+// ── Ordering under a bounded teardown, and the release tier ──────────────────
+
+/// Builds a [`cognee_graph::MockGraphDB`] whose `close()` never returns, standing
+/// in for a slot whose teardown outlives the caller's patience: a big embedded
+/// checkpoint, or a pool waiting on a connection that will not come back.
+struct StuckGraphFactory;
+
+#[async_trait::async_trait]
+impl cognee::GraphDbFactory for StuckGraphFactory {
+    fn provider(&self) -> &str {
+        "stuck"
+    }
+    async fn build(
+        &self,
+        _ctx: &cognee::BackendBuildContext,
+    ) -> Result<Arc<dyn cognee::graph::GraphDBTrait>, cognee::ComponentError> {
+        Ok(Arc::new(cognee_graph::MockGraphDB::hanging_on_close()))
+    }
+}
+
+/// A manager whose graph provider hangs on close, warm on every slot the test needs.
+async fn warm_manager_with_stuck_graph(root: &std::path::Path) -> ComponentManager {
+    let mut registry = cognee::ComponentRegistry::with_builtins();
+    registry.register_graph(Arc::new(StuckGraphFactory));
+    let mut s = settings(root, "http://127.0.0.1:1/v1");
+    s.graph_database_provider = "stuck".to_string();
+    let cm = ComponentManager::with_registry(ConfigManager::new(s), registry);
+    cm.database().await.expect("database");
+    cm.graph_db().await.expect("graph");
+    cm
+}
+
+/// The relational pool must be closed **first**, so a caller that bounds the
+/// teardown does not lose it to a slot that hangs.
+///
+/// Callers do bound it: `cognee-cli` wraps `close()` in a `timeout` because a pool
+/// close waits for connections to come back and a command's runtime may have been
+/// dropped with one checked out. With the relational close queued behind the graph
+/// checkpoint, an expired budget skipped exactly the close that #132 was about,
+/// leaving the `-wal`/`-shm` sidecars on disk — green, and still leaking.
+#[tokio::test]
+#[serial]
+async fn a_timed_out_close_still_released_the_relational_pool() {
+    let dir = TempDir::new().expect("tempdir");
+    let cm = warm_manager_with_stuck_graph(dir.path()).await;
+
+    let db = dir.path().join("cognee.db");
+    let wal = db.with_file_name("cognee.db-wal");
+    let shm = db.with_file_name("cognee.db-shm");
+    assert!(
+        wal.exists() && shm.exists(),
+        "precondition: a warm SQLite pool has both WAL sidecars"
+    );
+
+    // The graph close never returns, so the timeout is guaranteed to fire: this
+    // is not a race against a slow machine.
+    let timed_out = tokio::time::timeout(std::time::Duration::from_millis(300), cm.close())
+        .await
+        .is_err();
+    assert!(
+        timed_out,
+        "precondition: the stuck graph must exhaust the budget"
+    );
+
+    assert!(
+        !wal.exists(),
+        "the relational close must happen before the slot that hangs — -wal survived"
+    );
+    assert!(!shm.exists(), "-shm survived a timed-out close");
+}
+
+/// `release()` — the implicit tier — must not close a component another owner is
+/// still holding.
+///
+/// A store's `close()` mutates state behind the shared `Arc`, so it is visible to
+/// every clone: an embedded graph empties its inner handle, a pool flags itself
+/// closed. A finalizer running `close()` therefore breaks an operation that is
+/// still in flight, which is why the implicit tier only closes what it holds the
+/// last reference to.
+#[tokio::test]
+#[serial]
+async fn release_leaves_a_component_a_survivor_still_holds() {
+    let dir = TempDir::new().expect("tempdir");
+    let cm = ComponentManager::new(ConfigManager::new(settings(
+        dir.path(),
+        "http://127.0.0.1:1/v1",
+    )));
+
+    // Stand in for an operation in flight: it owns a clone of the graph and the
+    // relational connection for its duration.
+    let graph = cm.graph_db().await.expect("graph");
+    let database = cm.database().await.expect("database");
+
+    cm.release().await;
+
+    // The survivor's handles still work.
+    graph
+        .is_empty()
+        .await
+        .expect("release() must not close a graph an in-flight op is holding");
+    database
+        .ping()
+        .await
+        .expect("release() must not close a pool an in-flight op is holding");
+
+    // And the cache really was evicted — this is a release, not a no-op.
+    assert_eq!(
+        Arc::strong_count(&graph),
+        1,
+        "the cache must have given up its graph reference"
+    );
+    assert_eq!(Arc::strong_count(&database), 1);
+}
+
+/// The other half of the tier: with no survivor, `release()` releases everything
+/// `close()` would — including the SQLite sidecars, which is the whole point of
+/// the finalizer path (a Python handle collected without `close()`).
+#[tokio::test]
+#[serial]
+async fn release_closes_what_nobody_else_is_using() {
+    let dir = TempDir::new().expect("tempdir");
+    let cm = ComponentManager::new(ConfigManager::new(settings(
+        dir.path(),
+        "http://127.0.0.1:1/v1",
+    )));
+    cm.database().await.expect("database");
+    cm.graph_db().await.expect("graph");
+
+    let wal = dir.path().join("cognee.db-wal");
+    assert!(wal.exists(), "precondition: warm pool has a -wal");
+
+    cm.release().await;
+
+    assert!(
+        !wal.exists(),
+        "with no other owner, release() must close the pool — otherwise a \
+         garbage-collected handle leaks its sidecars, which is #132 again"
+    );
+    assert!(
+        wal_files(dir.path()).is_empty(),
+        "the graph .wal must be checkpointed away too: {:?}",
+        wal_files(dir.path())
+    );
+}
+
+/// `has_cached_components()` must see a **partly** warmed manager.
+///
+/// Warming is slot-by-slot and can fail in the middle: a bad `llm_api_key` fails
+/// after the SQLite pool and the graph are already cached. A probe that reported
+/// "nothing cached" for that state let the finalizer skip the teardown entirely,
+/// leaving an open database behind.
+#[tokio::test]
+#[serial]
+async fn has_cached_components_sees_a_partly_warmed_manager() {
+    let dir = TempDir::new().expect("tempdir");
+    let cm = ComponentManager::new(ConfigManager::new(settings(
+        dir.path(),
+        "http://127.0.0.1:1/v1",
+    )));
+    assert!(
+        !cm.has_cached_components(),
+        "a cold manager has nothing cached"
+    );
+
+    cm.database().await.expect("database");
+    assert!(
+        cm.has_cached_components(),
+        "one warm slot is enough to have something to release"
+    );
+
+    cm.close().await;
+    assert!(
+        !cm.has_cached_components(),
+        "close() empties every slot, so there is nothing left to release"
+    );
+}

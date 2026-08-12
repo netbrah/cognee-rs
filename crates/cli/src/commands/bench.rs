@@ -374,26 +374,27 @@ pub fn run(args: BenchArgs, cm: Arc<ComponentManager>) -> Result<(), CliError> {
         )
     };
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| CliError::Runtime(format!("Failed to create async runtime: {error}")))?;
-
-    let result = runtime.block_on(run_phases(
-        &cm,
-        owner_id,
-        &args.dataset_name,
-        &memories,
-        args.profile_dir.as_deref(),
-        args.min_graph_nodes,
-        BenchConfig {
-            llm_model,
-            embedding_model,
-            embedding_dimensions,
-            dataset_name: args.dataset_name.clone(),
-            mock_llm: args.mock_llm,
-        },
-    ));
+    // Through the shared helper so the bench pays the same teardown as every other
+    // command: the components are closed and telemetry flushed on the runtime that
+    // owns them, before it goes away.
+    let result = crate::teardown::run_command(Arc::clone(&cm), async {
+        Ok(run_phases(
+            &cm,
+            owner_id,
+            &args.dataset_name,
+            &memories,
+            args.profile_dir.as_deref(),
+            args.min_graph_nodes,
+            BenchConfig {
+                llm_model,
+                embedding_model,
+                embedding_dimensions,
+                dataset_name: args.dataset_name.clone(),
+                mock_llm: args.mock_llm,
+            },
+        )
+        .await)
+    })?;
 
     // ── Serialize & write (catastrophic on failure — exit nonzero) ───────
     let json = serde_json::to_string_pretty(&result)

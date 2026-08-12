@@ -215,9 +215,8 @@ impl LadybugAdapter {
             .ok_or_else(|| GraphDBError::ConnectionError("graph database is closed".to_string()))
     }
 
-    /// Release the embedded database's OS resources: checkpoint the `.wal` into
-    /// the main file, drop the file descriptor and release lbug's write lock on
-    /// the database file.
+    /// Stop serving queries and checkpoint the `.wal` into the main database
+    /// file.
     ///
     /// **A `Drop` is not a close, and a `Drop` at an unspecified time is worse.**
     /// lbug runs its checkpoint in `Database`'s destructor and swallows every
@@ -228,17 +227,34 @@ impl LadybugAdapter {
     /// the last clone, which inside an `async fn` is a runtime worker blocked for
     /// up to ~1.5 s. Closing explicitly makes both deterministic.
     ///
-    /// The drop runs on [`tokio::task::spawn_blocking`] because the checkpoint is
-    /// synchronous and file-bound, and it is **awaited**: the next `warm()` on
-    /// the same path must not race this checkpoint, or it hits lbug's file lock.
+    /// The checkpoint **and** the drop run together on
+    /// [`tokio::task::spawn_blocking`], and the join is awaited: both are
+    /// synchronous and file-bound, so running either inline would block the
+    /// calling worker — and on a current-thread runtime it would also stall the
+    /// timer, which is how a caller's `tokio::time::timeout` around this close
+    /// stops being able to fire at all (the CLI's teardown does exactly that).
+    /// Awaiting the join is what makes a subsequent `warm()` on the same path
+    /// safe: it must not race this checkpoint, or it hits lbug's file lock.
     ///
-    /// Idempotent, and safe to call while other clones of this adapter are alive
-    /// — they fail their next query with `graph database is closed` rather than
-    /// silently reopening the file.
+    /// # What is and is not released when this returns
+    ///
+    /// Guaranteed: the slot is empty, so no *new* query can start — every clone
+    /// of this adapter fails with `graph database is closed` rather than silently
+    /// reopening the file — and a checkpoint has been attempted.
+    ///
+    /// **Not** guaranteed: that the file descriptor and lbug's write lock are
+    /// gone. [`Self::db`] hands out owned `Arc<Database>` clones that a query
+    /// holds for its duration, so if one is in flight this drops a reference
+    /// rather than the last one, and the descriptor closes when that query
+    /// finishes. `Ok(())` therefore means "closed to new work and checkpointed",
+    /// not "the file is free"; a caller that needs the file free (to reopen it,
+    /// or to delete its directory) must first stop issuing queries.
+    ///
+    /// Idempotent.
     pub async fn close(&self) -> GraphDBResult<()> {
         // Take the handle out under the lock, then release the lock before the
-        // (potentially slow) drop, so a concurrent accessor observes "closed"
-        // immediately instead of blocking on the checkpoint.
+        // (potentially slow) checkpoint, so a concurrent accessor observes
+        // "closed" immediately instead of blocking on it.
         let taken = {
             let mut guard = self.db.write().map_err(|_| {
                 GraphDBError::ConnectionError("Ladybug database lock poisoned".to_string())
@@ -250,26 +266,28 @@ impl LadybugAdapter {
             return Ok(());
         };
 
-        // Best-effort explicit checkpoint before the drop. lbug's destructor
-        // swallows checkpoint failures, so doing it here is the only way the
-        // outcome is observable at all. It must never propagate: an explicit
-        // CHECKPOINT legitimately fails on a read-only or in-memory database,
-        // and it must never skip the drop below, which is what actually releases
-        // the descriptor.
-        if let Ok(conn) = Connection::new(&db)
-            && let Err(e) = conn.query("CHECKPOINT")
-        {
-            tracing::debug!(error = %e, path = %self.db_path, "ladybug CHECKPOINT before close failed; the destructor will retry");
-        }
-
         let path = self.db_path.clone();
-        tokio::task::spawn_blocking(move || drop(db))
-            .await
-            .map_err(|e| {
-                GraphDBError::ConnectionError(format!(
-                    "failed to join the ladybug close for {path}: {e}"
-                ))
-            })
+        let checkpoint_path = path.clone();
+        tokio::task::spawn_blocking(move || {
+            // Best-effort explicit checkpoint before the drop. lbug's destructor
+            // swallows checkpoint failures, so doing it here is the only way the
+            // outcome is observable at all. It must never propagate: an explicit
+            // CHECKPOINT legitimately fails on a read-only or in-memory database,
+            // and it must never skip the drop below, which is what releases this
+            // reference to the descriptor.
+            if let Ok(conn) = Connection::new(&db)
+                && let Err(e) = conn.query("CHECKPOINT")
+            {
+                tracing::debug!(error = %e, path = %checkpoint_path, "ladybug CHECKPOINT before close failed; the destructor will retry");
+            }
+            drop(db);
+        })
+        .await
+        .map_err(|e| {
+            GraphDBError::ConnectionError(format!(
+                "failed to join the ladybug close for {path}: {e}"
+            ))
+        })
     }
 
     /// Execute a query and convert results to JSON values.

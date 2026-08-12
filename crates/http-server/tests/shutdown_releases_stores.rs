@@ -120,3 +120,130 @@ async fn shutdown_is_safe_without_stores() {
     // Twice, because a shutdown signal can arrive while one is already running.
     on_shutdown(&state).await;
 }
+
+/// A request in flight when the shutdown fires must still complete successfully.
+///
+/// This is what `with_graceful_shutdown` is for: axum stops accepting and then
+/// **drains**, and draining only begins once the future it was given completes. So
+/// running the teardown inside that future closes the stores while handlers are
+/// still executing — the in-flight request then hits a closed store and returns
+/// 500 for a shutdown that was supposed to be graceful. Ordering the two
+/// (`serve(...).await`, *then* `on_shutdown`) is what makes the drain mean
+/// anything.
+///
+/// Deterministic by construction: the handler announces that it has started, the
+/// test fires the shutdown only after seeing that, and the handler touches the
+/// database *after* the shutdown has been requested.
+#[tokio::test]
+async fn a_request_in_flight_survives_the_shutdown() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let state = support::build_p4_state(None, None, None).await;
+    let db = state
+        .lib
+        .as_ref()
+        .expect("the p4 state wires a relational connection")
+        .database
+        .clone();
+
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let hit_db_after_shutdown = Arc::new(AtomicBool::new(false));
+
+    let handler_db = Arc::clone(&db);
+    let flag = Arc::clone(&hit_db_after_shutdown);
+    let started = Arc::new(tokio::sync::Mutex::new(Some(started_tx)));
+    let app = axum::Router::new().route(
+        "/slow",
+        axum::routing::get(move || {
+            let db = Arc::clone(&handler_db);
+            let flag = Arc::clone(&flag);
+            let started = Arc::clone(&started);
+            async move {
+                // Tell the test we are in flight, then give it room to fire the
+                // shutdown before we touch the store.
+                if let Some(tx) = started.lock().await.take() {
+                    let _ = tx.send(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                // The assertion: a handler still running during shutdown must find
+                // its resources intact.
+                let ok = db.ping().await.is_ok();
+                flag.store(ok, Ordering::Release);
+                if ok { "ok" } else { "closed" }
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = tokio::spawn(cognee_http_server::serve_with_shutdown(
+        listener,
+        app,
+        async move {
+            let _ = shutdown_rx.await;
+        },
+        state,
+    ));
+
+    let request = tokio::spawn(async move {
+        reqwest::get(format!("http://{addr}/slow"))
+            .await
+            .expect("request")
+            .text()
+            .await
+            .expect("body")
+    });
+
+    // Only fire the shutdown once the handler is provably running.
+    started_rx.await.expect("handler started");
+    shutdown_tx.send(()).expect("trigger shutdown");
+
+    let body = request.await.expect("join the request");
+    server.await.expect("join the server").expect("serve");
+
+    assert_eq!(
+        body, "ok",
+        "the in-flight request must complete against live resources, not a store \
+         closed underneath it"
+    );
+    assert!(
+        hit_db_after_shutdown.load(Ordering::Acquire),
+        "the handler reached the database after the shutdown was requested and it \
+         must still have been open"
+    );
+
+    // And the teardown did run — after the drain.
+    assert!(
+        db.ping().await.is_err(),
+        "once serve() returned, the teardown must have closed the pool"
+    );
+}
+
+/// One store that will not close must not hold shutdown open forever.
+///
+/// A pool close waits for its checked-out connections to come back, so a task
+/// parked in a driver read (or a handler outside the pipeline registry) can make it
+/// wait indefinitely. Unbounded, that turns a SIGTERM into a SIGKILL — which skips
+/// every *remaining* close as well, so an unbounded wait costs more resources than
+/// it saves.
+#[tokio::test]
+async fn a_store_that_never_closes_does_not_hang_the_shutdown() {
+    let hanging: Arc<dyn GraphDBTrait> = Arc::new(cognee_graph::MockGraphDB::hanging_on_close());
+    let state = support::build_p4_state(None, None, Some(hanging)).await;
+
+    // The whole shutdown must finish well inside the per-store ceiling (10 s), and
+    // the ceiling itself must be finite. 30 s is the outer bound of the assertion,
+    // not of the code.
+    let finished = tokio::time::timeout(std::time::Duration::from_secs(30), on_shutdown(&state))
+        .await
+        .is_ok();
+
+    assert!(
+        finished,
+        "on_shutdown must bound each store close; it waited on one that never \
+         returns and would have been SIGKILLed"
+    );
+}

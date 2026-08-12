@@ -280,3 +280,111 @@ async fn close_blocking_releases_the_sidecars_on_either_thread() {
     );
     assert!(!state.is_closed());
 }
+
+/// A warm that fails part-way still leaves resources open, and the finalizer's
+/// probe has to say so.
+///
+/// `CogneeServices::build` warms slot by slot and resolves the LLM near the end,
+/// so an empty `llm_api_key` fails **after** the SQLite pool (and the graph) are
+/// cached. The services slot is then `None` — and a probe that only looked there
+/// reported "nothing to release", so `Drop for PyCognee` / neon's `Finalize`
+/// skipped the teardown and the open database survived until process exit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_warm_still_reports_open_resources_and_releases_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("cognee.db");
+    let (wal, shm) = sidecars(&db_path);
+
+    // Everything valid except the LLM key, which is resolved strictly and last.
+    let settings = Settings {
+        llm_api_key: String::new(),
+        embedding_provider: "mock".to_owned(),
+        data_root_directory: dir.path().join("data").to_string_lossy().into_owned(),
+        system_root_directory: dir.path().join("sys").to_string_lossy().into_owned(),
+        relational_db_url: format!("sqlite://{}?mode=rwc", db_path.display()),
+        ..Settings::default()
+    };
+    let state = std::sync::Arc::new(HandleState::from_settings(settings));
+
+    let err = match state.services().await {
+        Ok(_) => panic!("warm must fail without an LLM key"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("llm_api_key"),
+        "expected the LLM key to be what failed, got: {err}"
+    );
+
+    // The pool is open even though the bundle was never cached.
+    assert!(
+        wal.exists() && shm.exists(),
+        "precondition: the relational pool was opened before the warm failed"
+    );
+    assert!(
+        state.has_open_resources(),
+        "a partly warmed handle has resources to release; reporting otherwise is \
+         what made the finalizer skip the teardown"
+    );
+
+    // And the finalizer's teardown does release them.
+    state.release().await;
+    assert!(
+        !wal.exists() && !shm.exists(),
+        "release must free the sidecars"
+    );
+}
+
+/// `release()` — the implicit tier — must not break a component that an operation
+/// still in flight is holding.
+///
+/// A store's `close()` mutates state behind the shared `Arc`, so it is visible to
+/// every clone. The explicit `close()` is entitled to that; a garbage collector is
+/// not, and the two-tier split exists precisely so a finalizer cannot fail
+/// somebody's in-flight query.
+#[tokio::test(flavor = "multi_thread")]
+async fn release_does_not_break_an_operation_still_holding_the_services() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _db_path) = handle_under(dir.path());
+
+    // Exactly what an in-flight op holds for its duration.
+    let in_flight = state.services().await.expect("warm");
+
+    state.release().await;
+
+    in_flight
+        .database
+        .ping()
+        .await
+        .expect("release() must leave an in-flight op's connection usable");
+    in_flight
+        .graph_db
+        .is_empty()
+        .await
+        .expect("release() must leave an in-flight op's graph usable");
+
+    // The handle itself is still usable too, and re-warms cold.
+    assert!(!state.is_closed());
+    state.services().await.expect("re-warm after release");
+}
+
+/// The explicit `close()` is the opposite contract, and that difference is the
+/// point: it closes the components even out from under an in-flight operation,
+/// because the caller said they were done.
+#[tokio::test(flavor = "multi_thread")]
+async fn close_closes_even_what_an_operation_is_holding() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, db_path) = handle_under(dir.path());
+    let (wal, _shm) = sidecars(&db_path);
+
+    let in_flight = state.services().await.expect("warm");
+    state.close().await;
+
+    assert!(
+        !wal.exists(),
+        "close() must release the sidecars regardless"
+    );
+    assert!(
+        in_flight.database.ping().await.is_err(),
+        "close() closes the pool an in-flight op holds — that is the contract"
+    );
+}

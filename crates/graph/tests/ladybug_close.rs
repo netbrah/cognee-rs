@@ -172,3 +172,37 @@ async fn the_same_path_can_be_reopened_after_close() {
 
     reopened.close().await.expect("close the reopen");
 }
+
+/// `close()` guarantees exactly what its rustdoc now claims — closed to new work
+/// and checkpointed — and nothing about the descriptor being free.
+///
+/// This pins the honest half in place. The stronger promise the doc used to make
+/// ("drop the file descriptor and release lbug's write lock" by the time it
+/// returns) cannot be kept: `db()` hands out owned `Arc<Database>` clones that an
+/// in-flight query holds for its duration, so a close racing one drops a
+/// reference rather than the last one. When no query is in flight the descriptor
+/// *is* released, which is what `the_same_path_can_be_reopened_after_close`
+/// covers; the two together are the whole contract.
+#[tokio::test]
+#[serial]
+async fn close_reports_ok_and_refuses_new_work() {
+    let (adapter, db_path, _dir) = warm().await;
+
+    adapter.close().await.expect("close reports Ok");
+
+    let err = adapter
+        .get_node("n1")
+        .await
+        .expect_err("a closed adapter must refuse new queries");
+    assert!(
+        err.to_string().contains("closed"),
+        "error should name the cause, got: {err}"
+    );
+
+    // The checkpoint half of the guarantee: the WAL was folded into the main
+    // file rather than left next to it.
+    assert!(
+        !wal_path(&db_path).exists(),
+        "close() must checkpoint the .wal away"
+    );
+}

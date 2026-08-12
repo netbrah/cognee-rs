@@ -207,10 +207,17 @@ impl HandleState {
     /// it) for a handle that never warmed. A contended lock reports `true`: the
     /// safe direction is to attempt the release rather than skip a real one.
     pub fn has_open_resources(&self) -> bool {
-        match self.services.try_lock() {
+        let bundle_cached = match self.services.try_lock() {
             Ok(guard) => guard.is_some(),
             Err(_) => true,
-        }
+        };
+        // The bundle alone is not the answer. `CogneeServices::build` warms the
+        // engines one at a time and can fail part-way — a bad `llm_api_key` fails
+        // *after* the SQLite pool and the embedded graph are cached — leaving the
+        // bundle `None` while real resources are open. Asking only about the
+        // bundle reported "nothing to release" for exactly that handle, and the
+        // finalizer skipped the teardown.
+        bundle_cached || self.cm.has_cached_components()
     }
 
     /// Release the resources this handle opened, leaving it usable.
@@ -225,17 +232,24 @@ impl HandleState {
     /// - `release` is for the **implicit** paths — a GC finalizer (`Drop for
     ///   PyCognee`, neon's `Finalize`) reclaiming a handle the program dropped on
     ///   the floor. The user never said "close", so this only gives the resources
-    ///   back: the handle stays warm-able, and anything still holding a clone of
-    ///   the state (a sub-handle like `cognee.datasets`, an in-flight op) keeps
-    ///   working — it just re-warms against a fresh connection.
+    ///   back, and only the ones nobody else is using: the handle stays warm-able,
+    ///   a sub-handle like `cognee.datasets` that outlived its parent keeps
+    ///   working (it re-warms against a fresh connection), and an operation still
+    ///   in flight keeps the components it holds — those are released when it
+    ///   finishes. See [`ComponentManager::release`](cognee::ComponentManager::release)
+    ///   for how "nobody else is using it" is decided.
     /// - [`close`](Self::close) is for the **explicit** paths (`Cognee.close()`,
-    ///   `cg_sdk_close`). It additionally marks the handle closed, so later ops
-    ///   fail with a clear error instead of silently reopening the database.
+    ///   `cg_sdk_close`). It marks the handle closed, so later ops fail with a
+    ///   clear error instead of silently reopening the database, and it closes the
+    ///   components **unconditionally** — including ones an in-flight operation is
+    ///   still holding, which will then fail on its next query. That is the point:
+    ///   the caller said they were done, and a resource that outlives an explicit
+    ///   close is the bug this exists to prevent.
     ///
-    /// Both are idempotent. Neither waits for concurrent operations: an op that is
-    /// mid-flight holds its own `Arc<CogneeServices>` and will see a closed pool on
-    /// its next query, so a binding should only tear down when its own contract
-    /// says the handle is done.
+    /// Both are idempotent, and neither waits for concurrent operations. So a
+    /// binding should only call `close` when its own contract says the handle is
+    /// done, and use `release` where it cannot know — which is exactly the split
+    /// between an explicit `close()` call and a garbage collector.
     pub async fn release(&self) {
         self.teardown(false).await;
     }
@@ -276,7 +290,15 @@ impl HandleState {
         let mut guard = self.services.lock().await;
         drop(guard.take());
         *self.owner_id.lock().await = None;
-        self.cm.close().await;
+        // Which teardown tier the manager runs is the whole difference between
+        // `release` and `close`: a store's `close()` mutates state behind the
+        // shared `Arc` and would break an operation still holding a clone, so the
+        // implicit tier closes only components nobody else is using.
+        if mark_closed {
+            self.cm.close().await;
+        } else {
+            self.cm.release().await;
+        }
 
         // Finally, let the analytics POSTs already in flight finish. `send_telemetry`
         // is fire-and-forget, so a binding whose embedder exits (or drops its

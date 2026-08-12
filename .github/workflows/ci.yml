@@ -702,8 +702,18 @@ jobs:
           path: target/ort-cache
           key: ort-v2.0.0-rc.12-cpu-linux-x86_64
 
+      # `--features pgvector` is load-bearing, not decoration: BOTH files in this
+      # lane are `#![cfg(feature = "pgvector")]`, and `crates/vector` declares no
+      # default features. Without the flag each target compiles down to nothing and
+      # libtest prints "running 0 tests" and exits 0 — a green step that asserts
+      # nothing, which is how the leak in #132 stayed hidden in the first place.
+      # `assert_pgvector_suite_ran.sh` is what stops that from being possible
+      # again: it fails the lane on a zero count or a skip marker.
       - name: Run pgvector span instrumentation tests
-        run: cargo test -p cognee-vector --test pgvector_span_instrumentation -- --nocapture
+        run: |
+          cargo test -p cognee-vector --features pgvector,testing \
+            --test pgvector_span_instrumentation -- --nocapture \
+            2>&1 | tee /tmp/pgvector-spans.log
 
       # Pool-teardown regression tests (topoteretes/cognee-rs#132). Named
       # explicitly because this lane invokes individual `--test` targets: a new
@@ -712,7 +722,13 @@ jobs:
       # `PGVECTOR_TEST_URL` first and falls back to the `DB_*` set this lane
       # already exports, so no new service container or env is needed.
       - name: Run PgVectorAdapter pool-close tests
-        run: cargo test -p cognee-vector --test pgvector_close -- --nocapture
+        run: |
+          cargo test -p cognee-vector --features pgvector,testing \
+            --test pgvector_close -- --nocapture \
+            2>&1 | tee /tmp/pgvector-close.log
+
+      - name: Assert the pgvector suites actually ran
+        run: bash scripts/ci/assert_pgvector_suite_ran.sh /tmp/pgvector-spans.log /tmp/pgvector-close.log
 
   # ── Stage 2.5: Postgres graph adapter tests (depends on lint, parallel with `test`) ──
   # `crates/graph/tests/pg_graph_integration.rs` and the two inline

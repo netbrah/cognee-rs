@@ -54,6 +54,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   relational pool, so closing it from a store teardown would turn a leak fix into
   an outage.
 
+  Two clarifications to that contract, from review of the change:
+
+  - **The two teardown tiers differ in what they may touch, not just in a flag.**
+    The explicit tier (`HandleState::close`, `Cognee.close()`, `cg_sdk_close`)
+    closes the stores unconditionally — including one that an operation still in
+    flight is holding, which will then fail on its next query. The implicit tier
+    (`HandleState::release`, reached from a GC finalizer: `Drop for PyCognee`,
+    neon's `Finalize`) closes a component **only when the cache holds its last
+    reference.** A store's `close()` mutates state behind the shared `Arc`, so it
+    is visible to every clone, and a garbage collector has no mandate to fail
+    somebody's in-flight query — an explicit `close()` does. In the ordinary
+    finalizer case, with nothing in flight, the two tiers release exactly the same
+    resources, sidecars included.
+  - **`LadybugAdapter::close` guarantees "closed to new work and checkpointed",
+    not "the file is free".** It empties the slot (so every clone fails with
+    `graph database is closed`) and checkpoints the `.wal`, both on the blocking
+    pool. It cannot promise the descriptor and lbug's write lock are gone by the
+    time it returns: an in-flight query owns a database handle for its duration, so
+    a close racing one drops a reference rather than the last one. A caller that
+    needs the file free — to reopen it, or to delete its directory — has to stop
+    issuing queries first. The earlier wording promised the write lock was
+    released; it is released once the last query finishes, which is not the same
+    claim.
+
 - **`cognee-core`: `PipelineContext::current_data` changed meaning.** It is now
   pinned, once per data item, to the value that *entered* the pipeline, and is
   never rebound as that item flows through the task chain. Previously the
