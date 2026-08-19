@@ -8,8 +8,14 @@ pub mod event;
 pub mod generation;
 pub mod hook_input;
 pub mod layout;
+#[cfg(feature = "runtime")]
+pub mod lease;
+#[cfg(feature = "runtime")]
+pub mod ledger;
 pub mod limits;
 pub mod protocol;
 pub mod redact;
+#[cfg(feature = "runtime")]
+pub mod scheduler;
 pub mod secret;
 pub mod spool;
