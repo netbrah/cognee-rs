@@ -204,7 +204,7 @@ fn state_tree_and_module_written_files_are_private() {
 }
 
 #[test]
-#[cfg(unix)]
+#[cfg(all(unix, feature = "runtime"))]
 fn state_creation_establishes_process_umask_077() {
     let temp = tempfile::tempdir().expect("tempdir");
     let output = std::process::Command::new(std::env::current_exe().expect("current test binary"))
@@ -228,7 +228,7 @@ fn state_creation_establishes_process_umask_077() {
 
 #[test]
 #[ignore = "isolated subprocess helper"]
-#[cfg(unix)]
+#[cfg(all(unix, feature = "runtime"))]
 fn state_creation_umask_probe_helper() {
     let Some(root) = std::env::var_os("COGNEE_UMASK_PROBE_ROOT") else {
         return;
@@ -241,6 +241,37 @@ fn state_creation_umask_probe_helper() {
     // SAFETY: The helper owns the subprocess-wide umask.
     let previous = unsafe { libc::umask(0o077) };
     assert_eq!(previous & 0o777, 0o077);
+}
+
+#[test]
+#[cfg(all(unix, not(feature = "runtime")))]
+fn no_default_feature_private_filesystem_apis_remain_available() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let layout = StateLayout::under(temp.path().join("state"));
+    layout.ensure_private().expect("private state tree");
+    let status_file = layout.status.join("no-default-status.json");
+    layout
+        .write_private_file(&status_file, br#"{"ready":true}"#)
+        .expect("private no-default status file");
+
+    assert_eq!(
+        std::fs::metadata(&layout.root)
+            .expect("root metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(status_file)
+            .expect("status metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
 }
 
 #[test]

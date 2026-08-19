@@ -26,8 +26,6 @@ pub enum LayoutError {
     Io(#[source] std::io::Error),
     #[error("private file must remain below the state root")]
     OutsideRoot,
-    #[error("private state creation requires the runtime feature on Unix")]
-    RuntimeRequired,
 }
 
 impl From<std::io::Error> for LayoutError {
@@ -54,13 +52,9 @@ impl StateLayout {
     }
 
     pub fn ensure_private(&self) -> Result<(), LayoutError> {
-        #[cfg(all(unix, feature = "runtime"))]
+        #[cfg(unix)]
         {
             unix_fs::ensure_private(self)
-        }
-        #[cfg(all(unix, not(feature = "runtime")))]
-        {
-            Err(LayoutError::RuntimeRequired)
         }
         #[cfg(not(unix))]
         {
@@ -70,14 +64,9 @@ impl StateLayout {
 
     pub fn write_private_file(&self, path: &Path, contents: &[u8]) -> Result<(), LayoutError> {
         let relative = private_relative_path(&self.root, path)?;
-        #[cfg(all(unix, feature = "runtime"))]
+        #[cfg(unix)]
         {
             unix_fs::write_private_file(&self.root, relative, contents)
-        }
-        #[cfg(all(unix, not(feature = "runtime")))]
-        {
-            let _ = (relative, contents);
-            Err(LayoutError::RuntimeRequired)
         }
         #[cfg(not(unix))]
         {
@@ -100,19 +89,23 @@ fn private_relative_path<'a>(root: &Path, path: &'a Path) -> Result<&'a Path, La
     Ok(relative)
 }
 
-#[cfg(all(unix, feature = "runtime"))]
+#[cfg(unix)]
 mod unix_fs {
-    use std::ffi::{CString, OsString};
+    use std::ffi::OsString;
     use std::fs::{self, File};
     use std::io::Write;
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use std::os::unix::ffi::OsStrExt;
     use std::path::{Component, Path};
+
+    use rustix::fd::OwnedFd;
+    use rustix::fs::{Mode, OFlags, fchmod, mkdirat, open, openat};
+    use rustix::io::Errno;
+    use rustix::process::umask;
 
     use super::{LayoutError, StateLayout};
 
-    const DIRECTORY_MODE: libc::mode_t = 0o700;
-    const FILE_MODE: libc::mode_t = 0o600;
+    const DIRECTORY_MODE: Mode = Mode::RUSR.union(Mode::WUSR).union(Mode::XUSR);
+    const FILE_MODE: Mode = Mode::RUSR.union(Mode::WUSR);
+    const PRIVATE_UMASK: Mode = Mode::RWXG.union(Mode::RWXO);
 
     pub(super) fn ensure_private(layout: &StateLayout) -> Result<(), LayoutError> {
         establish_private_umask();
@@ -148,23 +141,16 @@ mod unix_fs {
         let (file_name, directories) = components.split_last().ok_or(LayoutError::OutsideRoot)?;
         let root = open_or_create_root(root)?;
         let parent = ensure_component_directories(root, directories)?;
-        let file_name = c_string(file_name)?;
         // O_NOFOLLOW rejects a final-component symlink. Every directory was
         // opened one component at a time with the same flag.
-        let raw_file = unsafe {
-            libc::openat(
-                parent.as_raw_fd(),
-                file_name.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-                libc::c_uint::from(FILE_MODE),
-            )
-        };
-        if raw_file < 0 {
-            return Err(last_io_error());
-        }
-        // SAFETY: openat returned a new owned descriptor.
-        let file_fd = unsafe { OwnedFd::from_raw_fd(raw_file) };
-        chmod_fd(&file_fd, FILE_MODE)?;
+        let file_fd = openat(
+            &parent,
+            file_name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            FILE_MODE,
+        )
+        .map_err(io_error)?;
+        fchmod(&file_fd, FILE_MODE).map_err(io_error)?;
         let mut file = File::from(file_fd);
         file.set_len(0)?;
         file.write_all(contents)?;
@@ -173,9 +159,9 @@ mod unix_fs {
     }
 
     fn establish_private_umask() {
-        // SAFETY: umask is process-global; every state-creating path sets the
-        // same strictly-more-restrictive value and deliberately retains it.
-        unsafe { libc::umask(0o077) };
+        // umask is process-global; every state-creating path sets the same
+        // strictly-more-restrictive value and deliberately retains it.
+        umask(PRIVATE_UMASK);
     }
 
     fn open_or_create_root(path: &Path) -> Result<OwnedFd, LayoutError> {
@@ -194,7 +180,7 @@ mod unix_fs {
         fs::create_dir_all(parent_path)?;
         let parent = open_directory_path(parent_path)?;
         let (root, _) = open_or_create_directory_at(&parent, &component)?;
-        chmod_fd(&root, DIRECTORY_MODE)?;
+        fchmod(&root, DIRECTORY_MODE).map_err(io_error)?;
         Ok(root)
     }
 
@@ -209,7 +195,7 @@ mod unix_fs {
     ) -> Result<OwnedFd, LayoutError> {
         for component in components {
             let (child, _) = open_or_create_directory_at(&current, component)?;
-            chmod_fd(&child, DIRECTORY_MODE)?;
+            fchmod(&child, DIRECTORY_MODE).map_err(io_error)?;
             current = child;
         }
         Ok(current)
@@ -219,50 +205,28 @@ mod unix_fs {
         parent: &OwnedFd,
         component: &OsString,
     ) -> Result<(OwnedFd, bool), LayoutError> {
-        let component = c_string(component)?;
-        let created =
-            unsafe { libc::mkdirat(parent.as_raw_fd(), component.as_ptr(), DIRECTORY_MODE) } == 0;
-        if !created {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::EEXIST) {
-                return Err(LayoutError::Io(error));
-            }
-        }
-        let raw_child = unsafe {
-            libc::openat(
-                parent.as_raw_fd(),
-                component.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-            )
+        let created = match mkdirat(parent, component, DIRECTORY_MODE) {
+            Ok(()) => true,
+            Err(Errno::EXIST) => false,
+            Err(error) => return Err(io_error(error)),
         };
-        if raw_child < 0 {
-            return Err(last_io_error());
-        }
-        // SAFETY: openat returned a new owned descriptor.
-        Ok((unsafe { OwnedFd::from_raw_fd(raw_child) }, created))
+        let child = openat(
+            parent,
+            component,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(io_error)?;
+        Ok((child, created))
     }
 
     fn open_directory_path(path: &Path) -> Result<OwnedFd, LayoutError> {
-        let path =
-            CString::new(path.as_os_str().as_bytes()).map_err(|_| LayoutError::OutsideRoot)?;
-        let raw = unsafe {
-            libc::open(
-                path.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-            )
-        };
-        if raw < 0 {
-            return Err(last_io_error());
-        }
-        // SAFETY: open returned a new owned descriptor.
-        Ok(unsafe { OwnedFd::from_raw_fd(raw) })
-    }
-
-    fn chmod_fd(fd: &OwnedFd, mode: libc::mode_t) -> Result<(), LayoutError> {
-        if unsafe { libc::fchmod(fd.as_raw_fd(), mode) } != 0 {
-            return Err(last_io_error());
-        }
-        Ok(())
+        open(
+            path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(io_error)
     }
 
     fn normal_components(path: &Path) -> Result<Vec<OsString>, LayoutError> {
@@ -279,12 +243,8 @@ mod unix_fs {
         Ok(result)
     }
 
-    fn c_string(component: &OsString) -> Result<CString, LayoutError> {
-        CString::new(component.as_os_str().as_bytes()).map_err(|_| LayoutError::OutsideRoot)
-    }
-
-    fn last_io_error() -> LayoutError {
-        LayoutError::Io(std::io::Error::last_os_error())
+    fn io_error(error: Errno) -> LayoutError {
+        LayoutError::Io(error.into())
     }
 }
 
