@@ -41,12 +41,15 @@ async-trait = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt", "sync"] }
+url = { workspace = true }
 cognee-bindings-common = { path = "../bindings-common", version = "0.2.0", default-features = false, optional = true }
 cognee = { path = "../lib", version = "0.2.0", default-features = false, optional = true }
 rusqlite = { version = "0.32", optional = true }
 libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt", "rt-multi-thread"] }
