@@ -65,6 +65,8 @@ pub enum ConfigError {
     MissingGraphSetting(&'static str),
     #[error("embedding generation fingerprint does not match the requested configuration")]
     EmbeddingGenerationMismatch,
+    #[error("embedding generation belongs to a different private root")]
+    EmbeddingGenerationRootMismatch,
 }
 
 impl AgentConfig {
@@ -153,19 +155,22 @@ impl AgentConfig {
         if generation.fingerprint() != &EmbeddingFingerprint::from_config(embedding) {
             return Err(ConfigError::EmbeddingGenerationMismatch);
         }
+        if generation.private_root() != self.layout.root.as_path() {
+            return Err(ConfigError::EmbeddingGenerationRootMismatch);
+        }
 
         let layout = &self.layout;
         let mut settings = cognee::config::Settings::default();
         settings.system_root_directory = layout.system.display().to_string();
-        settings.data_root_directory = generation.data.display().to_string();
+        settings.data_root_directory = generation.data().display().to_string();
         settings.cache_root_directory = layout.cache.display().to_string();
         settings.logs_root_directory = layout.status.join("logs").display().to_string();
         settings.db_provider = "sqlite".into();
         settings.relational_db_url = generation.sqlite_url();
         settings.vector_db_provider = "lancedb".into();
-        settings.vector_db_url = generation.vector.display().to_string();
+        settings.vector_db_url = generation.vector().display().to_string();
         settings.graph_database_provider = "ladybug".into();
-        settings.graph_file_path = generation.graph.display().to_string();
+        settings.graph_file_path = generation.graph().display().to_string();
         settings.cache_backend = "seaorm".into();
         settings.default_dataset_name = self.dataset.clone();
         settings.llm_provider = self.llm.provider.clone();

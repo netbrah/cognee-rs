@@ -42,13 +42,14 @@ impl EmbeddingFingerprint {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EmbeddingGeneration {
     id: String,
     fingerprint: EmbeddingFingerprint,
-    pub data: PathBuf,
-    pub vector: PathBuf,
-    pub graph: PathBuf,
+    private_root: PathBuf,
+    data: PathBuf,
+    vector: PathBuf,
+    graph: PathBuf,
 }
 
 #[derive(Debug, Error)]
@@ -81,6 +82,7 @@ impl EmbeddingGeneration {
         Ok(Self {
             id,
             fingerprint,
+            private_root: layout.root.clone(),
             data: root.join("data"),
             vector: root.join("vector"),
             graph: root.join("graph"),
@@ -95,10 +97,26 @@ impl EmbeddingGeneration {
         &self.fingerprint
     }
 
+    pub fn private_root(&self) -> &std::path::Path {
+        &self.private_root
+    }
+
+    pub fn data(&self) -> &std::path::Path {
+        &self.data
+    }
+
+    pub fn vector(&self) -> &std::path::Path {
+        &self.vector
+    }
+
+    pub fn graph(&self) -> &std::path::Path {
+        &self.graph
+    }
+
     pub fn sqlite_url(&self) -> String {
         format!(
             "sqlite://{}?mode=rwc",
-            self.data.join("cognee.db").display()
+            self.data().join("cognee.db").display()
         )
     }
 }

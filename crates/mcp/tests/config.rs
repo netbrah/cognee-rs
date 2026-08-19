@@ -204,6 +204,46 @@ fn state_tree_and_module_written_files_are_private() {
 }
 
 #[test]
+#[cfg(unix)]
+fn state_creation_establishes_process_umask_077() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let output = std::process::Command::new(std::env::current_exe().expect("current test binary"))
+        .args([
+            "--ignored",
+            "--exact",
+            "state_creation_umask_probe_helper",
+            "--nocapture",
+        ])
+        .env("COGNEE_UMASK_PROBE_ROOT", temp.path())
+        .output()
+        .expect("run isolated umask probe");
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "isolated subprocess helper"]
+#[cfg(unix)]
+fn state_creation_umask_probe_helper() {
+    let Some(root) = std::env::var_os("COGNEE_UMASK_PROBE_ROOT") else {
+        return;
+    };
+    // SAFETY: This helper runs in a dedicated subprocess with no other test threads.
+    unsafe { libc::umask(0) };
+    StateLayout::under(PathBuf::from(root))
+        .ensure_private()
+        .expect("private state tree");
+    // SAFETY: The helper owns the subprocess-wide umask.
+    let previous = unsafe { libc::umask(0o077) };
+    assert_eq!(previous & 0o777, 0o077);
+}
+
+#[test]
 fn private_file_rejects_parent_directory_components() {
     let temp = tempfile::tempdir().expect("tempdir");
     let layout = StateLayout::under(temp.path().join("state"));
@@ -213,6 +253,27 @@ fn private_file_rejects_parent_directory_components() {
 
     assert!(layout.write_private_file(&traversal, b"escape").is_err());
     assert!(!outside.exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn private_file_rejects_symlink_escape() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let layout = StateLayout::under(temp.path().join("state"));
+    layout.ensure_private().expect("private state tree");
+    let outside = temp.path().join("outside");
+    std::fs::create_dir(&outside).expect("outside fixture");
+    let escape = layout.status.join("escape");
+    symlink(&outside, &escape).expect("symlink fixture");
+
+    assert!(
+        layout
+            .write_private_file(&escape.join("leaked.json"), b"escape")
+            .is_err()
+    );
+    assert!(!outside.join("leaked.json").exists());
 }
 
 #[test]
@@ -242,12 +303,27 @@ fn embedding_generation_is_immutable_stable_and_below_the_private_root() {
     assert_eq!(first.fingerprint().model, "embed-v1");
     assert_eq!(first.fingerprint().dimensions, 1536);
     assert_eq!(first.fingerprint().stable_id().len(), 64);
-    for path in [&first.data, &first.vector, &first.graph] {
+    for path in [first.data(), first.vector(), first.graph()] {
         assert!(path.starts_with(&layout.root), "{}", path.display());
     }
     assert!(first.sqlite_url().starts_with("sqlite:///private/cognee/"));
     let json = serde_json::to_string(&first).expect("generation json");
     assert!(!json.contains("secret"));
+}
+
+#[test]
+fn embedding_generation_exposes_only_read_access() {
+    let source = include_str!("../src/embedding_generation.rs");
+    assert!(!source.contains("pub data: PathBuf"));
+    assert!(!source.contains("pub vector: PathBuf"));
+    assert!(!source.contains("pub graph: PathBuf"));
+
+    let before_struct = source
+        .split_once("pub struct EmbeddingGeneration")
+        .expect("generation declaration")
+        .0;
+    let derive = before_struct.rsplit_once("#[derive").expect("derive").1;
+    assert!(!derive.contains("Deserialize"));
 }
 
 #[test]
@@ -317,7 +393,7 @@ fn graph_settings_require_complete_models_and_project_explicitly() {
     assert_eq!(settings.system_root_directory, "/private/cognee/system");
     assert_eq!(
         settings.data_root_directory,
-        generation.data.display().to_string()
+        generation.data().display().to_string()
     );
     assert_eq!(settings.cache_root_directory, "/private/cognee/cache");
     assert_eq!(settings.logs_root_directory, "/private/cognee/status/logs");
@@ -326,12 +402,12 @@ fn graph_settings_require_complete_models_and_project_explicitly() {
     assert_eq!(settings.vector_db_provider, "lancedb");
     assert_eq!(
         settings.vector_db_url,
-        generation.vector.display().to_string()
+        generation.vector().display().to_string()
     );
     assert_eq!(settings.graph_database_provider, "ladybug");
     assert_eq!(
         settings.graph_file_path,
-        generation.graph.display().to_string()
+        generation.graph().display().to_string()
     );
     assert_eq!(settings.cache_backend, "seaorm");
     assert_eq!(settings.default_dataset_name, "agent_sessions");
@@ -350,6 +426,41 @@ fn graph_settings_require_complete_models_and_project_explicitly() {
     );
     assert_eq!(settings.embedding_api_key, "settings-secret");
     assert_eq!(settings.embedding_batch_size, 64);
+}
+
+#[test]
+#[cfg(feature = "engine")]
+fn graph_settings_reject_a_generation_from_another_private_root() {
+    let config = AgentConfig::from_env(&fake_env([
+        ("HOME", "/home/alice"),
+        ("APEX_COGNEE_ROOT", "/private/cognee"),
+        ("APEX_COGNEE_PROXY_KEY", "settings-secret"),
+        ("APEX_COGNEE_LLM_PROVIDER", "openai"),
+        ("APEX_COGNEE_LLM_ENDPOINT", "https://proxy.example/v1"),
+        ("APEX_COGNEE_LLM_MODEL", "gpt-5.4-nano"),
+        ("APEX_COGNEE_EMBEDDING_PROVIDER", "openai"),
+        (
+            "APEX_COGNEE_EMBEDDING_ENDPOINT",
+            "https://proxy.example/v1/embeddings",
+        ),
+        ("APEX_COGNEE_EMBEDDING_MODEL", "embed-v1"),
+        ("APEX_COGNEE_EMBEDDING_DIMENSIONS", "1536"),
+    ]))
+    .expect("complete config");
+    let other_layout = StateLayout::under(PathBuf::from("/private/other-cognee"));
+    let generation = EmbeddingGeneration::new(
+        &other_layout,
+        "generation-001",
+        config.embedding.as_ref().expect("embedding"),
+    )
+    .expect("generation");
+
+    let error = match config.cognee_settings(&generation) {
+        Err(error) => error,
+        Ok(_) => panic!("cross-layout generation must be rejected"),
+    };
+
+    assert!(error.to_string().contains("private root"));
 }
 
 fn visit_paths(path: &Path, visitor: &mut impl FnMut(&Path)) {
