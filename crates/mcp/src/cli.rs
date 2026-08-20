@@ -31,6 +31,12 @@ pub fn run(cli: Cli) -> Result<(), AgentError> {
             .map_err(|_| AgentError::Unavailable("hook output"));
     }
 
+    #[cfg(feature = "engine")]
+    if matches!(cli.command, Command::Drain) {
+        crate::drain::run_drain_from_env(&crate::config::ProcessEnv)?;
+        return Ok(());
+    }
+
     let command = match cli.command {
         Command::Mcp => "mcp",
         Command::Hook => "hook",

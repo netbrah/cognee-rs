@@ -19,6 +19,8 @@ use crate::limits::ResourceLimits;
 use crate::scheduler::{ScheduledEvent, select_batch};
 use crate::spool::{ClaimedEvent, FailureDisposition, Spool};
 
+const CONTEXT_RECALL_QUERY: &str = "stable preferences decisions constraints and project facts";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FaultPoint {
     AfterApplyBeforeLedgerCommit,
@@ -622,8 +624,7 @@ impl Worker {
                         operation_deadline(deadline, self.limits.embedding_timeout_seconds),
                         "context_recall",
                         opened.recall(RecallRequest {
-                            query: "stable preferences decisions constraints and project facts"
-                                .to_owned(),
+                            query: CONTEXT_RECALL_QUERY.to_owned(),
                             dataset: dataset.clone(),
                             session_id: Some(session_id.clone()),
                             top_k: 10,
@@ -651,6 +652,40 @@ impl Worker {
                 report.failed += 1;
                 record_error(&mut report, &error);
                 break;
+            }
+            let bootstrap_recall = {
+                let Some(opened) = resources.engine.as_mut() else {
+                    report.failed += 1;
+                    record_error(&mut report, &AgentError::Engine("engine_missing"));
+                    break;
+                };
+                before_deadline(
+                    operation_deadline(deadline, self.limits.embedding_timeout_seconds),
+                    "bootstrap_recall",
+                    opened.recall(RecallRequest {
+                        query: CONTEXT_RECALL_QUERY.to_owned(),
+                        dataset: dataset.clone(),
+                        session_id: None,
+                        top_k: 10,
+                        search_type: Some("CHUNKS".to_owned()),
+                        auto_route: false,
+                    }),
+                )
+                .await
+            };
+            if let Err(error) = resources.verify_lease() {
+                report.failed += 1;
+                record_error(&mut report, &error);
+                break;
+            }
+            if let Ok(response) = bootstrap_recall {
+                let memory = response
+                    .items
+                    .into_iter()
+                    .map(|item| item.content)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let _ = self.context_cache.write_bootstrap(&dataset, &memory);
             }
             if let Err(error) = complete_checkpoint(&self.layout, &dataset) {
                 report.failed += 1;

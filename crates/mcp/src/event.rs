@@ -167,6 +167,28 @@ impl EventEnvelope {
             },
         }
     }
+
+    /// Return the idempotency key used at the Cognee storage boundary.
+    ///
+    /// APEX may deliver the terminal callback more than once with a new source
+    /// timestamp or cwd spelling each time. Keep those callbacks as distinct
+    /// audit events while collapsing their identical session-end effect in
+    /// Cognee. The payload hash still distinguishes materially different
+    /// terminal reasons.
+    pub fn external_event_id(&self) -> String {
+        match self.event {
+            EventKind::SessionEnd => deterministic_event_id(
+                self.schema_version,
+                &self.session_id,
+                self.event.as_str(),
+                "",
+                "",
+                self.dataset_generation,
+                &self.payload_hash,
+            ),
+            _ => self.event_id.clone(),
+        }
+    }
 }
 
 pub fn canonical_json(value: &Value) -> String {

@@ -23,7 +23,7 @@ pub enum ApplyPlan {
 }
 
 pub fn plan_event_application(event: &EventEnvelope) -> Result<ApplyPlan, AgentError> {
-    let external_options = || json!({"externalEventId": event.event_id});
+    let external_options = || json!({"externalEventId": event.external_event_id()});
     let trace =
         |origin_function: &str, method_params: Value, method_return_value: Option<Value>| {
             let mut entry = json!({
@@ -177,7 +177,8 @@ pub trait MemoryEngine: Send {
     async fn contains_event(&mut self, dataset: &str, event_id: &str) -> Result<bool, AgentError>;
 
     async fn contains_event_for(&mut self, event: &EventEnvelope) -> Result<bool, AgentError> {
-        self.contains_event(&event.dataset, &event.event_id).await
+        self.contains_event(&event.dataset, &event.external_event_id())
+            .await
     }
 
     async fn apply_event(&mut self, event: &EventEnvelope) -> Result<ApplyReceipt, AgentError>;
@@ -259,7 +260,7 @@ impl MemoryEngine for CogneeMemoryEngine {
             &self.state,
             &event.dataset,
             session_id,
-            &event.event_id,
+            &event.external_event_id(),
         )
         .await
         .map_err(classify_sdk_error)

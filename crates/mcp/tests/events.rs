@@ -212,6 +212,44 @@ fn source_timestamp_is_preserved_exactly_and_timestamp_or_generation_changes_id(
 }
 
 #[test]
+fn repeated_session_end_callbacks_share_one_external_idempotency_key() {
+    let session_end = |timestamp: &str, cwd: &str, reason: &str| {
+        envelope(
+            serde_json::to_vec(&json!({
+                "session_id": "479b2310-764a-4b3d-9c48-ad2dc754ebc4",
+                "transcript_path": "/tmp/transcript.jsonl",
+                "cwd": cwd,
+                "hook_event_name": "SessionEnd",
+                "timestamp": timestamp,
+                "reason": reason
+            }))
+            .unwrap()
+            .as_slice(),
+            1,
+        )
+    };
+    let first = session_end("2026-08-20T04:26:26.588Z", "/opt/apex_tracking", "exit");
+    let second = session_end("2026-08-20T04:26:26.953Z", "/opt/apex_tracking", "exit");
+    let third = session_end("2026-08-20T04:26:27.383Z", "/other/spelling", "exit");
+    let different_reason = session_end("2026-08-20T04:26:27.383Z", "/opt/apex_tracking", "logout");
+
+    assert_ne!(first.event_id, second.event_id);
+    assert_ne!(second.event_id, third.event_id);
+    assert_eq!(first.external_event_id(), second.external_event_id());
+    assert_eq!(second.external_event_id(), third.external_event_id());
+    assert_ne!(
+        third.external_event_id(),
+        different_reason.external_event_id()
+    );
+
+    let before_agent = envelope(
+        br#"{"session_id":"s","transcript_path":"t","cwd":"c","hook_event_name":"BeforeAgent","timestamp":"2026-08-20T04:26:26.588Z","prompt":"p"}"#,
+        1,
+    );
+    assert_eq!(before_agent.external_event_id(), before_agent.event_id);
+}
+
+#[test]
 fn payload_limits_are_bytes_and_never_split_utf8() {
     let prompt = "é".repeat(20_000);
     let response = "🙂".repeat(10_000);

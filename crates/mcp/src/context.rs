@@ -63,8 +63,15 @@ impl ContextCache {
     }
 
     pub fn read(&self, session_id: &str) -> Result<Option<String>, ContextError> {
+        self.read_path(self.session_path(session_id))
+    }
+
+    pub fn read_bootstrap(&self, dataset: &str) -> Result<Option<String>, ContextError> {
+        self.read_path(self.bootstrap_path(dataset))
+    }
+
+    fn read_path(&self, path: PathBuf) -> Result<Option<String>, ContextError> {
         self.layout.ensure_private()?;
-        let path = self.path(session_id);
         let file = match File::open(path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -82,10 +89,18 @@ impl ContextCache {
     }
 
     pub fn write(&self, session_id: &str, memory: &str) -> Result<(), ContextError> {
+        self.write_path(self.session_path(session_id), memory)
+    }
+
+    pub fn write_bootstrap(&self, dataset: &str, memory: &str) -> Result<(), ContextError> {
+        self.write_path(self.bootstrap_path(dataset), memory)
+    }
+
+    fn write_path(&self, path: PathBuf, memory: &str) -> Result<(), ContextError> {
         self.layout.ensure_private()?;
         let rendered = sanitize_cached_memory(memory);
         write_atomic(
-            &self.path(session_id),
+            &path,
             rendered.as_bytes(),
             ReplaceMode::Replace,
             self.sync.as_ref(),
@@ -93,11 +108,18 @@ impl ContextCache {
         Ok(())
     }
 
-    fn path(&self, session_id: &str) -> PathBuf {
+    fn session_path(&self, session_id: &str) -> PathBuf {
         let digest = lowercase_hex(&Sha256::digest(session_id.as_bytes()));
         self.layout
             .context
             .join(format!("{digest}{CACHE_FILE_SUFFIX}"))
+    }
+
+    fn bootstrap_path(&self, dataset: &str) -> PathBuf {
+        let digest = lowercase_hex(&Sha256::digest(dataset.as_bytes()));
+        self.layout
+            .context
+            .join(format!("bootstrap-{digest}{CACHE_FILE_SUFFIX}"))
     }
 }
 

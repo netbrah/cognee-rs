@@ -919,7 +919,7 @@ impl MemoryEngine for DurableEngine {
             .applied
             .lock()
             .expect("applied lock")
-            .insert(event.event_id.clone());
+            .insert(event.external_event_id());
         Ok(ApplyReceipt::new(Some("durable-entry".to_owned())))
     }
 
@@ -1001,6 +1001,71 @@ async fn crash_after_apply_restarts_through_contains_without_duplicate_apply() {
     assert_eq!(spool_depths(&layout), (0, 0));
     assert_eq!(
         ledger_state(&layout, &event.event_id),
+        IngestionState::Committed
+    );
+}
+
+#[tokio::test]
+async fn repeated_session_end_callbacks_apply_one_external_effect() {
+    let temporary = tempdir().expect("temporary root");
+    let layout = StateLayout::under(temporary.path().join("cognee"));
+    let limits = ResourceLimits::default();
+    let mut first = event_with_payload(
+        "1",
+        EventKind::SessionEnd,
+        serde_json::json!({"reason": "exit"}),
+    );
+    first.timestamp = "2026-08-20T04:26:26.588Z".to_owned();
+    let mut second = event_with_payload(
+        "2",
+        EventKind::SessionEnd,
+        serde_json::json!({"reason": "exit"}),
+    );
+    second.timestamp = "2026-08-20T04:26:26.953Z".to_owned();
+    second.cwd = "/same-workspace-via-a-different-spelling".to_owned();
+    let mut different_reason = event_with_payload(
+        "3",
+        EventKind::SessionEnd,
+        serde_json::json!({"reason": "logout"}),
+    );
+    different_reason.timestamp = "2026-08-20T04:26:27.383Z".to_owned();
+    different_reason.payload_hash = "e".repeat(64);
+    let spool = Spool::new(layout.clone(), limits.clone());
+    spool
+        .enqueue(&first, Priority::Normal)
+        .expect("enqueue first terminal callback");
+    spool
+        .enqueue(&second, Priority::Normal)
+        .expect("enqueue repeated terminal callback");
+    spool
+        .enqueue(&different_reason, Priority::Normal)
+        .expect("enqueue distinct terminal callback");
+    let engine_state = Arc::new(DurableEngineState::default());
+    let factory = Arc::new(DurableFactory {
+        state: engine_state.clone(),
+    });
+
+    let report = worker_for(&layout, &limits, factory)
+        .drain(DrainBudget::from_limits(&limits))
+        .await;
+
+    assert_eq!(report.committed, 3);
+    assert_eq!(
+        *engine_state.apply_calls.lock().expect("apply calls lock"),
+        2
+    );
+    assert_eq!(engine_state.applied.lock().expect("applied lock").len(), 2);
+    assert_eq!(spool_depths(&layout), (0, 0));
+    assert_eq!(
+        ledger_state(&layout, &first.event_id),
+        IngestionState::Committed
+    );
+    assert_eq!(
+        ledger_state(&layout, &second.event_id),
+        IngestionState::Committed
+    );
+    assert_eq!(
+        ledger_state(&layout, &different_reason.event_id),
         IngestionState::Committed
     );
 }
@@ -1320,13 +1385,19 @@ fn maps_every_event_to_the_exact_binding_payload_and_external_event_key() {
     for (kind, payload, expected_entry) in cases {
         let event = event_with_payload("c", kind, payload);
         let plan = plan_event_application(&event).expect("event plan");
+        let expected_external_event_id = match kind {
+            EventKind::SessionEnd => {
+                "cee436769a8e8c07fc24a3466f837b3ace7a5b0ae61b3b7316a74bd27543bf56".to_owned()
+            }
+            _ => "c".repeat(64),
+        };
         assert_eq!(
             plan,
             ApplyPlan::SessionEntry {
                 dataset: "agent_sessions".to_owned(),
                 session_id: "session-1".to_owned(),
                 entry: expected_entry,
-                options: serde_json::json!({"externalEventId": "c".repeat(64)}),
+                options: serde_json::json!({"externalEventId": expected_external_event_id}),
             },
             "{kind:?}"
         );
@@ -1376,6 +1447,42 @@ fn maps_every_event_to_the_exact_binding_payload_and_external_event_key() {
             }),
         }
     );
+}
+
+#[test]
+fn repeated_session_end_plans_use_one_external_event_key() {
+    let first = event_with_payload(
+        "1",
+        EventKind::SessionEnd,
+        serde_json::json!({"reason": "exit"}),
+    );
+    let second = event_with_payload(
+        "2",
+        EventKind::SessionEnd,
+        serde_json::json!({"reason": "exit"}),
+    );
+
+    let ApplyPlan::SessionEntry {
+        options: first_options,
+        ..
+    } = plan_event_application(&first).expect("first terminal plan")
+    else {
+        panic!("session end must map to a session entry")
+    };
+    let ApplyPlan::SessionEntry {
+        options: second_options,
+        ..
+    } = plan_event_application(&second).expect("second terminal plan")
+    else {
+        panic!("session end must map to a session entry")
+    };
+
+    assert_eq!(
+        first_options["externalEventId"],
+        second_options["externalEventId"]
+    );
+    assert_ne!(first_options["externalEventId"], first.event_id);
+    assert_ne!(second_options["externalEventId"], second.event_id);
 }
 
 fn event(id_digit: &str, kind: EventKind) -> EventEnvelope {

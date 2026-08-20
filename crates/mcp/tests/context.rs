@@ -124,6 +124,37 @@ fn cache_replace_is_atomic_and_a_failed_refresh_preserves_the_prior_value() {
     );
 }
 
+#[test]
+fn bootstrap_cache_is_dataset_scoped_and_domain_separated_from_sessions() {
+    let temporary = tempdir().expect("temporary root");
+    let layout = StateLayout::under(temporary.path().join("cognee"));
+    let cache = ContextCache::new(layout.clone());
+    let dataset = "../../agent_sessions";
+
+    cache
+        .write_bootstrap(dataset, "Stable preference: concise answers.")
+        .expect("write bootstrap context");
+
+    let rendered = cache
+        .read_bootstrap(dataset)
+        .expect("read bootstrap context")
+        .expect("bootstrap context");
+    assert!(rendered.contains("Stable preference: concise answers."));
+    assert!(cache.read(dataset).expect("session cache read").is_none());
+    let entries: Vec<_> = std::fs::read_dir(&layout.context)
+        .expect("context directory")
+        .collect::<Result<_, _>>()
+        .expect("context entries");
+    assert_eq!(entries.len(), 1);
+    assert!(
+        entries[0]
+            .file_name()
+            .to_string_lossy()
+            .starts_with("bootstrap-")
+    );
+    assert!(!temporary.path().join("agent_sessions").exists());
+}
+
 #[derive(Default)]
 struct RefreshState {
     improves: AtomicUsize,
@@ -235,13 +266,24 @@ async fn successful_improve_refreshes_each_session_with_fixed_non_generative_chu
     assert_eq!(report.failed, 0);
     assert_eq!(state.improves.load(Ordering::SeqCst), 1);
     let recalls = state.recalls.lock().expect("recall lock");
-    assert_eq!(recalls.len(), 1);
+    assert_eq!(recalls.len(), 2);
     assert_eq!(
         recalls[0],
         RecallRequest {
             query: "stable preferences decisions constraints and project facts".to_owned(),
             dataset: "agent_sessions".to_owned(),
             session_id: Some("session-refresh".to_owned()),
+            top_k: 10,
+            search_type: Some("CHUNKS".to_owned()),
+            auto_route: false,
+        }
+    );
+    assert_eq!(
+        recalls[1],
+        RecallRequest {
+            query: "stable preferences decisions constraints and project facts".to_owned(),
+            dataset: "agent_sessions".to_owned(),
+            session_id: None,
             top_k: 10,
             search_type: Some("CHUNKS".to_owned()),
             auto_route: false,
@@ -258,6 +300,12 @@ async fn successful_improve_refreshes_each_session_with_fixed_non_generative_chu
     assert_eq!(rendered.matches("</untrusted_memory>").count(), 1);
     assert!(!rendered.contains("[32m"));
     assert!(rendered.len() <= 16 * 1024);
+    let bootstrap = cache
+        .read_bootstrap("agent_sessions")
+        .expect("read bootstrap cache")
+        .expect("bootstrap cache");
+    assert!(bootstrap.contains("Stable preference: concise."));
+    assert_eq!(bootstrap.matches("<untrusted_memory>").count(), 1);
 }
 
 #[tokio::test]

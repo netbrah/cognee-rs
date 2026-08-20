@@ -160,32 +160,33 @@ impl AgentConfig {
         }
 
         let layout = &self.layout;
-        let mut settings = cognee::config::Settings::default();
-        settings.system_root_directory = layout.system.display().to_string();
-        settings.data_root_directory = generation.data().display().to_string();
-        settings.cache_root_directory = layout.cache.display().to_string();
-        settings.logs_root_directory = layout.status.join("logs").display().to_string();
-        settings.db_provider = "sqlite".into();
-        settings.relational_db_url = generation.sqlite_url();
-        settings.vector_db_provider = "lancedb".into();
-        settings.vector_db_url = generation.vector().display().to_string();
-        settings.graph_database_provider = "ladybug".into();
-        settings.graph_file_path = generation.graph().display().to_string();
-        settings.cache_backend = "seaorm".into();
-        settings.default_dataset_name = self.dataset.clone();
-        settings.llm_provider = self.llm.provider.clone();
-        settings.llm_model = self.llm.model.clone();
-        settings.llm_endpoint = self.llm.endpoint.clone();
-        settings.llm_api_key = self.proxy_key.expose().to_owned();
-        settings.llm_max_parallel_requests = 1;
-        settings.llm_max_retries = 0;
-        settings.embedding_provider = embedding.provider.clone();
-        settings.embedding_model_name = embedding.model.clone();
-        settings.embedding_dimensions = embedding.dimensions;
-        settings.embedding_endpoint = embedding.endpoint.clone();
-        settings.embedding_api_key = self.proxy_key.expose().to_owned();
-        settings.embedding_batch_size = self.limits.embedding_batch_size;
-        Ok(settings)
+        Ok(cognee::config::Settings {
+            system_root_directory: layout.system.display().to_string(),
+            data_root_directory: generation.data().display().to_string(),
+            cache_root_directory: layout.cache.display().to_string(),
+            logs_root_directory: layout.status.join("logs").display().to_string(),
+            db_provider: "sqlite".into(),
+            relational_db_url: generation.sqlite_url(),
+            vector_db_provider: "lancedb".into(),
+            vector_db_url: generation.vector().display().to_string(),
+            graph_database_provider: "ladybug".into(),
+            graph_file_path: generation.graph().display().to_string(),
+            cache_backend: "seaorm".into(),
+            default_dataset_name: self.dataset.clone(),
+            llm_provider: self.llm.provider.clone(),
+            llm_model: self.llm.model.clone(),
+            llm_endpoint: self.llm.endpoint.clone(),
+            llm_api_key: self.proxy_key.expose().to_owned(),
+            llm_max_parallel_requests: 1,
+            llm_max_retries: 0,
+            embedding_provider: embedding.provider.clone(),
+            embedding_model_name: embedding.model.clone(),
+            embedding_dimensions: embedding.dimensions,
+            embedding_endpoint: embedding.endpoint.clone(),
+            embedding_api_key: self.proxy_key.expose().to_owned(),
+            embedding_batch_size: self.limits.embedding_batch_size,
+            ..Default::default()
+        })
     }
 }
 

@@ -154,7 +154,12 @@ pub fn run_hook_with<R: Read, W: Write, E: Write>(
     };
 
     let response = if matches!(event, HookEvent::SessionStart | HookEvent::BeforeAgent) {
-        match ContextCache::new(services.config.layout.clone()).read(&session_id) {
+        let cache = ContextCache::new(services.config.layout.clone());
+        let cached = cache.read(&session_id).and_then(|context| match context {
+            Some(context) => Ok(Some(context)),
+            None => cache.read_bootstrap(&services.config.dataset),
+        });
+        match cached {
             Ok(Some(context)) => HookResponse::with_context(event, context),
             Ok(None) => HookResponse::capture(),
             Err(_) => {

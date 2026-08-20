@@ -329,6 +329,35 @@ fn missing_cache_is_normal_and_capture_does_not_require_graph_model_or_embedding
 }
 
 #[test]
+fn fresh_session_injection_falls_back_to_the_bounded_user_bootstrap_cache() {
+    let temporary = tempdir().expect("temporary root");
+    let spawner = Arc::new(RecordingDrainSpawner::default());
+    let services = services(temporary.path(), 50, spawner);
+    ContextCache::new(services.config().layout.clone())
+        .write_bootstrap(
+            "agent_sessions",
+            "Stable preference: give concise evidence-backed answers.",
+        )
+        .expect("write user bootstrap cache");
+
+    for event in ["SessionStart", "BeforeAgent"] {
+        let mut value = fixture(event, TIMESTAMP);
+        value["session_id"] = json!(format!("fresh-{event}"));
+        let raw = serde_json::to_vec(&value).expect("fixture JSON");
+        let (stdout, stderr, result) = run(&services, raw.as_slice());
+        result.expect("fresh-session hook");
+        assert!(stderr.is_empty());
+        let response = one_json_object(&stdout);
+        let context = response["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("bootstrap context");
+        assert!(context.contains("Stable preference: give concise evidence-backed answers."));
+        assert_eq!(context.matches("<untrusted_memory>").count(), 1);
+        assert_eq!(context.matches("</untrusted_memory>").count(), 1);
+    }
+}
+
+#[test]
 fn detached_drain_policy_is_bounded_and_stdout_is_flushed_before_launch() {
     let temporary = tempdir().expect("temporary root");
     let spawner = Arc::new(RecordingDrainSpawner::default());
