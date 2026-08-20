@@ -133,6 +133,8 @@ pub struct Settings {
     pub llm_api_key: String,
     pub llm_endpoint: String,
     pub llm_api_version: String,
+    /// Optional caller identity sent on proxy-bound HTTP requests.
+    pub user_agent: String,
     /// Reasoning-model detection override (`LLM_REASONING`): `auto` (default,
     /// name/host auto-detection), `always` (force the reasoning parameter shape),
     /// or `never` (force the legacy `max_tokens`+sampling shape). Lets an operator
@@ -833,6 +835,7 @@ impl Settings {
                 dimensions: self.embedding_dimensions as usize,
                 endpoint,
                 api_key,
+                user_agent: (!self.user_agent.trim().is_empty()).then(|| self.user_agent.clone()),
                 batch_size: self.embedding_batch_size as usize,
                 mock,
                 mock_deterministic,
@@ -851,6 +854,7 @@ impl Settings {
                 model: self.llm_model.clone(),
                 api_key: self.llm_api_key.clone(),
                 endpoint: self.llm_endpoint.clone(),
+                user_agent: (!self.user_agent.trim().is_empty()).then(|| self.user_agent.clone()),
                 anthropic_base_url: cognee_components::anthropic_base_url_from_env(),
                 max_retries: self.llm_max_retries,
                 max_completion_tokens: self.llm_max_completion_tokens,
@@ -1085,6 +1089,7 @@ impl Default for Settings {
             llm_api_key: String::new(),
             llm_endpoint: String::new(),
             llm_api_version: String::new(),
+            user_agent: String::new(),
             llm_reasoning: "auto".to_string(),
             llm_temperature: 0.0,
             llm_streaming: false,

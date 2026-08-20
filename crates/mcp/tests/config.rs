@@ -446,6 +446,7 @@ fn graph_settings_require_complete_models_and_project_explicitly() {
     assert_eq!(settings.llm_model, "gpt-5.4-nano");
     assert_eq!(settings.llm_endpoint, "https://proxy.example/v1");
     assert_eq!(settings.llm_api_key, "settings-secret");
+    assert!(settings.user_agent.starts_with("Apex/"));
     assert_eq!(settings.llm_max_parallel_requests, 1);
     assert_eq!(settings.llm_max_retries, 0);
     assert_eq!(settings.embedding_provider, "openai");
@@ -457,6 +458,15 @@ fn graph_settings_require_complete_models_and_project_explicitly() {
     );
     assert_eq!(settings.embedding_api_key, "settings-secret");
     assert_eq!(settings.embedding_batch_size, 64);
+    let backend = settings.backend_context();
+    assert_eq!(
+        backend.llm.user_agent.as_deref(),
+        Some(settings.user_agent.as_str())
+    );
+    assert_eq!(
+        backend.embedding.user_agent.as_deref(),
+        Some(settings.user_agent.as_str())
+    );
 }
 
 #[test]

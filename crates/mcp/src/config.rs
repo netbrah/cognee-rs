@@ -177,6 +177,7 @@ impl AgentConfig {
             llm_model: self.llm.model.clone(),
             llm_endpoint: self.llm.endpoint.clone(),
             llm_api_key: self.proxy_key.expose().to_owned(),
+            user_agent: apex_user_agent(),
             llm_max_parallel_requests: 1,
             llm_max_retries: 0,
             embedding_provider: embedding.provider.clone(),
@@ -188,6 +189,16 @@ impl AgentConfig {
             ..Default::default()
         })
     }
+}
+
+#[cfg(feature = "engine")]
+fn apex_user_agent() -> String {
+    format!(
+        "Apex/{} ({}; {})",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    )
 }
 
 impl fmt::Debug for ModelConfig {
