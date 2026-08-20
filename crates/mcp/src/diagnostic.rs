@@ -106,7 +106,10 @@ mod tests {
             "searchTypeUsed": "CHUNKS",
         }));
 
-        let parsed: serde_json::Value = serde_json::from_str(&output).expect("diagnostic JSON");
+        let parsed: serde_json::Value = match serde_json::from_str(&output) {
+            Ok(parsed) => parsed,
+            Err(error) => panic!("diagnostic JSON: {error}"),
+        };
         assert_eq!(parsed["ok"], true);
         assert_eq!(parsed["result"]["searchTypeUsed"], "CHUNKS");
         assert!(output.contains("[REDACTED]"));
@@ -123,7 +126,10 @@ mod tests {
         let AgentError::Diagnostic(output) = error else {
             panic!("expected diagnostic error")
         };
-        let parsed: serde_json::Value = serde_json::from_str(&output).expect("diagnostic JSON");
+        let parsed: serde_json::Value = match serde_json::from_str(&output) {
+            Ok(parsed) => parsed,
+            Err(error) => panic!("diagnostic JSON: {error}"),
+        };
         assert_eq!(parsed["ok"], false);
         assert_eq!(parsed["code"], "RUNTIME_ERROR");
         assert!(output.contains("[REDACTED]"));
