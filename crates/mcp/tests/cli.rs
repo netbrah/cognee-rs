@@ -1,5 +1,5 @@
 use clap::Parser;
-use cognee_mcp::cli::Cli;
+use cognee_mcp::cli::{Cli, Command};
 
 #[test]
 fn parses_all_five_top_level_commands() {
@@ -8,6 +8,38 @@ fn parses_all_five_top_level_commands() {
             Cli::try_parse_from(["cognee-agent", command]).is_ok(),
             "{command}"
         );
+    }
+}
+
+#[test]
+fn parses_read_only_recall_diagnostic_arguments() {
+    let cli = Cli::try_parse_from([
+        "cognee-agent",
+        "recall",
+        "--query",
+        "stable preferences",
+        "--session-id",
+        "session-123",
+        "--search-type",
+        "CHUNKS",
+        "--top-k",
+        "7",
+    ])
+    .expect("parse recall diagnostic");
+
+    match cli.command {
+        Command::Recall {
+            query,
+            session_id,
+            search_type,
+            top_k,
+        } => {
+            assert_eq!(query, "stable preferences");
+            assert_eq!(session_id.as_deref(), Some("session-123"));
+            assert_eq!(search_type, "CHUNKS");
+            assert_eq!(top_k, 7);
+        }
+        command => panic!("expected recall command, got {command:?}"),
     }
 }
 

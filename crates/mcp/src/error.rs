@@ -18,6 +18,8 @@ pub enum AgentError {
     Retryable(&'static str),
     #[error("blocked memory engine failure: {0}")]
     Blocked(&'static str),
+    #[error("{0}")]
+    Diagnostic(String),
     #[cfg(feature = "runtime")]
     #[error(transparent)]
     Lease(#[from] crate::lease::LeaseError),
@@ -40,6 +42,7 @@ impl AgentError {
             Self::Timeout(_) => "timeout",
             Self::Checkpoint(_) => "checkpoint",
             Self::Retryable(class) | Self::Blocked(class) => class,
+            Self::Diagnostic(_) => "diagnostic",
             #[cfg(feature = "runtime")]
             Self::Lease(crate::lease::LeaseError::LeaseLost) => "lease_lost",
             #[cfg(feature = "runtime")]

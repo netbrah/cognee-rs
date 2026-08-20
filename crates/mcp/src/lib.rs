@@ -7,6 +7,7 @@ pub mod config;
 pub mod context;
 #[cfg(feature = "runtime")]
 pub mod detach;
+pub mod diagnostic;
 #[cfg(feature = "engine")]
 pub mod drain;
 pub mod embedding_generation;

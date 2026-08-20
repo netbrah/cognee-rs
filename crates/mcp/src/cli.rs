@@ -16,6 +16,16 @@ pub enum Command {
     Mcp,
     Hook,
     Drain,
+    Recall {
+        #[arg(long)]
+        query: String,
+        #[arg(long)]
+        session_id: Option<String>,
+        #[arg(long, default_value = "CHUNKS")]
+        search_type: String,
+        #[arg(long, default_value_t = 10)]
+        top_k: usize,
+    },
     Doctor,
     Recover,
 }
@@ -37,10 +47,28 @@ pub fn run(cli: Cli) -> Result<(), AgentError> {
         return Ok(());
     }
 
+    #[cfg(feature = "engine")]
+    if let Command::Recall {
+        query,
+        session_id,
+        search_type,
+        top_k,
+    } = &cli.command
+    {
+        return crate::diagnostic::run_recall_from_env(
+            &crate::config::ProcessEnv,
+            query,
+            session_id.as_deref(),
+            search_type,
+            *top_k,
+        );
+    }
+
     let command = match cli.command {
         Command::Mcp => "mcp",
         Command::Hook => "hook",
         Command::Drain => "drain",
+        Command::Recall { .. } => "recall",
         Command::Doctor => "doctor",
         Command::Recover => "recover",
     };
