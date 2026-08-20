@@ -4,6 +4,8 @@ pub mod atomic_fs;
 pub mod cli;
 pub mod config;
 pub mod embedding_generation;
+pub mod engine;
+pub mod error;
 pub mod event;
 pub mod generation;
 pub mod hook_input;
@@ -19,3 +21,5 @@ pub mod redact;
 pub mod scheduler;
 pub mod secret;
 pub mod spool;
+#[cfg(feature = "runtime")]
+pub mod worker;

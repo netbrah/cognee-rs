@@ -1,7 +1,8 @@
 //! Command-line surface for the Cognee agent.
 
 use clap::{Parser, Subcommand};
-use thiserror::Error;
+
+pub use crate::error::AgentError;
 
 #[derive(Debug, Parser)]
 #[command(name = "cognee-agent", about = "Cognee MCP agent")]
@@ -17,12 +18,6 @@ pub enum Command {
     Drain,
     Doctor,
     Recover,
-}
-
-#[derive(Debug, Error)]
-pub enum AgentError {
-    #[error("{0} is not available in this build")]
-    Unavailable(&'static str),
 }
 
 /// Dispatch one agent command.
