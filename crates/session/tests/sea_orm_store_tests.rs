@@ -501,6 +501,7 @@ async fn session_manager_graph_context_round_trip() {
 fn make_step(trace_id: &str, origin: &str) -> SessionTraceStep {
     SessionTraceStep {
         trace_id: trace_id.to_string(),
+        external_event_id: None,
         origin_function: origin.to_string(),
         status: "success".to_string(),
         memory_query: "q?".to_string(),

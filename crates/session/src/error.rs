@@ -8,4 +8,7 @@ pub enum SessionError {
 
     #[error("invalid parameter: {0}")]
     InvalidParameter(String),
+
+    #[error("external event conflict for '{event_id}': {reason}")]
+    ExternalEventConflict { event_id: String, reason: String },
 }
