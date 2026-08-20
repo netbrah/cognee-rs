@@ -22,9 +22,15 @@ pub enum Command {
 
 /// Dispatch one agent command.
 ///
-/// The command surface is intentionally established before command runtimes
-/// are introduced; each command reports that it is unavailable to the caller.
+/// Hook capture is available in runtime builds. The remaining command
+/// runtimes retain their stable placeholder errors until their planned tasks.
 pub fn run(cli: Cli) -> Result<(), AgentError> {
+    #[cfg(feature = "runtime")]
+    if matches!(cli.command, Command::Hook) {
+        return crate::hook::run_hook(std::io::stdin().lock(), std::io::stdout().lock())
+            .map_err(|_| AgentError::Unavailable("hook output"));
+    }
+
     let command = match cli.command {
         Command::Mcp => "mcp",
         Command::Hook => "hook",

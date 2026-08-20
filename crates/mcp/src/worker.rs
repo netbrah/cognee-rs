@@ -8,7 +8,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::atomic_fs::{ReplaceMode, SystemSyncOps, write_atomic};
-use crate::engine::{EngineFactory, MemoryEngine};
+use crate::context::ContextCache;
+use crate::engine::{EngineFactory, MemoryEngine, RecallRequest};
 use crate::error::AgentError;
 use crate::event::{EventEnvelope, EventKind, canonical_json};
 use crate::layout::StateLayout;
@@ -140,6 +141,7 @@ pub struct Worker {
     engine_factory: Arc<dyn EngineFactory>,
     runtime: Arc<dyn WorkerRuntime>,
     token_estimator: Arc<dyn TokenEstimator>,
+    context_cache: ContextCache,
     limits: ResourceLimits,
 }
 
@@ -215,6 +217,7 @@ impl Worker {
         engine_factory: Arc<dyn EngineFactory>,
         limits: ResourceLimits,
     ) -> Self {
+        let context_cache = ContextCache::new(layout.clone());
         Self {
             layout,
             spool,
@@ -223,6 +226,7 @@ impl Worker {
             engine_factory,
             runtime: Arc::new(SystemWorkerRuntime),
             token_estimator: Arc::new(ConservativeTokenEstimator),
+            context_cache,
             limits,
         }
     }
@@ -234,6 +238,11 @@ impl Worker {
 
     pub fn with_token_estimator(mut self, token_estimator: Arc<dyn TokenEstimator>) -> Self {
         self.token_estimator = token_estimator;
+        self
+    }
+
+    pub fn with_context_cache(mut self, context_cache: ContextCache) -> Self {
+        self.context_cache = context_cache;
         self
     }
 
@@ -595,6 +604,50 @@ impl Worker {
                 }
             }
             if let Err(error) = resources.verify_lease() {
+                report.failed += 1;
+                record_error(&mut report, &error);
+                break;
+            }
+            let mut context_fence_error = None;
+            for session_id in &session_ids {
+                if let Err(error) = resources.verify_lease() {
+                    context_fence_error = Some(error);
+                    break;
+                }
+                let recall = {
+                    let Some(opened) = resources.engine.as_mut() else {
+                        break;
+                    };
+                    before_deadline(
+                        operation_deadline(deadline, self.limits.embedding_timeout_seconds),
+                        "context_recall",
+                        opened.recall(RecallRequest {
+                            query: "stable preferences decisions constraints and project facts"
+                                .to_owned(),
+                            dataset: dataset.clone(),
+                            session_id: Some(session_id.clone()),
+                            top_k: 10,
+                            search_type: Some("CHUNKS".to_owned()),
+                            auto_route: false,
+                        }),
+                    )
+                    .await
+                };
+                if let Err(error) = resources.verify_lease() {
+                    context_fence_error = Some(error);
+                    break;
+                }
+                if let Ok(response) = recall {
+                    let memory = response
+                        .items
+                        .into_iter()
+                        .map(|item| item.content)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let _ = self.context_cache.write(session_id, &memory);
+                }
+            }
+            if let Some(error) = context_fence_error {
                 report.failed += 1;
                 record_error(&mut report, &error);
                 break;

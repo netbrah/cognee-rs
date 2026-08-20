@@ -278,7 +278,7 @@ impl MemoryEngine for CheckpointEngine {
         &mut self,
         _request: RecallRequest,
     ) -> Result<RecallResponse, cognee_mcp::error::AgentError> {
-        panic!("recall is not part of a drain")
+        Ok(RecallResponse::default())
     }
 
     async fn forget(

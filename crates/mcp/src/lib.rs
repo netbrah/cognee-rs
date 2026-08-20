@@ -3,11 +3,17 @@
 pub mod atomic_fs;
 pub mod cli;
 pub mod config;
+#[cfg(feature = "runtime")]
+pub mod context;
+#[cfg(feature = "runtime")]
+pub mod detach;
 pub mod embedding_generation;
 pub mod engine;
 pub mod error;
 pub mod event;
 pub mod generation;
+#[cfg(feature = "runtime")]
+pub mod hook;
 pub mod hook_input;
 pub mod layout;
 #[cfg(feature = "runtime")]
