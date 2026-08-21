@@ -10,6 +10,7 @@ use cognee_mcp::engine::{
     MemoryEngine, RecallRequest, RecallResponse, plan_event_application,
 };
 use cognee_mcp::event::{CaptureMetadata, EventEnvelope, EventKind};
+use cognee_mcp::generation::GenerationStore;
 use cognee_mcp::layout::StateLayout;
 use cognee_mcp::lease::EngineLease;
 use cognee_mcp::ledger::{IngestionState, Ledger};
@@ -1003,6 +1004,228 @@ async fn crash_after_apply_restarts_through_contains_without_duplicate_apply() {
         ledger_state(&layout, &event.event_id),
         IngestionState::Committed
     );
+}
+
+#[tokio::test]
+async fn late_event_from_a_superseded_generation_is_quarantined_without_engine_calls() {
+    let temporary = tempdir().expect("temporary root");
+    let layout = StateLayout::under(temporary.path().join("cognee"));
+    let limits = ResourceLimits::default();
+    let spool = Spool::new(layout.clone(), limits.clone());
+    GenerationStore::new(layout.clone())
+        .advance_and_quarantine("agent_sessions", &spool)
+        .expect("advance generation");
+    let stale = event("9", EventKind::BeforeAgent);
+    spool
+        .enqueue(&stale, Priority::Normal)
+        .expect("enqueue late stale event");
+    let engine_state = Arc::new(DurableEngineState::default());
+    let factory = Arc::new(DurableFactory {
+        state: engine_state.clone(),
+    });
+
+    let report = worker_for(&layout, &limits, factory)
+        .drain(DrainBudget::from_limits(&limits))
+        .await;
+
+    assert_eq!(report.committed, 0);
+    assert_eq!(report.quarantined, 1);
+    assert_eq!(report.failed, 0);
+    assert_eq!(*engine_state.apply_calls.lock().expect("apply calls"), 0);
+    assert_eq!(
+        *engine_state.contains_calls.lock().expect("contains calls"),
+        0
+    );
+    assert_eq!(*engine_state.close_calls.lock().expect("close calls"), 0);
+    assert!(
+        Ledger::open(layout.clone())
+            .expect("inspect ledger")
+            .state(&stale.event_id)
+            .expect("read ledger")
+            .is_none()
+    );
+    let superseded = layout.spool_failed.join("superseded/generation-0");
+    let quarantined = std::fs::read_dir(superseded)
+        .expect("superseded directory")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("superseded entries");
+    assert_eq!(quarantined.len(), 1);
+}
+
+struct GenerationAdvancingFactory {
+    layout: StateLayout,
+    limits: ResourceLimits,
+    state: Arc<DurableEngineState>,
+    point: GenerationAdvancePoint,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GenerationAdvancePoint {
+    Open,
+    Apply,
+}
+
+#[async_trait]
+impl EngineFactory for GenerationAdvancingFactory {
+    async fn open(&self) -> Result<Box<dyn MemoryEngine>, cognee_mcp::error::AgentError> {
+        if self.point == GenerationAdvancePoint::Open {
+            advance_generation(&self.layout, &self.limits);
+        }
+        Ok(Box::new(GenerationAdvancingEngine {
+            layout: self.layout.clone(),
+            limits: self.limits.clone(),
+            state: self.state.clone(),
+            point: self.point,
+        }))
+    }
+}
+
+struct GenerationAdvancingEngine {
+    layout: StateLayout,
+    limits: ResourceLimits,
+    state: Arc<DurableEngineState>,
+    point: GenerationAdvancePoint,
+}
+
+#[async_trait]
+impl MemoryEngine for GenerationAdvancingEngine {
+    async fn contains_event(
+        &mut self,
+        _dataset: &str,
+        _event_id: &str,
+    ) -> Result<bool, cognee_mcp::error::AgentError> {
+        *self.state.contains_calls.lock().expect("contains calls") += 1;
+        Ok(false)
+    }
+
+    async fn apply_event(
+        &mut self,
+        _event: &EventEnvelope,
+    ) -> Result<ApplyReceipt, cognee_mcp::error::AgentError> {
+        *self.state.apply_calls.lock().expect("apply calls") += 1;
+        if self.point == GenerationAdvancePoint::Apply {
+            advance_generation(&self.layout, &self.limits);
+        }
+        Ok(ApplyReceipt::new(Some("generation-race-entry".to_owned())))
+    }
+
+    async fn improve(
+        &mut self,
+        _dataset: &str,
+        _session_ids: &[String],
+    ) -> Result<ImproveReceipt, cognee_mcp::error::AgentError> {
+        panic!("checkpoint is not due")
+    }
+
+    async fn recall(
+        &mut self,
+        _request: RecallRequest,
+    ) -> Result<RecallResponse, cognee_mcp::error::AgentError> {
+        panic!("recall is not part of a drain")
+    }
+
+    async fn forget(
+        &mut self,
+        _target: ForgetTarget,
+    ) -> Result<ForgetReceipt, cognee_mcp::error::AgentError> {
+        panic!("forget is not part of a drain")
+    }
+
+    async fn close(self: Box<Self>) {
+        *self.state.close_calls.lock().expect("close calls") += 1;
+    }
+}
+
+fn advance_generation(layout: &StateLayout, limits: &ResourceLimits) {
+    let spool = Spool::new(layout.clone(), limits.clone());
+    GenerationStore::new(layout.clone())
+        .advance_and_quarantine("agent_sessions", &spool)
+        .expect("advance generation during engine operation");
+}
+
+#[tokio::test]
+async fn generation_change_after_engine_open_blocks_apply_and_commit() {
+    let temporary = tempdir().expect("temporary root");
+    let layout = StateLayout::under(temporary.path().join("cognee"));
+    let limits = ResourceLimits::default();
+    let stale = event("8", EventKind::BeforeAgent);
+    Spool::new(layout.clone(), limits.clone())
+        .enqueue(&stale, Priority::Normal)
+        .expect("enqueue event");
+    let engine_state = Arc::new(DurableEngineState::default());
+    let factory = Arc::new(GenerationAdvancingFactory {
+        layout: layout.clone(),
+        limits: limits.clone(),
+        state: engine_state.clone(),
+        point: GenerationAdvancePoint::Open,
+    });
+
+    let report = worker_for(&layout, &limits, factory)
+        .drain(DrainBudget::from_limits(&limits))
+        .await;
+
+    assert_eq!(report.committed, 0);
+    assert_eq!(report.quarantined, 1);
+    assert_eq!(report.failed, 0);
+    assert_eq!(*engine_state.apply_calls.lock().expect("apply calls"), 0);
+    assert_eq!(
+        *engine_state.contains_calls.lock().expect("contains calls"),
+        1
+    );
+    assert_ne!(
+        ledger_state(&layout, &stale.event_id),
+        IngestionState::Committed
+    );
+    assert_eq!(
+        std::fs::read_dir(layout.spool_failed.join("superseded/generation-0"))
+            .expect("superseded directory")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn generation_change_after_apply_stops_before_a_second_dataset_event() {
+    let temporary = tempdir().expect("temporary root");
+    let layout = StateLayout::under(temporary.path().join("cognee"));
+    let limits = ResourceLimits::default();
+    let stale = event("5", EventKind::BeforeAgent);
+    let mut second = event("6", EventKind::BeforeAgent);
+    second.dataset = "project_notes".to_owned();
+    let spool = Spool::new(layout.clone(), limits.clone());
+    spool
+        .enqueue(&stale, Priority::Normal)
+        .expect("enqueue event");
+    spool
+        .enqueue(&second, Priority::Normal)
+        .expect("enqueue second dataset event");
+    let engine_state = Arc::new(DurableEngineState::default());
+    let factory = Arc::new(GenerationAdvancingFactory {
+        layout: layout.clone(),
+        limits: limits.clone(),
+        state: engine_state.clone(),
+        point: GenerationAdvancePoint::Apply,
+    });
+
+    let report = worker_for(&layout, &limits, factory)
+        .drain(DrainBudget::from_limits(&limits))
+        .await;
+
+    assert_eq!(report.committed, 0);
+    assert_eq!(report.quarantined, 1);
+    assert_eq!(report.failed, 0);
+    assert_eq!(*engine_state.apply_calls.lock().expect("apply calls"), 1);
+    assert_ne!(
+        ledger_state(&layout, &stale.event_id),
+        IngestionState::Committed
+    );
+    assert_eq!(
+        std::fs::read_dir(layout.spool_failed.join("superseded/generation-0"))
+            .expect("superseded directory")
+            .count(),
+        1
+    );
+    assert_eq!(spool_depths(&layout), (1, 0));
 }
 
 #[tokio::test]

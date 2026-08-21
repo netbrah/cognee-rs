@@ -2,9 +2,33 @@
 
 use serde_json::{Value, json};
 
-const PROTOCOL_VERSION: &str = "2024-11-05";
-const SERVER_NAME: &str = "cognee-agent";
-const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub(crate) const PROTOCOL_VERSION: &str = "2024-11-05";
+pub(crate) const SERVER_NAME: &str = "cognee-agent";
+pub(crate) const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub(crate) fn initialize_result() -> Value {
+    json!({
+        "protocolVersion": PROTOCOL_VERSION,
+        "capabilities": { "tools": {} },
+        "serverInfo": {
+            "name": SERVER_NAME,
+            "version": SERVER_VERSION
+        }
+    })
+}
+
+pub(crate) fn success_response(id: Value, result: Value) -> String {
+    json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string()
+}
+
+pub(crate) fn error_response(id: Value, code: i64, message: &str) -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {"code": code, "message": message}
+    })
+    .to_string()
+}
 
 /// Handle one newline-stripped JSON-RPC message.
 ///
@@ -13,14 +37,7 @@ pub fn handle_message(line: &str) -> Option<String> {
     let msg: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(_) => {
-            return Some(
-                json!({
-                    "jsonrpc": "2.0",
-                    "id": Value::Null,
-                    "error": {"code": -32700, "message": "Parse error"}
-                })
-                .to_string(),
-            );
+            return Some(error_response(Value::Null, -32700, "Parse error"));
         }
     };
 
@@ -29,35 +46,14 @@ pub fn handle_message(line: &str) -> Option<String> {
 
     if method == "initialize" {
         let id = id?;
-        return Some(
-            json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {
-                    "protocolVersion": PROTOCOL_VERSION,
-                    "capabilities": { "tools": {} },
-                    "serverInfo": {
-                        "name": SERVER_NAME,
-                        "version": SERVER_VERSION
-                    }
-                }
-            })
-            .to_string(),
-        );
+        return Some(success_response(id, initialize_result()));
     }
 
     if method == "ping" {
         let id = id?;
-        return Some(json!({"jsonrpc": "2.0", "id": id, "result": {}}).to_string());
+        return Some(success_response(id, json!({})));
     }
 
     let id = id?;
-    Some(
-        json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "error": {"code": -32601, "message": "Method not found"}
-        })
-        .to_string(),
-    )
+    Some(error_response(id, -32601, "Method not found"))
 }

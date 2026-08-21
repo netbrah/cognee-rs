@@ -11,7 +11,7 @@ use cognee_mcp::generation::GenerationStore;
 use cognee_mcp::hook_input::HookInput;
 use cognee_mcp::layout::StateLayout;
 use cognee_mcp::limits::ResourceLimits;
-use cognee_mcp::spool::{Priority, Spool};
+use cognee_mcp::spool::{Priority, Spool, SpoolRecord};
 use serde_json::json;
 use tempfile::tempdir;
 
@@ -103,6 +103,44 @@ fn advancing_one_dataset_quarantines_only_its_old_generation() {
         .filter_map(Result::ok)
         .count();
     assert_eq!(superseded_count, 2);
+}
+
+#[test]
+fn superseded_quarantine_preserves_an_existing_same_name_record() {
+    let root = tempdir().expect("temp root");
+    let layout = StateLayout::under(root.path().join("cognee"));
+    layout.ensure_private().expect("private layout");
+    let spool = Spool::new(layout.clone(), ResourceLimits::default());
+    let stale = event("agent_sessions", "collision");
+    let queued = spool
+        .enqueue(&stale, Priority::Normal)
+        .expect("enqueue stale event");
+    let superseded = layout.spool_failed.join("superseded/generation-0");
+    std::fs::create_dir_all(&superseded).expect("superseded directory");
+    let existing = superseded.join(queued.path.file_name().expect("event file name"));
+    let prior_evidence = b"preexisting-superseded-evidence";
+    std::fs::write(&existing, prior_evidence).expect("existing evidence");
+
+    let report = GenerationStore::new(layout.clone())
+        .advance_and_quarantine("agent_sessions", &spool)
+        .expect("advance generation");
+
+    assert_eq!(report.quarantined, 1);
+    assert_eq!(
+        std::fs::read(&existing).expect("preserved prior evidence"),
+        prior_evidence
+    );
+    let entries = std::fs::read_dir(&superseded)
+        .expect("superseded records")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("superseded entries");
+    assert_eq!(entries.len(), 2);
+    assert!(entries.iter().any(|entry| {
+        serde_json::from_slice::<SpoolRecord>(
+            &std::fs::read(entry.path()).expect("superseded bytes"),
+        )
+        .is_ok_and(|record| record.envelope.event_id == stale.event_id)
+    }));
 }
 
 #[test]

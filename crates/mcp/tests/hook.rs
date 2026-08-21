@@ -170,7 +170,7 @@ fn contains_forbidden_key(value: &Value) -> bool {
 }
 
 #[test]
-fn six_official_events_emit_one_non_blocking_object_and_only_injection_events_use_cache() {
+fn six_official_events_emit_one_non_blocking_object_and_only_session_start_uses_cache() {
     let temporary = tempdir().expect("temporary root");
     let root = temporary.path().join("cognee");
     let spawner = Arc::new(RecordingDrainSpawner::default());
@@ -198,7 +198,7 @@ fn six_official_events_emit_one_non_blocking_object_and_only_injection_events_us
         let response = one_json_object(&stdout);
         assert_eq!(response["suppressOutput"], true);
         assert!(!contains_forbidden_key(&response));
-        if matches!(event, "SessionStart" | "BeforeAgent") {
+        if event == "SessionStart" {
             let output = response["hookSpecificOutput"]
                 .as_object()
                 .expect("injection output");
@@ -340,21 +340,49 @@ fn fresh_session_injection_falls_back_to_the_bounded_user_bootstrap_cache() {
         )
         .expect("write user bootstrap cache");
 
-    for event in ["SessionStart", "BeforeAgent"] {
-        let mut value = fixture(event, TIMESTAMP);
-        value["session_id"] = json!(format!("fresh-{event}"));
-        let raw = serde_json::to_vec(&value).expect("fixture JSON");
-        let (stdout, stderr, result) = run(&services, raw.as_slice());
-        result.expect("fresh-session hook");
-        assert!(stderr.is_empty());
-        let response = one_json_object(&stdout);
-        let context = response["hookSpecificOutput"]["additionalContext"]
-            .as_str()
-            .expect("bootstrap context");
-        assert!(context.contains("Stable preference: give concise evidence-backed answers."));
-        assert_eq!(context.matches("<untrusted_memory>").count(), 1);
-        assert_eq!(context.matches("</untrusted_memory>").count(), 1);
-    }
+    let mut value = fixture("SessionStart", TIMESTAMP);
+    value["session_id"] = json!("fresh-SessionStart");
+    let raw = serde_json::to_vec(&value).expect("fixture JSON");
+    let (stdout, stderr, result) = run(&services, raw.as_slice());
+    result.expect("fresh-session hook");
+    assert!(stderr.is_empty());
+    let response = one_json_object(&stdout);
+    let context = response["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .expect("bootstrap context");
+    assert!(context.contains("Stable preference: give concise evidence-backed answers."));
+    assert_eq!(context.matches("<untrusted_memory>").count(), 1);
+    assert_eq!(context.matches("</untrusted_memory>").count(), 1);
+}
+
+#[test]
+fn before_agent_captures_the_prompt_without_injecting_cached_memory() {
+    let temporary = tempdir().expect("temporary root");
+    let spawner = Arc::new(RecordingDrainSpawner::default());
+    let services = services(temporary.path(), 50, spawner);
+    ContextCache::new(services.config().layout.clone())
+        .write(
+            "session-17",
+            "Stable preference: give concise evidence-backed answers.",
+        )
+        .expect("write session cache");
+
+    let raw = serde_json::to_vec(&fixture("BeforeAgent", TIMESTAMP)).expect("hook fixture");
+    let (stdout, stderr, result) = run(&services, raw.as_slice());
+
+    result.expect("BeforeAgent remains fail-open");
+    assert!(stderr.is_empty());
+    assert_eq!(one_json_object(&stdout), json!({"suppressOutput": true}));
+    assert_eq!(
+        cognee_mcp::spool::Spool::new(
+            services.config().layout.clone(),
+            services.config().limits.clone(),
+        )
+        .depths()
+        .expect("spool depths")
+        .pending,
+        1
+    );
 }
 
 #[test]

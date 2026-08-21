@@ -12,6 +12,7 @@ use crate::context::ContextCache;
 use crate::engine::{EngineFactory, MemoryEngine, RecallRequest};
 use crate::error::AgentError;
 use crate::event::{EventEnvelope, EventKind, canonical_json};
+use crate::generation::GenerationStore;
 use crate::layout::StateLayout;
 use crate::lease::{EngineLease, LeaseGuard};
 use crate::ledger::{IngestionState, Ledger};
@@ -140,6 +141,7 @@ pub struct Worker {
     spool: Spool,
     lease: EngineLease,
     ledger: Ledger,
+    generations: GenerationStore,
     engine_factory: Arc<dyn EngineFactory>,
     runtime: Arc<dyn WorkerRuntime>,
     token_estimator: Arc<dyn TokenEstimator>,
@@ -220,11 +222,13 @@ impl Worker {
         limits: ResourceLimits,
     ) -> Self {
         let context_cache = ContextCache::new(layout.clone());
+        let generations = GenerationStore::new(layout.clone());
         Self {
             layout,
             spool,
             lease,
             ledger,
+            generations,
             engine_factory,
             runtime: Arc::new(SystemWorkerRuntime),
             token_estimator: Arc::new(ConservativeTokenEstimator),
@@ -356,6 +360,27 @@ impl Worker {
                 }
             };
             let event = claimed.record.envelope.clone();
+            let current_generation = match self.generations.current(&event.dataset) {
+                Ok(generation) => generation,
+                Err(_) => {
+                    report.failed += 1;
+                    record_error(&mut report, &AgentError::Checkpoint("dataset_generation"));
+                    break;
+                }
+            };
+            if event.dataset_generation != current_generation {
+                match self.spool.quarantine_claimed_superseded(claimed) {
+                    Ok(()) => {
+                        report.quarantined += 1;
+                        continue;
+                    }
+                    Err(error) => {
+                        report.failed += 1;
+                        record_error(&mut report, &AgentError::from(error));
+                        break;
+                    }
+                }
+            }
             let ledger_entry =
                 match self
                     .ledger
@@ -459,6 +484,27 @@ impl Worker {
                 record_error(&mut report, &error);
                 break;
             }
+            let current_generation = match self.generations.current(&event.dataset) {
+                Ok(generation) => generation,
+                Err(_) => {
+                    report.failed += 1;
+                    record_error(&mut report, &AgentError::Checkpoint("dataset_generation"));
+                    break;
+                }
+            };
+            if event.dataset_generation != current_generation {
+                match self.spool.quarantine_claimed_superseded(claimed) {
+                    Ok(()) => {
+                        report.quarantined += 1;
+                        continue;
+                    }
+                    Err(error) => {
+                        report.failed += 1;
+                        record_error(&mut report, &AgentError::from(error));
+                        break;
+                    }
+                }
+            }
             let applied_entry_id = if contains {
                 None
             } else {
@@ -515,6 +561,27 @@ impl Worker {
                 report.failed += 1;
                 record_error(&mut report, &error);
                 break;
+            }
+            let current_generation = match self.generations.current(&event.dataset) {
+                Ok(generation) => generation,
+                Err(_) => {
+                    report.failed += 1;
+                    record_error(&mut report, &AgentError::Checkpoint("dataset_generation"));
+                    break;
+                }
+            };
+            if event.dataset_generation != current_generation {
+                match self.spool.quarantine_claimed_superseded(claimed) {
+                    Ok(()) => {
+                        report.quarantined += 1;
+                        break;
+                    }
+                    Err(error) => {
+                        report.failed += 1;
+                        record_error(&mut report, &AgentError::from(error));
+                        break;
+                    }
+                }
             }
             if let Err(error) = self
                 .ledger

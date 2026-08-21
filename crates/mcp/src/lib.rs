@@ -24,11 +24,17 @@ pub mod lease;
 #[cfg(feature = "runtime")]
 pub mod ledger;
 pub mod limits;
+#[cfg(feature = "runtime")]
+pub mod mcp;
 pub mod protocol;
 pub mod redact;
 #[cfg(feature = "runtime")]
 pub mod scheduler;
 pub mod secret;
 pub mod spool;
+#[cfg(feature = "runtime")]
+pub mod stdio;
+#[cfg(feature = "runtime")]
+pub mod tools;
 #[cfg(feature = "runtime")]
 pub mod worker;

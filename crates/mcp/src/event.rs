@@ -1,7 +1,7 @@
 //! Normalized event envelopes and deterministic identifiers.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::config::lowercase_hex;
@@ -163,6 +163,80 @@ impl EventEnvelope {
                 response_truncated: truncation.response,
                 tool_input_truncated: truncation.tool_input,
                 tool_response_truncated: truncation.tool_response,
+                capture_degraded: false,
+            },
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_mcp_remember(
+        data: &str,
+        session_id: Option<&str>,
+        self_improvement: bool,
+        engineer: impl Into<String>,
+        host: impl Into<String>,
+        timestamp: impl Into<String>,
+        cwd: impl Into<String>,
+        dataset: impl Into<String>,
+        dataset_generation: u64,
+    ) -> Self {
+        let timestamp = timestamp.into();
+        let cwd = cwd.into();
+        let dataset = dataset.into();
+        let envelope_session_id = session_id.unwrap_or_default().to_owned();
+        let mut payload = Map::from_iter([
+            ("data".to_owned(), Value::String(data.to_owned())),
+            ("self_improvement".to_owned(), Value::Bool(self_improvement)),
+        ]);
+        if let Some(session_id) = session_id {
+            payload.insert(
+                "session_id".to_owned(),
+                Value::String(session_id.to_owned()),
+            );
+        }
+        let payload = Value::Object(payload);
+        let original_bytes = canonical_json(&payload).len();
+        let redacted = redact_json(&payload);
+        let mut payload = redacted.value;
+        let data = payload
+            .get("data")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let (data, truncated) = truncate_utf8(data, RESPONSE_LIMIT_BYTES);
+        payload["data"] = json!(data);
+        let canonical_payload = canonical_json(&payload);
+        let payload_hash = sha256_hex(canonical_payload.as_bytes());
+        let event_id = deterministic_event_id(
+            EVENT_SCHEMA_VERSION,
+            &envelope_session_id,
+            EventKind::McpRemember.as_str(),
+            &timestamp,
+            &cwd,
+            dataset_generation,
+            &payload_hash,
+        );
+        Self {
+            schema_version: EVENT_SCHEMA_VERSION,
+            event_id,
+            engineer: engineer.into(),
+            host: host.into(),
+            session_id: envelope_session_id,
+            event: EventKind::McpRemember,
+            timestamp,
+            cwd,
+            dataset,
+            dataset_generation,
+            payload_hash,
+            payload,
+            capture: CaptureMetadata {
+                original_bytes,
+                retained_bytes: canonical_payload.len(),
+                redaction_count: redacted.redaction_count,
+                truncation_count: usize::from(truncated),
+                prompt_truncated: false,
+                response_truncated: truncated,
+                tool_input_truncated: false,
+                tool_response_truncated: false,
                 capture_degraded: false,
             },
         }

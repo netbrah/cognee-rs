@@ -36,6 +36,11 @@ pub enum Command {
 /// runtimes retain their stable placeholder errors until their planned tasks.
 pub fn run(cli: Cli) -> Result<(), AgentError> {
     #[cfg(feature = "runtime")]
+    if matches!(cli.command, Command::Mcp) {
+        return crate::stdio::run_mcp_from_env(&crate::config::ProcessEnv);
+    }
+
+    #[cfg(feature = "runtime")]
     if matches!(cli.command, Command::Hook) {
         return crate::hook::run_hook(std::io::stdin().lock(), std::io::stdout().lock())
             .map_err(|_| AgentError::Unavailable("hook output"));

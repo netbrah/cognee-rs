@@ -132,6 +132,31 @@ pub fn rename_durable(
     Ok(())
 }
 
+pub fn rename_durable_no_replace(
+    source: &Path,
+    destination: &Path,
+    sync: &dyn SyncOps,
+) -> Result<AtomicWriteOutcome, AtomicFsError> {
+    let source_parent = source.parent().ok_or(AtomicFsError::InvalidPath)?;
+    let destination_parent = destination.parent().ok_or(AtomicFsError::InvalidPath)?;
+    ensure_private_directory(destination_parent)?;
+    sync.before_rename(source, destination)?;
+    match fs::hard_link(source, destination) {
+        Ok(()) => {
+            fs::remove_file(source)?;
+            sync.sync_directory(destination_parent)?;
+            if source_parent != destination_parent {
+                sync.sync_directory(source_parent)?;
+            }
+            Ok(AtomicWriteOutcome::Written)
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            Ok(AtomicWriteOutcome::Existing)
+        }
+        Err(error) => Err(AtomicFsError::Io(error)),
+    }
+}
+
 pub fn remove_durable(path: &Path, sync: &dyn SyncOps) -> Result<(), AtomicFsError> {
     let parent = path.parent().ok_or(AtomicFsError::InvalidPath)?;
     fs::remove_file(path)?;
