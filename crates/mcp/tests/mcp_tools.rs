@@ -86,6 +86,10 @@ fn descriptors_publish_the_exact_memory_surface_and_defaults() {
         "auto_route has a conditional runtime default"
     );
     assert_eq!(
+        recall["inputSchema"]["properties"]["wait_for_previous"]["type"],
+        "boolean"
+    );
+    assert_eq!(
         recall["inputSchema"]["properties"]["search_type"]["enum"],
         serde_json::json!([
             "GRAPH_COMPLETION",
@@ -131,6 +135,12 @@ fn descriptors_publish_the_exact_memory_surface_and_defaults() {
         "cluster names",
         "panic signatures",
         "artifact paths",
+        "RCA continuity",
+        "prior hypotheses",
+        "ruled-out causes",
+        "commands",
+        "test results",
+        "artifact locations",
     ] {
         assert!(
             recall_description.contains(trigger),
@@ -591,6 +601,30 @@ async fn recall_auto_routes_only_when_no_search_type_is_supplied() {
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].search_type, None);
     assert!(requests[0].auto_route);
+}
+
+#[tokio::test]
+async fn recall_accepts_and_ignores_the_apex_wait_for_previous_hint() {
+    let temporary = tempfile::tempdir().expect("temporary root");
+    let (_config, engine, _spawner, tools) = tools(&temporary, false);
+
+    for wait_for_previous in [false, true] {
+        let recalled = tools
+            .call(
+                "recall",
+                json!({
+                    "query": "what did we decide earlier?",
+                    "wait_for_previous": wait_for_previous
+                }),
+            )
+            .await;
+
+        assert_eq!(recalled["isError"], false);
+    }
+
+    let requests = engine.recalls.lock().expect("requests");
+    assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(|request| request.auto_route));
 }
 
 #[tokio::test]

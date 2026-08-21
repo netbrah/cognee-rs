@@ -19,7 +19,7 @@ use crate::lease::{EngineLease, LeaseGuard};
 use crate::mcp::ToolRouter;
 use crate::spool::{Priority, QueueDepthSummary, Spool};
 
-const RECALL_DESCRIPTION: &str = "Retrieve prior-session information when the user semantically refers to earlier conversations, decisions, findings, attempts, artifacts, preferences, or recurring incidents. Signals include \"yesterday,\" \"earlier,\" \"before,\" \"last week,\" \"last time,\" \"previously,\" \"previous session,\" \"pick up where we left off,\" \"continue where we left off,\" \"continue this,\" \"resume,\" \"where were we?\", \"I told you,\" \"you mentioned,\" \"we discussed,\" \"what did we try,\" \"what was ruled out,\" \"same issue,\" \"recurring failure,\" \"similar panic,\" \"known problem,\" \"that command,\" \"earlier test result,\" and \"previous setup.\" Engineering entities such as CONTAP, case IDs, PRs, symbols, cluster names, panic signatures, and artifact paths strengthen relevance but should not trigger broad recall by themselves.";
+const RECALL_DESCRIPTION: &str = "Retrieve relevant information from prior sessions when the user refers to earlier conversations, decisions, findings, attempts, artifacts, preferences, or recurring engineering incidents. Trigger on phrases such as \"yesterday,\" \"earlier,\" \"before,\" \"last week,\" \"last time,\" \"previously,\" \"previous session,\" \"pick up where we left off,\" \"continue where we left off,\" \"continue this,\" \"resume,\" \"where were we?\", \"I told you,\" \"you mentioned,\" \"we discussed,\" \"what did we try,\" \"what was ruled out,\" \"same issue,\" \"recurring failure,\" \"similar panic,\" \"known problem,\" \"that command,\" \"earlier test result,\" and \"previous setup,\" or equivalent semantic intent. Particularly useful for recurring investigations, RCA continuity, prior hypotheses, ruled-out causes, commands, test results, and artifact locations. Engineering entities such as CONTAP, case IDs, PRs, symbols, cluster names, panic signatures, and artifact paths strengthen relevance but should not trigger broad recall by themselves.";
 
 const REMEMBER_DESCRIPTION: &str = "Store durable information for later sessions only when the user expresses explicit memory intent: \"Please remember,\" \"Save, note, or record this,\" \"Keep this for next time,\" \"Don't forget,\" \"Going forward,\" \"In future sessions,\" \"My preference is,\" \"Always,\" \"never,\" or \"This is our standard workflow.\" Use for stable preferences, decisions, constraints, workflows, and facts worth preserving.";
 
@@ -97,6 +97,10 @@ pub fn tool_descriptors() -> Vec<Value> {
                     "auto_route": {
                         "type": "boolean",
                         "description": "Defaults to true only when search_type is absent; otherwise defaults to false."
+                    },
+                    "wait_for_previous": {
+                        "type": "boolean",
+                        "description": "APEX scheduler compatibility hint; accepted and ignored by Cognee."
                     }
                 },
                 "required": ["query"],
@@ -272,6 +276,7 @@ impl McpTools {
                 "session_id",
                 "top_k",
                 "auto_route",
+                "wait_for_previous",
             ],
         ) else {
             return invalid_arguments("recall arguments are invalid");
@@ -309,6 +314,9 @@ impl McpTools {
             Ok(value) => value.unwrap_or(search_type.is_none()),
             Err(()) => return invalid_arguments("recall.auto_route must be a boolean"),
         };
+        if optional_bool(arguments, "wait_for_previous").is_err() {
+            return invalid_arguments("recall.wait_for_previous must be a boolean");
+        }
 
         let pending = match self.pending_memories(&query, &datasets, session_id.as_deref(), top_k) {
             Ok(pending) => pending,
