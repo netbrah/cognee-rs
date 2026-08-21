@@ -17,7 +17,7 @@ use crate::event::{EventEnvelope, EventKind};
 use crate::generation::{GenerationAdvanceReport, GenerationStore};
 use crate::lease::{EngineLease, LeaseGuard};
 use crate::mcp::ToolRouter;
-use crate::spool::{Priority, Spool};
+use crate::spool::{Priority, QueueDepthSummary, Spool};
 
 const RECALL_DESCRIPTION: &str = "Retrieve prior-session information when the user semantically refers to earlier conversations, decisions, findings, attempts, artifacts, preferences, or recurring incidents. Signals include \"yesterday,\" \"earlier,\" \"before,\" \"last week,\" \"last time,\" \"previously,\" \"previous session,\" \"pick up where we left off,\" \"continue where we left off,\" \"continue this,\" \"resume,\" \"where were we?\", \"I told you,\" \"you mentioned,\" \"we discussed,\" \"what did we try,\" \"what was ruled out,\" \"same issue,\" \"recurring failure,\" \"similar panic,\" \"known problem,\" \"that command,\" \"earlier test result,\" and \"previous setup.\" Engineering entities such as CONTAP, case IDs, PRs, symbols, cluster names, panic signatures, and artifact paths strengthen relevance but should not trigger broad recall by themselves.";
 
@@ -321,11 +321,7 @@ impl McpTools {
                 );
             }
         };
-        let queue_depth = self
-            .spool
-            .depths()
-            .map(|depths| depths.pending.saturating_add(depths.processing))
-            .unwrap_or_default();
+        let queue_depth = self.spool.queue_depth_summary().unwrap_or_default();
         let lease = match self.acquire_lease("mcp-recall").await {
             Ok(Some(lease)) => lease,
             Ok(None) => {
@@ -334,7 +330,7 @@ impl McpTools {
                         "ENGINE_BUSY",
                         "Cognee is busy; retry recall shortly.",
                         true,
-                        Map::from_iter([("queue_depth".to_owned(), json!(queue_depth))]),
+                        queue_depth_details(queue_depth),
                     );
                 }
                 return recall_success(pending, search_type, auto_route, "busy", queue_depth);
@@ -344,7 +340,7 @@ impl McpTools {
                     "LEASE_ERROR",
                     "Cognee engine ownership could not be established.",
                     true,
-                    Map::from_iter([("queue_depth".to_owned(), json!(queue_depth))]),
+                    queue_depth_details(queue_depth),
                 );
             }
         };
@@ -400,7 +396,7 @@ impl McpTools {
                 "LEASE_ERROR",
                 "Cognee engine ownership could not be released safely.",
                 true,
-                Map::from_iter([("queue_depth".to_owned(), json!(queue_depth))]),
+                queue_depth_details(queue_depth),
             );
         }
         if let Some(error) = recall_error {
@@ -922,7 +918,7 @@ fn recall_success(
     search_type_used: Option<String>,
     auto_routed: bool,
     graph_status: &str,
-    queue_depth: usize,
+    queue_depth: QueueDepthSummary,
 ) -> Value {
     recall_success_with_items(
         items,
@@ -938,7 +934,7 @@ fn recall_success_with_items(
     search_type_used: Option<String>,
     auto_routed: bool,
     graph_status: &str,
-    queue_depth: usize,
+    queue_depth: QueueDepthSummary,
 ) -> Value {
     let pending_count = items
         .iter()
@@ -949,7 +945,11 @@ fn recall_success_with_items(
         "searchTypeUsed": search_type_used,
         "autoRouted": auto_routed,
         "graph": {"status": graph_status},
-        "pending": {"matched": pending_count, "queue_depth": queue_depth},
+        "pending": {
+            "matched": pending_count,
+            "queue_depth": queue_depth.depth,
+            "queue_depth_truncated": queue_depth.truncated,
+        },
     }))
 }
 
@@ -1008,17 +1008,27 @@ fn forget_error(error: &crate::error::AgentError, mut evidence: Map<String, Valu
 
 fn engine_error(
     error: &crate::error::AgentError,
-    queue_depth: usize,
+    queue_depth: QueueDepthSummary,
     mut extra: Map<String, Value>,
 ) -> Value {
     extra.insert("error_class".to_owned(), json!(error.class()));
-    extra.insert("queue_depth".to_owned(), json!(queue_depth));
+    extra.extend(queue_depth_details(queue_depth));
     tool_error(
         "ENGINE_ERROR",
         "Cognee recall is temporarily unavailable.",
         error.retry_class().is_some(),
         extra,
     )
+}
+
+fn queue_depth_details(queue_depth: QueueDepthSummary) -> Map<String, Value> {
+    Map::from_iter([
+        ("queue_depth".to_owned(), json!(queue_depth.depth)),
+        (
+            "queue_depth_truncated".to_owned(),
+            json!(queue_depth.truncated),
+        ),
+    ])
 }
 
 fn invalid_arguments(message: &str) -> Value {

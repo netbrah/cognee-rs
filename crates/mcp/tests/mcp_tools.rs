@@ -452,6 +452,42 @@ async fn busy_recall_without_a_pending_match_is_retryable_and_reports_queue_dept
 }
 
 #[tokio::test]
+async fn recall_queue_depth_saturates_when_the_telemetry_scan_is_truncated() {
+    let temporary = tempfile::tempdir().expect("temporary root");
+    let (config, _engine, _spawner, tools) = tools(&temporary, false);
+    let spool = Spool::new(config.layout.clone(), config.limits.clone());
+    for index in 0..129 {
+        let event = EventEnvelope::from_mcp_remember(
+            &format!("queued telemetry fixture {index}"),
+            None,
+            false,
+            "alice",
+            "host-a",
+            "2026-08-20T12:00:00.000000000Z".to_owned(),
+            "/work/apex",
+            "agent_sessions",
+            0,
+        );
+        spool
+            .enqueue(&event, Priority::High)
+            .expect("enqueue telemetry fixture");
+    }
+    let blocker = EngineLease::new(config.layout.clone(), Duration::from_secs(180))
+        .try_acquire("test-blocker")
+        .expect("lease attempt")
+        .expect("blocking lease");
+
+    let recalled = tools.call("recall", json!({"query": "quasar"})).await;
+
+    assert_eq!(recalled["isError"], true);
+    let recalled = body(&recalled);
+    assert_eq!(recalled["code"], "ENGINE_BUSY");
+    assert_eq!(recalled["queue_depth"], 128);
+    assert_eq!(recalled["queue_depth_truncated"], true);
+    blocker.release().expect("release blocker");
+}
+
+#[tokio::test]
 async fn pending_recall_rejects_a_queue_scan_above_its_hard_limit() {
     let temporary = tempfile::tempdir().expect("temporary root");
     let (config, _engine, _spawner, tools) = tools(&temporary, false);

@@ -28,6 +28,8 @@ pub const MAX_EVENT_FILE_BYTES: u64 = 256 * 1024;
 #[cfg(feature = "runtime")]
 const MAX_QUEUE_SCAN_RECORDS: usize = 256;
 #[cfg(feature = "runtime")]
+const MAX_QUEUE_DEPTH_SCAN_ENTRIES: usize = 128;
+#[cfg(feature = "runtime")]
 const QUARANTINE_COLLISION_ATTEMPTS: usize = 16;
 #[cfg(feature = "runtime")]
 static QUARANTINE_NONCE: AtomicU64 = AtomicU64::new(1);
@@ -129,6 +131,13 @@ pub struct SpoolDepths {
     pub processing: usize,
     pub failed: usize,
     pub bytes: u64,
+}
+
+#[cfg(feature = "runtime")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct QueueDepthSummary {
+    pub(crate) depth: usize,
+    pub(crate) truncated: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -415,6 +424,34 @@ impl Spool {
             bytes: pending_bytes
                 .saturating_add(processing_bytes)
                 .saturating_add(failed_bytes),
+        })
+    }
+
+    #[cfg(feature = "runtime")]
+    pub(crate) fn queue_depth_summary(&self) -> Result<QueueDepthSummary, SpoolError> {
+        self.layout.ensure_private()?;
+        let mut depth = 0usize;
+        let mut scanned = 0usize;
+        for source in [&self.layout.spool_pending, &self.layout.spool_processing] {
+            for entry in fs::read_dir(source)? {
+                let entry = entry?;
+                if scanned >= MAX_QUEUE_DEPTH_SCAN_ENTRIES {
+                    return Ok(QueueDepthSummary {
+                        depth: MAX_QUEUE_DEPTH_SCAN_ENTRIES,
+                        truncated: true,
+                    });
+                }
+                scanned += 1;
+                if entry.file_type()?.is_file()
+                    && !entry.file_name().to_string_lossy().starts_with(".tmp-")
+                {
+                    depth = depth.saturating_add(1);
+                }
+            }
+        }
+        Ok(QueueDepthSummary {
+            depth,
+            truncated: false,
         })
     }
 
