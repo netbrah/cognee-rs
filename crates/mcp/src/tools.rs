@@ -53,7 +53,11 @@ pub fn tool_descriptors() -> Vec<Value> {
                         "default": "agent_sessions"
                     },
                     "session_id": {"type": "string", "minLength": 1},
-                    "self_improvement": {"type": "boolean", "default": false}
+                    "self_improvement": {"type": "boolean", "default": false},
+                    "wait_for_previous": {
+                        "type": "boolean",
+                        "description": "APEX scheduler compatibility hint; accepted and ignored by Cognee."
+                    }
                 },
                 "required": ["data"],
                 "additionalProperties": false
@@ -115,7 +119,11 @@ pub fn tool_descriptors() -> Vec<Value> {
                 "properties": {
                     "dataset": {"type": "string", "minLength": 1},
                     "everything": {"type": "boolean", "default": false},
-                    "confirm": {"type": "string", "minLength": 1}
+                    "confirm": {"type": "string", "minLength": 1},
+                    "wait_for_previous": {
+                        "type": "boolean",
+                        "description": "APEX scheduler compatibility hint; accepted and ignored by Cognee."
+                    }
                 },
                 "required": ["confirm"],
                 "additionalProperties": false
@@ -204,7 +212,13 @@ impl McpTools {
     async fn remember(&self, arguments: Value) -> Value {
         let Some(arguments) = validated_object(
             &arguments,
-            &["data", "dataset_name", "session_id", "self_improvement"],
+            &[
+                "data",
+                "dataset_name",
+                "session_id",
+                "self_improvement",
+                "wait_for_previous",
+            ],
         ) else {
             return invalid_arguments("remember arguments are invalid");
         };
@@ -226,6 +240,9 @@ impl McpTools {
             Ok(value) => value.unwrap_or(false),
             Err(()) => return invalid_arguments("remember.self_improvement must be a boolean"),
         };
+        if optional_bool(arguments, "wait_for_previous").is_err() {
+            return invalid_arguments("remember.wait_for_previous must be a boolean");
+        }
         let generation = match self.generations.current(&dataset) {
             Ok(generation) => generation,
             Err(_) => {
@@ -432,8 +449,10 @@ impl McpTools {
     }
 
     async fn forget(&self, arguments: Value) -> Value {
-        let Some(arguments) = validated_object(&arguments, &["dataset", "everything", "confirm"])
-        else {
+        let Some(arguments) = validated_object(
+            &arguments,
+            &["dataset", "everything", "confirm", "wait_for_previous"],
+        ) else {
             return invalid_arguments("forget arguments are invalid");
         };
         let dataset = match optional_string(arguments, "dataset") {
@@ -444,6 +463,9 @@ impl McpTools {
             Ok(value) => value.unwrap_or(false),
             Err(()) => return invalid_arguments("forget.everything must be a boolean"),
         };
+        if optional_bool(arguments, "wait_for_previous").is_err() {
+            return invalid_arguments("forget.wait_for_previous must be a boolean");
+        }
         let Some(confirm) = required_string(arguments, "confirm") else {
             return invalid_arguments("forget.confirm must be a non-empty string");
         };

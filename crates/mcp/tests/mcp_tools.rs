@@ -54,6 +54,10 @@ fn descriptors_publish_the_exact_memory_surface_and_defaults() {
         remember["inputSchema"]["properties"]["self_improvement"]["default"],
         false
     );
+    assert_eq!(
+        remember["inputSchema"]["properties"]["wait_for_previous"]["type"],
+        "boolean"
+    );
     let remember_description = remember["description"].as_str().expect("description");
     for trigger in [
         "Please remember",
@@ -157,6 +161,10 @@ fn descriptors_publish_the_exact_memory_surface_and_defaults() {
     assert_eq!(
         forget["inputSchema"]["properties"]["everything"]["default"],
         false
+    );
+    assert_eq!(
+        forget["inputSchema"]["properties"]["wait_for_previous"]["type"],
+        "boolean"
     );
 }
 
@@ -354,6 +362,27 @@ async fn remember_queues_a_high_priority_event_without_opening_the_engine() {
         "Use two build workers on the fleet."
     );
     assert_eq!(record.envelope.event_id, body["event_id"]);
+}
+
+#[tokio::test]
+async fn remember_accepts_and_ignores_the_apex_wait_for_previous_hint() {
+    let temporary = tempfile::tempdir().expect("temporary root");
+    let (_config, engine, spawner, tools) = tools(&temporary, false);
+
+    let result = tools
+        .call(
+            "remember",
+            json!({
+                "data": "Preserve the canary convention.",
+                "wait_for_previous": false
+            }),
+        )
+        .await;
+
+    assert_eq!(result["isError"], false);
+    assert_eq!(body(&result)["status"], "queued");
+    assert_eq!(engine.opens.load(Ordering::SeqCst), 0);
+    assert_eq!(spawner.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -653,6 +682,26 @@ async fn forget_rejects_ambiguous_or_unconfirmed_targets_without_mutation() {
             .expect("generation"),
         0
     );
+}
+
+#[tokio::test]
+async fn forget_accepts_and_ignores_the_apex_wait_for_previous_hint() {
+    let temporary = tempfile::tempdir().expect("temporary root");
+    let (_config, engine, _spawner, tools) = tools(&temporary, false);
+
+    let result = tools
+        .call(
+            "forget",
+            json!({
+                "dataset": "agent_sessions",
+                "confirm": "DELETE DATASET agent_sessions",
+                "wait_for_previous": true
+            }),
+        )
+        .await;
+
+    assert_eq!(result["isError"], false);
+    assert_eq!(engine.forgets.lock().expect("forgets").len(), 1);
 }
 
 #[tokio::test]
