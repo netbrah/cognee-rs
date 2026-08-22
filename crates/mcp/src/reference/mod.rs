@@ -12,6 +12,7 @@ mod delta;
 mod engine;
 mod layout;
 mod publisher;
+mod reader;
 mod record;
 
 use std::path::PathBuf;
@@ -40,6 +41,10 @@ pub use publisher::{
     CurrentPointer, FileManifestEntry, GenerationManifest, PublishFaultPoint, PublishHooks,
     PublishReceipt, PublishRunReport, PublishedGenerationStatus, PublisherLock, ReferencePublisher,
     SourceManifestEntry, recover_publish_lock, validate_published_generation,
+};
+pub use reader::{
+    ReferenceReadHooks, ReferenceReader, ReferenceRecallItem, ReferenceRecallMetadata,
+    ReferenceRecallRequest, ReferenceRecallResponse,
 };
 pub use record::{PreparedDocument, ReferenceOperation, ReferenceRecord, Source, SourceKind};
 

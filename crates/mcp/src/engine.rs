@@ -385,7 +385,7 @@ impl MemoryEngine for CogneeMemoryEngine {
 }
 
 #[cfg(feature = "engine")]
-fn normalize_recall_item(item: &Value, request: &RecallRequest) -> RecallItem {
+pub fn normalize_recall_item(item: &Value, request: &RecallRequest) -> RecallItem {
     let raw_source = item
         .get("source")
         .and_then(Value::as_str)
@@ -400,6 +400,12 @@ fn normalize_recall_item(item: &Value, request: &RecallRequest) -> RecallItem {
         Some(content) => crate::event::canonical_json(content),
         None => String::new(),
     };
+    let mut metadata = serde_json::Map::new();
+    collect_reference_metadata(item.get("content").unwrap_or(&Value::Null), &mut metadata);
+    let event_id = metadata
+        .get("cognee_external_event_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     RecallItem {
         source,
         content,
@@ -407,8 +413,57 @@ fn normalize_recall_item(item: &Value, request: &RecallRequest) -> RecallItem {
         dataset: request.dataset.clone(),
         session_id: request.session_id.clone(),
         timestamp: None,
-        event_id: None,
-        metadata: serde_json::Map::new(),
+        event_id,
+        metadata,
+    }
+}
+
+#[cfg(feature = "engine")]
+fn collect_reference_metadata(value: &Value, output: &mut serde_json::Map<String, Value>) {
+    const KEYS: [&str; 6] = [
+        "cognee_external_event_id",
+        "reference_source_id",
+        "reference_revision",
+        "reference_label",
+        "reference_content_type",
+        "reference_content_sha256",
+    ];
+    match value {
+        Value::Object(values) => {
+            for key in KEYS {
+                if let Some(value) = values.get(key) {
+                    output
+                        .entry(key.to_owned())
+                        .or_insert_with(|| value.clone());
+                }
+            }
+            if let Some(value) = values.get("content_type") {
+                output
+                    .entry("reference_content_type".to_owned())
+                    .or_insert_with(|| value.clone());
+            }
+            if let Some(value) = values.get("content_sha256") {
+                output
+                    .entry("reference_content_sha256".to_owned())
+                    .or_insert_with(|| value.clone());
+            }
+            for value in values.values() {
+                collect_reference_metadata(value, output);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_reference_metadata(value, output);
+            }
+        }
+        Value::String(value)
+            if value.trim_start().starts_with('{') || value.trim_start().starts_with('[') =>
+        {
+            if let Ok(nested) = serde_json::from_str::<Value>(value) {
+                collect_reference_metadata(&nested, output);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
     }
 }
 

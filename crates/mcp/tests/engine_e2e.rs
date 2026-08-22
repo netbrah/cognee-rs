@@ -4,7 +4,10 @@ use std::collections::HashMap;
 
 use cognee_mcp::config::{AgentConfig, EnvSource};
 use cognee_mcp::embedding_generation::EmbeddingGeneration;
-use cognee_mcp::engine::{CogneeEngineFactory, EngineFactory};
+use cognee_mcp::engine::{
+    CogneeEngineFactory, EngineFactory, RecallRequest, normalize_recall_item,
+};
+use serde_json::json;
 use tempfile::tempdir;
 
 struct FakeEnv(HashMap<String, String>);
@@ -63,6 +66,59 @@ async fn factory_constructs_and_closes_a_short_lived_handle_without_warming_stor
     assert!(
         !database.exists(),
         "closing an unused handle must not warm storage"
+    );
+}
+
+#[test]
+fn graph_recall_normalization_retains_reference_provenance_without_changing_private_schema() {
+    let request = RecallRequest {
+        query: "restart".to_owned(),
+        dataset: "agent_sessions".to_owned(),
+        session_id: Some("session-1".to_owned()),
+        top_k: 3,
+        search_type: Some("CHUNKS".to_owned()),
+        auto_route: false,
+    };
+    let item = normalize_recall_item(
+        &json!({
+            "source": "graph",
+            "content": {
+                "payload": {
+                    "text": "rolling restart",
+                    "external_metadata": "{\"cognee_external_event_id\":\"event-2\",\"reference_source_id\":\"source-1\",\"reference_revision\":2,\"reference_label\":\"restart.md\",\"content_type\":\"text/markdown\",\"content_sha256\":\"sha256:content\"}"
+                }
+            },
+            "score": 0.75
+        }),
+        &request,
+    );
+
+    assert_eq!(item.event_id.as_deref(), Some("event-2"));
+    assert_eq!(item.metadata["reference_source_id"], "source-1");
+    assert_eq!(item.metadata["reference_revision"], 2);
+    assert_eq!(item.metadata["reference_label"], "restart.md");
+    assert_eq!(item.metadata["reference_content_type"], "text/markdown");
+    assert_eq!(item.metadata["reference_content_sha256"], "sha256:content");
+    assert_eq!(
+        serde_json::to_value(&item)
+            .expect("serialize private recall item")
+            .as_object()
+            .expect("private recall object")
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        [
+            "content",
+            "dataset",
+            "event_id",
+            "metadata",
+            "score",
+            "session_id",
+            "source",
+            "timestamp",
+        ]
+        .into_iter()
+        .collect()
     );
 }
 

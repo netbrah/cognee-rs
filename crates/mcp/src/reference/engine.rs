@@ -8,6 +8,7 @@ use serde_json::Value;
 #[cfg(feature = "engine")]
 use super::REFERENCE_DATASET;
 use super::ReferenceError;
+use crate::engine::{RecallRequest, RecallResponse};
 
 #[cfg(feature = "engine")]
 const REFERENCE_EMBEDDING_MODEL: &str = "text-embedding-3-large";
@@ -70,6 +71,10 @@ pub trait ReferenceReadEngine: Send {
         dataset: &str,
         probe: &ReferenceRecallProbe,
     ) -> Result<bool, ReferenceError>;
+
+    async fn recall(&mut self, _request: RecallRequest) -> Result<RecallResponse, ReferenceError> {
+        Err(ReferenceError::Unavailable)
+    }
 
     async fn close(self: Box<Self>) -> Result<(), ReferenceError>;
 }
@@ -313,6 +318,40 @@ impl ReferenceReadEngine for CogneeReferenceReadEngine {
                 .await
                 .map_err(|_| ReferenceError::Unavailable)?;
         Ok(recall_result_contains_probe(&result, probe))
+    }
+
+    async fn recall(&mut self, request: RecallRequest) -> Result<RecallResponse, ReferenceError> {
+        if request.dataset != REFERENCE_DATASET {
+            return Err(ReferenceError::InvalidInput);
+        }
+        let mut options = serde_json::json!({
+            "datasets": [request.dataset],
+            "topK": request.top_k,
+            "autoRoute": false,
+            "saveInteraction": false,
+        });
+        if let Some(search_type) = request.search_type.as_deref() {
+            options["searchType"] = Value::String(search_type.to_owned());
+        }
+        let result =
+            cognee_bindings_common::ops::retrieval::recall(&self.state, &request.query, &options)
+                .await
+                .map_err(|_| ReferenceError::Unavailable)?;
+        let items = result
+            .get("items")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|item| crate::engine::normalize_recall_item(item, &request))
+            .collect();
+        Ok(RecallResponse {
+            items,
+            search_type_used: result
+                .get("searchTypeUsed")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            auto_routed: false,
+        })
     }
 
     async fn close(self: Box<Self>) -> Result<(), ReferenceError> {
