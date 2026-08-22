@@ -1178,7 +1178,7 @@ fn create_unsafe_artifact(_directory: &Path, _artifact: UnsafeArtifact) -> io::R
 
 #[test]
 #[cfg(feature = "engine")]
-fn concrete_reference_settings_route_both_provider_clients_with_apex_identity() {
+fn concrete_reference_settings_include_publishable_build_and_provider_identity() {
     use std::collections::HashMap;
 
     use cognee_mcp::config::{AgentConfig, EnvSource};
@@ -1224,11 +1224,21 @@ fn concrete_reference_settings_route_both_provider_clients_with_apex_identity() 
     ]));
     let agent = AgentConfig::from_env(&env).expect("agent config");
     let factory = CogneeReferenceEngineFactory::new(agent).expect("reference engine factory");
+    let identity = factory.identity();
+    assert!(
+        matches!(identity.cognee_rs_commit.len(), 40 | 64)
+            && identity
+                .cognee_rs_commit
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit()),
+        "repository builds must embed an exact Git commit, got {:?}",
+        identity.cognee_rs_commit
+    );
     let open = ReferenceEngineOpen {
         root: temporary.path().join("generation"),
         dataset: "fleet_reference".to_owned(),
         read_only: true,
-        user_agent: factory.identity().user_agent,
+        user_agent: identity.user_agent,
     };
 
     let settings = factory.settings_for(&open).expect("reference settings");

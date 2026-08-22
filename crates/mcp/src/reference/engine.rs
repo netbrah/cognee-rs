@@ -115,9 +115,7 @@ impl CogneeReferenceEngineFactory {
             return Err(ReferenceError::Unavailable);
         }
         let identity = ReferenceEngineIdentity {
-            cognee_rs_commit: option_env!("COGNEE_RS_COMMIT")
-                .unwrap_or("unknown")
-                .to_owned(),
+            cognee_rs_commit: env!("COGNEE_RS_COMMIT").to_owned(),
             adapter_version: env!("CARGO_PKG_VERSION").to_owned(),
             user_agent: crate::config::apex_user_agent(),
             llm: ReferenceProviderFingerprint {
