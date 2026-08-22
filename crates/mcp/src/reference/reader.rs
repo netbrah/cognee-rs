@@ -7,14 +7,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
-    DeltaHead, DeltaSnapshot, REFERENCE_DATASET, ReferenceConfig, ReferenceEngineFactory,
-    ReferenceEngineOpen, ReferenceError, ReferenceRecord, validate_published_generation,
+    DeltaHead, DeltaSnapshot, DeltaStore, REFERENCE_DATASET, ReferenceConfig,
+    ReferenceEngineFactory, ReferenceEngineOpen, ReferenceError, ReferenceRecord,
+    validate_published_generation,
 };
 use crate::engine::{RecallItem, RecallRequest};
 
 const DEFAULT_TOP_K: usize = 3;
 const MAX_TOP_K: usize = 10;
 const MAX_QUERY_BYTES: usize = 8_192;
+const HARD_MAX_ITEM_BYTES: usize = 2 * 1024;
+const HARD_MAX_PAYLOAD_BYTES: usize = 8 * 1024;
 const JSON_FILE_LIMIT: u64 = 16 * 1024 * 1024;
 const SEARCH_TYPES: [&str; 4] = ["CHUNKS", "SUMMARIES", "GRAPH_COMPLETION", "RAG_COMPLETION"];
 
@@ -48,6 +51,7 @@ pub struct ReferenceRecallItem {
     pub source_id: Option<String>,
     pub source_label: Option<String>,
     pub revision: Option<u64>,
+    pub content_type: Option<String>,
     pub event_id: Option<String>,
     pub content_sha256: Option<String>,
     pub cognified: bool,
@@ -113,7 +117,14 @@ impl ReferenceReader {
     ) -> Result<ReferenceRecallResponse, ReferenceError> {
         validate_request(&request)?;
         self.config.layout.validate_reader_root()?;
+        DeltaStore::new(self.config.layout.clone(), self.config.limits).validate_schema()?;
         let top_k = request.top_k.min(MAX_TOP_K);
+        let max_item_bytes = self.config.limits.max_item_bytes.min(HARD_MAX_ITEM_BYTES);
+        let max_payload_bytes = self
+            .config
+            .limits
+            .max_payload_bytes
+            .min(HARD_MAX_PAYLOAD_BYTES);
         let identity = self.factory.identity();
         let mut degraded = false;
         let mut generation_error = None;
@@ -136,8 +147,8 @@ impl ReferenceReader {
         let included_through = generation
             .as_ref()
             .map_or(0, |value| value.included_through);
-        let (snapshot, corrupt_delta_skipped) =
-            read_delta_snapshot(&self.config, included_through)?;
+        let (snapshot, corrupt_sequences) = read_delta_snapshot(&self.config, included_through)?;
+        let corrupt_delta_skipped = corrupt_sequences.len();
         degraded |= corrupt_delta_skipped > 0;
         self.hooks.after_head_snapshot();
         let delta_examined = usize::try_from(
@@ -147,19 +158,19 @@ impl ReferenceReader {
                 .saturating_sub(included_through),
         )
         .unwrap_or(usize::MAX);
-        let latest = latest_delta_by_source(&snapshot.records);
+        let latest_safe_sequence = corrupt_sequences.iter().copied().max();
+        let safe_records = snapshot
+            .records
+            .iter()
+            .filter(|record| latest_safe_sequence.is_none_or(|sequence| record.sequence > sequence))
+            .cloned()
+            .collect::<Vec<_>>();
+        let latest = latest_delta_by_source(&safe_records);
         let mut truncated = false;
         let mut delta_items = latest
             .values()
             .filter(|record| semantic_match(&request.query, &record.source_label, &record.content))
-            .map(|record| {
-                delta_item(
-                    record,
-                    &request.query,
-                    self.config.limits.max_item_bytes,
-                    &mut truncated,
-                )
-            })
+            .map(|record| delta_item(record, &request.query, max_item_bytes, &mut truncated))
             .collect::<Vec<_>>();
         delta_items.sort_by(|left, right| {
             right
@@ -167,6 +178,9 @@ impl ReferenceReader {
                 .cmp(&left.revision)
                 .then_with(|| right.event_id.cmp(&left.event_id))
         });
+        if corrupt_delta_skipped > 0 && delta_items.is_empty() {
+            return Err(ReferenceError::CorruptRecord);
+        }
         if delta_items.is_empty()
             && let Some(error) = generation_error
         {
@@ -202,12 +216,7 @@ impl ReferenceReader {
                             .items
                             .into_iter()
                             .map(|item| {
-                                graph_item(
-                                    item,
-                                    &request.query,
-                                    self.config.limits.max_item_bytes,
-                                    &mut truncated,
-                                )
+                                graph_item(item, &request.query, max_item_bytes, &mut truncated)
                             })
                             .collect::<Vec<_>>(),
                         _ if !delta_items.is_empty() => {
@@ -247,7 +256,7 @@ impl ReferenceReader {
             },
             truncated,
         };
-        enforce_payload_budget(&mut response, self.config.limits.max_payload_bytes);
+        enforce_payload_budget(&mut response, max_payload_bytes);
         Ok(response)
     }
 }
@@ -274,17 +283,17 @@ fn validate_request(request: &ReferenceRecallRequest) -> Result<(), ReferenceErr
 fn read_delta_snapshot(
     config: &ReferenceConfig,
     included_through: u64,
-) -> Result<(DeltaSnapshot, usize), ReferenceError> {
+) -> Result<(DeltaSnapshot, Vec<u64>), ReferenceError> {
     let head: DeltaHead = read_json_file(&config.layout.delta_head)?;
     if !head.verify_hash() || included_through > head.highest_committed_sequence {
         return Err(ReferenceError::CorruptRecord);
     }
     let mut records = Vec::new();
-    let mut corrupt = 0_usize;
+    let mut corrupt = Vec::new();
     for sequence in included_through.saturating_add(1)..=head.highest_committed_sequence {
         match read_delta_record(&config.layout.delta_events, sequence) {
             Ok(record) => records.push(record),
-            Err(ReferenceError::CorruptRecord) => corrupt = corrupt.saturating_add(1),
+            Err(ReferenceError::CorruptRecord) => corrupt.push(sequence),
             Err(error) => return Err(error),
         }
     }
@@ -383,6 +392,7 @@ fn delta_item(
         source_id: Some(record.source_id.clone()),
         source_label: Some(record.source_label.clone()),
         revision: Some(record.revision),
+        content_type: Some(record.content_type.clone()),
         event_id: Some(record.event_id.clone()),
         content_sha256: Some(record.content_sha256.clone()),
         cognified: false,
@@ -440,6 +450,8 @@ fn graph_item(
         .metadata
         .get("reference_revision")
         .and_then(Value::as_u64);
+    let content_type = metadata_string(&item, "reference_content_type")
+        .or_else(|| metadata_string(&item, "content_type"));
     let event_id = item
         .event_id
         .clone()
@@ -455,6 +467,7 @@ fn graph_item(
         source_id,
         source_label,
         revision,
+        content_type,
         event_id,
         content_sha256,
         cognified: true,

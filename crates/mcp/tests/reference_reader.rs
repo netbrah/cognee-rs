@@ -284,6 +284,29 @@ async fn delta_only_root_recalls_committed_records_without_opening_a_graph() {
     assert!(factory.state.opens.lock().expect("opens lock").is_empty());
 }
 
+#[tokio::test]
+async fn reader_rejects_wrong_schema_version_or_dataset_before_snapshotting() {
+    for schema in [
+        json!({"schema_version": 2, "dataset": "fleet_reference"}),
+        json!({"schema_version": 1, "dataset": "agent_sessions"}),
+    ] {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = config(temporary.path().join("reference"));
+        commit(&config, "schema validation needle", "schema", "schema.md");
+        replace_read_only_file(
+            &config.layout.schema,
+            &serde_json::to_vec(&schema).expect("serialize schema"),
+        );
+
+        let error = ReferenceReader::new(config, Arc::new(FakeFactory::new()))
+            .recall(request("schema validation"))
+            .await
+            .expect_err("invalid schema identity");
+
+        assert!(matches!(error, ReferenceError::CorruptRecord));
+    }
+}
+
 struct AdvancingHooks {
     current_path: PathBuf,
     new_current: Vec<u8>,
@@ -577,6 +600,10 @@ async fn long_graph_excerpt_is_bounded_without_dropping_the_result() {
 
     assert_eq!(response.items.len(), 1);
     assert!(response.items[0].content.len() <= 2 * 1024);
+    assert_eq!(
+        response.items[0].content_type.as_deref(),
+        Some("text/plain")
+    );
     assert!(response.truncated);
 }
 
@@ -629,11 +656,68 @@ async fn graph_failure_closes_the_engine_and_returns_safe_delta_as_degraded() {
 }
 
 #[tokio::test]
-async fn response_defaults_caps_excerpts_item_count_and_complete_json() {
+async fn graph_failure_never_falls_back_to_a_match_older_than_corrupt_delta() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let config = config(temporary.path().join("reference"));
+    let factory = FakeFactory::new();
+    commit(&config, "published anchor", "anchor", "anchor.md");
+    publish(&config, &factory).await;
+    commit(
+        &config,
+        "stale candidate needle",
+        "candidate",
+        "candidate.md",
+    );
+    commit(&config, "later record", "later", "later.md");
+    corrupt_event(&config, 3);
+    factory.state.fail_graph.store(true, Ordering::SeqCst);
+
+    let error = ReferenceReader::new(config, Arc::new(factory))
+        .recall(request("stale candidate"))
+        .await
+        .expect_err("corruption after the match makes fallback unsafe");
+
+    assert!(matches!(error, ReferenceError::CorruptRecord));
+}
+
+#[tokio::test]
+async fn invalid_generation_never_falls_back_to_a_match_older_than_corrupt_delta() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let config = config(temporary.path().join("reference"));
+    let factory = FakeFactory::new();
+    commit(&config, "published anchor", "anchor", "anchor.md");
+    publish(&config, &factory).await;
+    commit(
+        &config,
+        "stale candidate needle",
+        "candidate",
+        "candidate.md",
+    );
+    commit(&config, "later record", "later", "later.md");
+    corrupt_event(&config, 3);
+    let mut pointer: CurrentPointer =
+        serde_json::from_slice(&std::fs::read(&config.layout.current).expect("current pointer"))
+            .expect("parse current pointer");
+    pointer.manifest_sha256 = "sha256:forged".to_owned();
+    replace_read_only_file(
+        &config.layout.current,
+        &serde_json::to_vec(&pointer).expect("serialize pointer"),
+    );
+
+    let error = ReferenceReader::new(config, Arc::new(factory))
+        .recall(request("stale candidate"))
+        .await
+        .expect_err("corruption after the match makes fallback unsafe");
+
+    assert!(matches!(error, ReferenceError::CorruptRecord));
+}
+
+#[tokio::test]
+async fn oversized_config_cannot_raise_response_hard_ceiling() {
     let temporary = tempfile::tempdir().expect("temporary directory");
     let mut config = config(temporary.path().join("reference"));
-    config.limits.max_item_bytes = 2 * 1024;
-    config.limits.max_payload_bytes = 8 * 1024;
+    config.limits.max_item_bytes = 64 * 1024;
+    config.limits.max_payload_bytes = 64 * 1024;
     for index in 0..12 {
         commit(
             &config,
@@ -687,6 +771,14 @@ fn replace_read_only_file(path: &Path, bytes: &[u8]) {
     make_writable(path);
     std::fs::write(path, bytes).expect("replace fixture file");
     make_read_only(path);
+}
+
+fn corrupt_event(config: &ReferenceConfig, sequence: u64) {
+    let path = DeltaStore::new(config.layout.clone(), config.limits)
+        .event_path(sequence)
+        .expect("event path");
+    make_writable(&path);
+    std::fs::write(path, b"{not-json").expect("corrupt event");
 }
 
 #[cfg(unix)]
