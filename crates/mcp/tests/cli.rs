@@ -60,6 +60,22 @@ fn reference_command_is_hidden_from_root_help_but_remains_parseable() {
 }
 
 #[test]
+fn mcp_reference_tool_names_are_not_cli_commands() {
+    for tool in [
+        "cognee_reference_recall",
+        "cognee_reference_remember",
+        "cognee_reference_publish",
+        "cognee_reference_recover",
+        "cognee_reference_forget",
+    ] {
+        assert!(
+            Cli::try_parse_from(["cognee-agent", tool]).is_err(),
+            "MCP tool leaked into the CLI surface: {tool}"
+        );
+    }
+}
+
+#[test]
 fn reference_remember_accepts_repeated_file_aliases_without_selecting_stdin() {
     let cli = Cli::try_parse_from([
         "cognee-agent",

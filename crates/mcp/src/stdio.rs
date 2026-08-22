@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use crate::config::{AgentConfig, EnvSource};
 use crate::error::AgentError;
 use crate::mcp::McpServer;
+use crate::reference::ReferenceConfig;
 use crate::tools::McpTools;
 
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
@@ -22,7 +23,12 @@ enum FrameRead {
 pub fn run_mcp_from_env(env: &impl EnvSource) -> Result<(), AgentError> {
     let config =
         AgentConfig::from_env(env).map_err(|_| AgentError::Blocked("configuration_drift"))?;
-    let server = McpServer::new(Arc::new(McpTools::production(config)));
+    let tools = match ReferenceConfig::from_env(env) {
+        Ok(Some(reference)) => McpTools::production(config).with_production_reference(reference),
+        Ok(None) => McpTools::production(config),
+        Err(_) => McpTools::production(config).with_reference_unavailable(),
+    };
+    let server = McpServer::new(Arc::new(tools));
     run_stdio(
         io::stdin().lock(),
         io::stdout().lock(),
