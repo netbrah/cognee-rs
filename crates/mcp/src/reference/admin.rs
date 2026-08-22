@@ -5,9 +5,12 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
+#[cfg(feature = "engine")]
+use super::ReferenceEngineFactory;
 use super::{
     CommitReceipt, CommitStatus, DeltaStore, PreparedDocument, ReferenceCommand, ReferenceConfig,
-    ReferenceError, ReferenceLayout, ReferenceLimits, ReferenceRememberArgs, Source,
+    ReferenceEngineIdentity, ReferenceError, ReferenceLayout, ReferenceLimits,
+    ReferenceRememberArgs, Source, validate_published_generation,
 };
 use crate::cli::AgentError;
 use crate::config::ProcessEnv;
@@ -54,6 +57,17 @@ pub struct DoctorReport {
     pub highest_committed_sequence: u64,
     pub committed_records: usize,
     pub orphan_records: usize,
+    pub generation_id: Option<String>,
+    pub included_through: u64,
+    pub source_count: usize,
+    pub generation_files: usize,
+    pub publisher_locked: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RecoveryReceipt {
+    pub publish_lock_recovered: bool,
+    pub delta_head: super::DeltaHead,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -189,6 +203,13 @@ pub fn run_reference_remember_with(
 }
 
 pub fn run_reference_doctor(config: &ReferenceConfig) -> Result<DoctorReport, ReferenceError> {
+    run_reference_doctor_with_identity(config, None)
+}
+
+pub fn run_reference_doctor_with_identity(
+    config: &ReferenceConfig,
+    expected_identity: Option<&ReferenceEngineIdentity>,
+) -> Result<DoctorReport, ReferenceError> {
     config.layout.validate_reader_root()?;
     validate_reference_permissions(&config.layout)?;
     let store = DeltaStore::new(config.layout.clone(), config.limits);
@@ -200,12 +221,49 @@ pub fn run_reference_doctor(config: &ReferenceConfig) -> Result<DoctorReport, Re
         .into_iter()
         .filter(|entry| entry.file_name().to_string_lossy().ends_with(".json"))
         .count();
+    let published = if config.layout.current.exists() {
+        Some(validate_published_generation(config, expected_identity)?)
+    } else {
+        None
+    };
+    let publisher_locked = super::publisher::publish_lock_present(&config.layout)?;
     Ok(DoctorReport {
         status: "ok",
         highest_committed_sequence: snapshot.head.highest_committed_sequence,
         committed_records: snapshot.records.len(),
         orphan_records: event_files.saturating_sub(snapshot.records.len()),
+        generation_id: published
+            .as_ref()
+            .map(|generation| generation.generation_id.clone()),
+        included_through: published
+            .as_ref()
+            .map_or(0, |generation| generation.included_through),
+        source_count: published
+            .as_ref()
+            .map_or(0, |generation| generation.source_count),
+        generation_files: published
+            .as_ref()
+            .map_or(0, |generation| generation.file_count),
+        publisher_locked,
     })
+}
+
+#[cfg(feature = "engine")]
+pub fn run_reference_publish_from_env(
+    config: ReferenceConfig,
+    env: &impl crate::config::EnvSource,
+) -> Result<super::PublishRunReport, AgentError> {
+    let agent =
+        crate::config::AgentConfig::from_env(env).map_err(|_| ReferenceError::Unavailable)?;
+    let factory = super::CogneeReferenceEngineFactory::new(agent)?;
+    let publisher = super::ReferencePublisher::new(config, std::sync::Arc::new(factory))?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(ReferenceError::Io)?;
+    runtime
+        .block_on(publisher.publish_until_caught_up(Duration::from_secs(900)))
+        .map_err(AgentError::from)
 }
 
 fn validate_reference_permissions(layout: &ReferenceLayout) -> Result<(), ReferenceError> {
@@ -284,8 +342,25 @@ pub fn run_reference_command(command: &ReferenceCommand) -> Result<(), AgentErro
             }
             Ok(())
         }
-        ReferenceCommand::Publish => Err(AgentError::Unavailable("reference publish")),
+        ReferenceCommand::Publish => {
+            #[cfg(feature = "engine")]
+            {
+                let report = run_reference_publish_from_env(config, &ProcessEnv)?;
+                write_json_line(io::stdout().lock(), &report)?;
+                return Ok(());
+            }
+            #[cfg(not(feature = "engine"))]
+            Err(AgentError::Unavailable("reference publish"))
+        }
         ReferenceCommand::Doctor { json } => {
+            #[cfg(feature = "engine")]
+            let report = {
+                let agent = crate::config::AgentConfig::from_env(&ProcessEnv)
+                    .map_err(|_| ReferenceError::Unavailable)?;
+                let factory = super::CogneeReferenceEngineFactory::new(agent)?;
+                run_reference_doctor_with_identity(&config, Some(&factory.identity()))?
+            };
+            #[cfg(not(feature = "engine"))]
             let report = run_reference_doctor(&config)?;
             if *json {
                 write_json_line(io::stdout().lock(), &report)?;
@@ -306,8 +381,20 @@ pub fn run_reference_command(command: &ReferenceCommand) -> Result<(), AgentErro
             if !adopt_orphans {
                 return Err(ReferenceError::InvalidInput.into());
             }
+            let publish_lock_recovered = super::recover_publish_lock(
+                &config.layout,
+                &super::publisher::local_hostname()?,
+                super::publisher::process_is_alive,
+                std::sync::Arc::new(crate::atomic_fs::SystemSyncOps),
+            )?;
             let head = DeltaStore::new(config.layout.clone(), config.limits).adopt_orphans()?;
-            write_json_line(io::stdout().lock(), &head)?;
+            write_json_line(
+                io::stdout().lock(),
+                &RecoveryReceipt {
+                    publish_lock_recovered,
+                    delta_head: head,
+                },
+            )?;
             Ok(())
         }
     }

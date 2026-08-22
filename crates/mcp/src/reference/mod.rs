@@ -9,22 +9,38 @@
 mod admin;
 mod config;
 mod delta;
+mod engine;
 mod layout;
+mod publisher;
 mod record;
 
 use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
 
+#[cfg(feature = "engine")]
+pub use admin::run_reference_publish_from_env;
 #[cfg(feature = "runtime")]
 pub use admin::{
     CognificationWaiter, DoctorReport, FilesystemCognificationWaiter, PublishSpawner,
-    RememberReceipt, RememberRecordReceipt, SystemPublishSpawner, prepare_documents,
-    run_reference_command, run_reference_doctor, run_reference_remember_with,
+    RecoveryReceipt, RememberReceipt, RememberRecordReceipt, SystemPublishSpawner,
+    prepare_documents, run_reference_command, run_reference_doctor,
+    run_reference_doctor_with_identity, run_reference_remember_with,
 };
 pub use config::{REFERENCE_DATASET, ReferenceConfig, ReferenceLimits};
 pub use delta::{CommitReceipt, CommitStatus, DeltaHead, DeltaSnapshot, DeltaStore};
+#[cfg(feature = "engine")]
+pub use engine::CogneeReferenceEngineFactory;
+pub use engine::{
+    ReferenceEngineFactory, ReferenceEngineIdentity, ReferenceEngineInput, ReferenceEngineOpen,
+    ReferenceProviderFingerprint, ReferenceReadEngine, ReferenceRecallProbe, ReferenceWriteEngine,
+};
 pub use layout::ReferenceLayout;
+pub use publisher::{
+    CurrentPointer, FileManifestEntry, GenerationManifest, PublishFaultPoint, PublishHooks,
+    PublishReceipt, PublishRunReport, PublishedGenerationStatus, PublisherLock, ReferencePublisher,
+    SourceManifestEntry, recover_publish_lock, validate_published_generation,
+};
 pub use record::{PreparedDocument, ReferenceOperation, ReferenceRecord, Source, SourceKind};
 
 pub use crate::error::ReferenceError;

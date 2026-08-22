@@ -192,7 +192,7 @@ impl AgentConfig {
 }
 
 #[cfg(feature = "engine")]
-fn apex_user_agent() -> String {
+pub(crate) fn apex_user_agent() -> String {
     format!(
         "Apex/{} ({}; {})",
         env!("CARGO_PKG_VERSION"),

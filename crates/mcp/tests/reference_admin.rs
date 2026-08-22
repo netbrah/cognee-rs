@@ -1,3 +1,5 @@
+#![cfg(feature = "runtime")]
+
 use std::io::{self, Cursor, Read};
 use std::sync::atomic::{AtomicUsize, Ordering};
 

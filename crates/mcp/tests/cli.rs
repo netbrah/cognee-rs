@@ -174,6 +174,41 @@ fn parses_reference_publish_and_recovery_commands() {
 
 #[test]
 #[cfg(feature = "engine")]
+fn reference_publish_command_runs_the_bounded_worker() {
+    let temporary = tempfile::tempdir().expect("temporary root");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cognee-agent"))
+        .args(["reference", "publish"])
+        .env_clear()
+        .env("HOME", temporary.path())
+        .env(
+            "APEX_COGNEE_REFERENCE_ROOT",
+            temporary.path().join("reference"),
+        )
+        .env("APEX_COGNEE_PROXY_KEY", "fixture-key")
+        .env("APEX_COGNEE_LLM_PROVIDER", "openai")
+        .env("APEX_COGNEE_LLM_ENDPOINT", "https://proxy.example/v1")
+        .env("APEX_COGNEE_LLM_MODEL", "gpt-5.4-mini")
+        .env("APEX_COGNEE_EMBEDDING_PROVIDER", "openai")
+        .env("APEX_COGNEE_EMBEDDING_ENDPOINT", "https://proxy.example/v1")
+        .env("APEX_COGNEE_EMBEDDING_MODEL", "text-embedding-3-large")
+        .env("APEX_COGNEE_EMBEDDING_DIMENSIONS", "3072")
+        .output()
+        .expect("run reference publisher");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("publisher JSON receipt");
+    assert_eq!(report["caught_up"], true);
+    assert_eq!(report["committed_head"], 0);
+    assert_eq!(report["included_through"], 0);
+}
+
+#[test]
+#[cfg(feature = "engine")]
 fn drain_command_runs_an_empty_bounded_worker_without_opening_storage() {
     let temporary = tempfile::tempdir().expect("temporary root");
     let root = temporary.path().join("cognee");
