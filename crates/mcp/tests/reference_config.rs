@@ -84,7 +84,7 @@ fn configured_reference_root_rejects_relative_and_parent_components_without_leak
 
 #[test]
 #[cfg(unix)]
-fn configured_reference_root_rejects_a_symlinked_existing_ancestor() {
+fn configured_reference_root_resolves_a_symlinked_existing_ancestor() {
     use std::os::unix::fs::symlink;
 
     let temporary = tempfile::tempdir().expect("temporary directory");
@@ -97,14 +97,22 @@ fn configured_reference_root_rejects_a_symlinked_existing_ancestor() {
     symlink(outside.path(), &link).expect("create directory symlink");
     let configured = link.join("reference");
 
-    let error = ReferenceConfig::from_env(&fake_env([(
+    let config = ReferenceConfig::from_env(&fake_env([(
         "APEX_COGNEE_REFERENCE_ROOT",
         configured.to_str().expect("UTF-8 root"),
     )]))
-    .expect_err("symlinked ancestor must fail");
+    .expect("canonical reference config")
+    .expect("enabled reference config");
 
-    assert!(matches!(error, ReferenceError::InvalidRoot));
-    assert!(!format!("{error:?}").contains("operator-secret"));
+    assert_eq!(
+        config.layout.root,
+        outside
+            .path()
+            .canonicalize()
+            .expect("canonical outside directory")
+            .join("reference")
+    );
+    assert!(!format!("{config:?}").contains("operator-secret-link"));
 }
 
 #[test]

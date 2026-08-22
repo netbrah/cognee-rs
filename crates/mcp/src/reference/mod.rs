@@ -5,15 +5,27 @@
 //! stable configuration, layout, and administrator command surface; storage
 //! and recall are layered on in the sibling modules.
 
+#[cfg(feature = "runtime")]
+mod admin;
 mod config;
+mod delta;
 mod layout;
+mod record;
 
 use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
 
+#[cfg(feature = "runtime")]
+pub use admin::{
+    CognificationWaiter, DoctorReport, FilesystemCognificationWaiter, PublishSpawner,
+    RememberReceipt, RememberRecordReceipt, SystemPublishSpawner, prepare_documents,
+    run_reference_command, run_reference_doctor, run_reference_remember_with,
+};
 pub use config::{REFERENCE_DATASET, ReferenceConfig, ReferenceLimits};
+pub use delta::{CommitReceipt, CommitStatus, DeltaHead, DeltaSnapshot, DeltaStore};
 pub use layout::ReferenceLayout;
+pub use record::{PreparedDocument, ReferenceOperation, ReferenceRecord, Source, SourceKind};
 
 pub use crate::error::ReferenceError;
 

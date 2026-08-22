@@ -49,14 +49,7 @@ impl ReferenceConfig {
         };
         let configured = PathBuf::from(configured);
         validate_configured_root(&configured)?;
-        reject_symlinked_existing_ancestors(&configured)?;
-        let root = if configured.exists() {
-            configured
-                .canonicalize()
-                .map_err(|_| ReferenceError::InvalidRoot)?
-        } else {
-            configured
-        };
+        let root = canonicalize_with_missing_tail(&configured)?;
         validate_configured_root(&root)?;
         Ok(Some(Self {
             layout: ReferenceLayout::under(root),
@@ -66,20 +59,33 @@ impl ReferenceConfig {
     }
 }
 
-fn reject_symlinked_existing_ancestors(root: &Path) -> Result<(), ReferenceError> {
-    let mut prefix = PathBuf::new();
-    for component in root.components() {
-        prefix.push(component.as_os_str());
-        match std::fs::symlink_metadata(&prefix) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(ReferenceError::InvalidRoot);
+fn canonicalize_with_missing_tail(root: &Path) -> Result<PathBuf, ReferenceError> {
+    let mut existing = root.to_path_buf();
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(&existing) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = existing
+                    .file_name()
+                    .ok_or(ReferenceError::InvalidRoot)?
+                    .to_owned();
+                missing.push(name);
+                existing = existing
+                    .parent()
+                    .ok_or(ReferenceError::InvalidRoot)?
+                    .to_path_buf();
             }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
             Err(_) => return Err(ReferenceError::InvalidRoot),
         }
     }
-    Ok(())
+    let mut canonical = existing
+        .canonicalize()
+        .map_err(|_| ReferenceError::InvalidRoot)?;
+    for component in missing.into_iter().rev() {
+        canonical.push(component);
+    }
+    Ok(canonical)
 }
 
 pub(crate) fn validate_configured_root(root: &Path) -> Result<(), ReferenceError> {

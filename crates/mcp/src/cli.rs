@@ -75,6 +75,11 @@ pub fn run(cli: Cli) -> Result<(), AgentError> {
         );
     }
 
+    #[cfg(feature = "runtime")]
+    if let Command::Reference { command } = &cli.command {
+        return crate::reference::run_reference_command(command);
+    }
+
     let command = match cli.command {
         Command::Mcp => "mcp",
         Command::Hook => "hook",

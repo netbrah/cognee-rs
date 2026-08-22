@@ -64,12 +64,27 @@ pub fn write_atomic(
     replace: ReplaceMode,
     sync: &dyn SyncOps,
 ) -> Result<AtomicWriteOutcome, AtomicFsError> {
+    write_atomic_with_permissions(destination, contents, replace, 0o700, 0o600, sync)
+}
+
+/// Atomically install a file with explicit parent-directory and file modes.
+///
+/// Private-state callers should continue to use [`write_atomic`]. The shared
+/// reference plane uses this variant for immutable, reader-visible files.
+pub fn write_atomic_with_permissions(
+    destination: &Path,
+    contents: &[u8],
+    replace: ReplaceMode,
+    directory_mode: u32,
+    file_mode: u32,
+    sync: &dyn SyncOps,
+) -> Result<AtomicWriteOutcome, AtomicFsError> {
     let parent = destination.parent().ok_or(AtomicFsError::InvalidPath)?;
     let file_name = destination.file_name().ok_or(AtomicFsError::InvalidPath)?;
     if replace == ReplaceMode::NoReplace && destination.exists() {
         return Ok(AtomicWriteOutcome::Existing);
     }
-    ensure_private_directory(parent)?;
+    ensure_directory_with_mode(parent, directory_mode)?;
 
     let temporary = temporary_path(parent, file_name);
     let mut options = OpenOptions::new();
@@ -77,11 +92,11 @@ pub fn write_atomic(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options.mode(file_mode);
     }
     let mut file = options.open(&temporary)?;
     let result = (|| {
-        set_private_file_mode(&temporary)?;
+        set_file_mode(&temporary, file_mode)?;
         file.write_all(contents)?;
         sync.sync_file(&file)?;
         drop(file);
@@ -165,11 +180,15 @@ pub fn remove_durable(path: &Path, sync: &dyn SyncOps) -> Result<(), AtomicFsErr
 }
 
 pub fn ensure_private_directory(path: &Path) -> Result<(), AtomicFsError> {
+    ensure_directory_with_mode(path, 0o700)
+}
+
+fn ensure_directory_with_mode(path: &Path, mode: u32) -> Result<(), AtomicFsError> {
     fs::create_dir_all(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
     }
     Ok(())
 }
@@ -181,11 +200,11 @@ fn temporary_path(parent: &Path, file_name: &std::ffi::OsStr) -> PathBuf {
     parent.join(name)
 }
 
-fn set_private_file_mode(path: &Path) -> io::Result<()> {
+fn set_file_mode(path: &Path, mode: u32) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
     }
     Ok(())
 }
