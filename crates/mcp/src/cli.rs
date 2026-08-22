@@ -3,6 +3,7 @@
 use clap::{Parser, Subcommand};
 
 pub use crate::error::AgentError;
+use crate::reference::ReferenceCommand;
 
 #[derive(Debug, Parser)]
 #[command(name = "cognee-agent", about = "Cognee MCP agent")]
@@ -28,6 +29,11 @@ pub enum Command {
     },
     Doctor,
     Recover,
+    #[command(hide = true)]
+    Reference {
+        #[command(subcommand)]
+        command: ReferenceCommand,
+    },
 }
 
 /// Dispatch one agent command.
@@ -76,6 +82,7 @@ pub fn run(cli: Cli) -> Result<(), AgentError> {
         Command::Recall { .. } => "recall",
         Command::Doctor => "doctor",
         Command::Recover => "recover",
+        Command::Reference { .. } => "reference",
     };
 
     Err(AgentError::Unavailable(command))

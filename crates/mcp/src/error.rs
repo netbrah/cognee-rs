@@ -3,6 +3,40 @@
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+pub enum ReferenceError {
+    #[error("reference root is invalid")]
+    InvalidRoot,
+    #[error("reference memory is unavailable")]
+    Unavailable,
+    #[error("reference memory model fingerprint does not match")]
+    ModelMismatch,
+    #[error("reference memory is read-only")]
+    ReadOnly,
+    #[error("reference memory contains a corrupt record")]
+    CorruptRecord,
+    #[error("reference memory backlog limit reached; publish before retrying")]
+    BacklogLimit,
+    #[error("reference memory I/O failed")]
+    Io(#[source] std::io::Error),
+}
+
+impl ReferenceError {
+    pub const fn class(&self) -> &'static str {
+        match self {
+            Self::InvalidRoot | Self::Unavailable | Self::Io(_) => "REFERENCE_UNAVAILABLE",
+            Self::ModelMismatch => "REFERENCE_MODEL_MISMATCH",
+            Self::ReadOnly => "REFERENCE_READ_ONLY",
+            Self::CorruptRecord => "REFERENCE_CORRUPT_RECORD",
+            Self::BacklogLimit => "REFERENCE_BACKLOG_LIMIT",
+        }
+    }
+
+    pub const fn retryable(&self) -> bool {
+        matches!(self, Self::Unavailable | Self::Io(_) | Self::BacklogLimit)
+    }
+}
+
+#[derive(Debug, Error)]
 pub enum AgentError {
     #[error("{0} is not available in this build")]
     Unavailable(&'static str),
@@ -31,6 +65,8 @@ pub enum AgentError {
     InjectedFault(crate::worker::FaultPoint),
     #[error(transparent)]
     Spool(#[from] crate::spool::SpoolError),
+    #[error(transparent)]
+    Reference(#[from] ReferenceError),
 }
 
 impl AgentError {
@@ -52,6 +88,7 @@ impl AgentError {
             #[cfg(feature = "runtime")]
             Self::InjectedFault(_) => "injected_fault",
             Self::Spool(_) => "spool",
+            Self::Reference(error) => error.class(),
         }
     }
 
@@ -59,6 +96,7 @@ impl AgentError {
         match self {
             Self::Retryable(class) => Some(class),
             Self::Timeout(_) => Some("timeout"),
+            Self::Reference(error) if error.retryable() => Some(error.class()),
             _ => None,
         }
     }

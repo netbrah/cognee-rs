@@ -28,6 +28,7 @@ pub mod limits;
 pub mod mcp;
 pub mod protocol;
 pub mod redact;
+pub mod reference;
 #[cfg(feature = "runtime")]
 pub mod scheduler;
 pub mod secret;

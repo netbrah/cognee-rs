@@ -1,5 +1,6 @@
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use cognee_mcp::cli::{Cli, Command};
+use cognee_mcp::reference::ReferenceCommand;
 
 #[test]
 fn parses_all_five_top_level_commands() {
@@ -41,6 +42,134 @@ fn parses_read_only_recall_diagnostic_arguments() {
         }
         command => panic!("expected recall command, got {command:?}"),
     }
+}
+
+#[test]
+fn reference_command_is_hidden_from_root_help_but_remains_parseable() {
+    let help = Cli::command().render_long_help().to_string();
+    assert!(!help.contains("reference"), "{help}");
+
+    let cli = Cli::try_parse_from(["cognee-agent", "reference", "doctor", "--json"])
+        .expect("parse hidden reference command");
+    assert!(matches!(
+        cli.command,
+        Command::Reference {
+            command: ReferenceCommand::Doctor { json: true }
+        }
+    ));
+}
+
+#[test]
+fn reference_remember_accepts_repeated_file_aliases_without_selecting_stdin() {
+    let cli = Cli::try_parse_from([
+        "cognee-agent",
+        "reference",
+        "remember",
+        "-f",
+        "standards.md",
+        "--file",
+        "runbook.md",
+        "--wait-cognified",
+        "--wait-seconds",
+        "7200",
+    ])
+    .expect("parse file ingestion");
+
+    let Command::Reference {
+        command: ReferenceCommand::Remember(arguments),
+    } = cli.command
+    else {
+        panic!("expected reference remember command");
+    };
+    assert_eq!(
+        arguments.files,
+        vec![
+            std::path::PathBuf::from("standards.md"),
+            std::path::PathBuf::from("runbook.md")
+        ]
+    );
+    assert!(!arguments.uses_stdin());
+    assert!(arguments.wait_cognified);
+    assert_eq!(arguments.wait_seconds, 7200);
+}
+
+#[test]
+fn reference_remember_selects_stdin_only_when_files_are_absent() {
+    let cli = Cli::try_parse_from([
+        "cognee-agent",
+        "reference",
+        "remember",
+        "--source-id",
+        "fleet-standard",
+        "--label",
+        "Storage standard",
+    ])
+    .expect("parse stdin ingestion");
+
+    let Command::Reference {
+        command: ReferenceCommand::Remember(arguments),
+    } = cli.command
+    else {
+        panic!("expected reference remember command");
+    };
+    assert!(arguments.uses_stdin());
+    assert_eq!(arguments.source_id.as_deref(), Some("fleet-standard"));
+    assert_eq!(arguments.label.as_deref(), Some("Storage standard"));
+    assert_eq!(arguments.wait_seconds, 1800);
+}
+
+#[test]
+fn reference_remember_rejects_stdin_identity_with_files_and_invalid_wait_bounds() {
+    for arguments in [
+        vec![
+            "cognee-agent",
+            "reference",
+            "remember",
+            "-f",
+            "standards.md",
+            "--source-id",
+            "fleet-standard",
+        ],
+        vec![
+            "cognee-agent",
+            "reference",
+            "remember",
+            "--wait-seconds",
+            "0",
+        ],
+        vec![
+            "cognee-agent",
+            "reference",
+            "remember",
+            "--wait-seconds",
+            "7201",
+        ],
+    ] {
+        assert!(Cli::try_parse_from(arguments).is_err());
+    }
+}
+
+#[test]
+fn parses_reference_publish_and_recovery_commands() {
+    let publish =
+        Cli::try_parse_from(["cognee-agent", "reference", "publish"]).expect("parse publish");
+    assert!(matches!(
+        publish.command,
+        Command::Reference {
+            command: ReferenceCommand::Publish
+        }
+    ));
+
+    let recover = Cli::try_parse_from(["cognee-agent", "reference", "recover", "--adopt-orphans"])
+        .expect("parse recovery");
+    assert!(matches!(
+        recover.command,
+        Command::Reference {
+            command: ReferenceCommand::Recover {
+                adopt_orphans: true
+            }
+        }
+    ));
 }
 
 #[test]
