@@ -1,7 +1,9 @@
 #![cfg(feature = "runtime")]
 
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -91,6 +93,7 @@ struct FakeState {
     probes: Mutex<Vec<ReferenceRecallProbe>>,
     on_ingest: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     mutate_during_probe: Mutex<bool>,
+    mutate_access_time_during_probe: Mutex<bool>,
     unsafe_artifact: Mutex<Option<UnsafeArtifact>>,
 }
 
@@ -102,9 +105,13 @@ struct FakeFactory {
 
 impl FakeFactory {
     fn new() -> Self {
+        Self::with_identity(identity())
+    }
+
+    fn with_identity(identity: ReferenceEngineIdentity) -> Self {
         Self {
             state: Arc::new(FakeState::default()),
-            identity: identity(),
+            identity,
         }
     }
 
@@ -126,6 +133,14 @@ impl FakeFactory {
             .mutate_during_probe
             .lock()
             .expect("probe mutation lock") = true;
+    }
+
+    fn mutate_access_time_during_probe(&self) {
+        *self
+            .state
+            .mutate_access_time_during_probe
+            .lock()
+            .expect("probe access-time mutation lock") = true;
     }
 
     fn create_unsafe_artifact(&self, artifact: UnsafeArtifact) {
@@ -215,6 +230,18 @@ impl ReferenceReadEngine for FakeReader {
             .expect("probe mutation lock")
         {
             std::fs::write(self.root.join("data/probe-write"), b"unexpected")?;
+        }
+        if *self
+            .state
+            .mutate_access_time_during_probe
+            .lock()
+            .expect("probe access-time mutation lock")
+        {
+            let file = std::fs::File::open(self.root.join("data/cognee.db"))?;
+            file.set_times(
+                std::fs::FileTimes::new()
+                    .set_accessed(std::time::SystemTime::now() + Duration::from_secs(86_400)),
+            )?;
         }
         Ok(true)
     }
@@ -316,8 +343,37 @@ async fn publisher_uses_one_head_snapshot_then_incrementally_applies_only_new_so
     assert_eq!(factory.batches().len(), 1);
     assert_eq!(factory.batches()[0].len(), 1);
     assert_eq!(
-        factory.batches()[0][0].external_metadata["reference_source_id"],
-        first.source_id
+        factory.batches()[0][0].external_metadata,
+        BTreeMap::from([
+            (
+                "externalEventId".to_owned(),
+                serde_json::Value::String(first.event_id.clone()),
+            ),
+            (
+                "cognee_external_event_id".to_owned(),
+                serde_json::Value::String(first.event_id.clone()),
+            ),
+            (
+                "reference_source_id".to_owned(),
+                serde_json::Value::String(first.source_id.clone()),
+            ),
+            (
+                "reference_revision".to_owned(),
+                serde_json::Value::from(first.revision),
+            ),
+            (
+                "reference_label".to_owned(),
+                serde_json::Value::String(first.source_label.clone()),
+            ),
+            (
+                "content_type".to_owned(),
+                serde_json::Value::String(first.content_type.clone()),
+            ),
+            (
+                "content_sha256".to_owned(),
+                serde_json::Value::String(first.content_sha256.clone()),
+            ),
+        ])
     );
 
     let second_publish = publisher.publish_once().await.expect("second publication");
@@ -408,6 +464,117 @@ async fn superseding_a_source_rebuilds_from_only_the_latest_source_catalog() {
         replacement.event_id
     );
     assert_ne!(first.event_id, replacement.event_id);
+}
+
+#[tokio::test]
+async fn builder_manifest_build_fingerprints_force_full_rebuilds_when_they_change() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let config = config(temporary.path().join("reference"));
+    seed(&config, "alpha standard", "alpha", "alpha.md");
+    publisher(config.clone(), FakeFactory::new())
+        .publish_once()
+        .await
+        .expect("initial publication");
+    let initial_manifest: serde_json::Value =
+        read_json(&config.layout.builder.join("manifest.json"));
+    assert_eq!(initial_manifest["cognee_rs_commit"], "0123456789abcdef");
+    assert_eq!(initial_manifest["adapter_version"], "1.4.4");
+
+    seed(&config, "bravo standard", "bravo", "bravo.md");
+    let mut changed_commit = identity();
+    changed_commit.cognee_rs_commit = "fedcba9876543210".to_owned();
+    let commit_factory = FakeFactory::with_identity(changed_commit.clone());
+    let commit_receipt = publisher(config.clone(), commit_factory.clone())
+        .publish_once()
+        .await
+        .expect("commit-change publication");
+    assert!(commit_receipt.rebuilt);
+    assert_eq!(commit_factory.batches()[0].len(), 2);
+
+    seed(&config, "charlie standard", "charlie", "charlie.md");
+    changed_commit.adapter_version = "1.4.5".to_owned();
+    let adapter_factory = FakeFactory::with_identity(changed_commit);
+    let adapter_receipt = publisher(config, adapter_factory.clone())
+        .publish_once()
+        .await
+        .expect("adapter-change publication");
+    assert!(adapter_receipt.rebuilt);
+    assert_eq!(adapter_factory.batches()[0].len(), 3);
+}
+
+#[tokio::test]
+async fn publisher_rejects_missing_or_unknown_engine_commit_before_ingesting_nonempty_content() {
+    for commit in ["", "unknown"] {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = config(temporary.path().join("reference"));
+        seed(&config, "identity required", "identity", "identity.md");
+        let mut invalid = identity();
+        invalid.cognee_rs_commit = commit.to_owned();
+        let factory = FakeFactory::with_identity(invalid);
+
+        let error = publisher(config.clone(), factory.clone())
+            .publish_once()
+            .await
+            .expect_err("missing or unknown build identity must block publication");
+
+        assert!(matches!(error, ReferenceError::Unavailable));
+        assert!(factory.batches().is_empty());
+        assert!(!config.layout.current.exists());
+    }
+}
+
+#[tokio::test]
+async fn interrupted_incremental_cognify_is_quarantined_and_rebuilt_on_retry() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let config = config(temporary.path().join("reference"));
+    seed(&config, "alpha standard", "alpha", "alpha.md");
+    let factory = FakeFactory::new();
+    publisher(config.clone(), factory.clone())
+        .publish_once()
+        .await
+        .expect("initial publication");
+    seed(&config, "bravo standard", "bravo", "bravo.md");
+    let faulted = cognee_mcp::reference::ReferencePublisher::with_dependencies(
+        config.clone(),
+        Arc::new(factory.clone()),
+        Arc::new(SystemSyncOps),
+        Arc::new(FailOnceAt {
+            point: PublishFaultPoint::AfterIngest,
+            fired: AtomicBool::new(false),
+        }),
+        "builder-host".to_owned(),
+    );
+
+    let error = faulted
+        .publish_once()
+        .await
+        .expect_err("injected incremental failure");
+    assert!(matches!(error, ReferenceError::Unavailable));
+    let dirty_manifest: serde_json::Value = read_json(&config.layout.builder.join("manifest.json"));
+    assert_eq!(dirty_manifest["dirty"], true);
+
+    let retry = faulted.publish_once().await.expect("retry publication");
+
+    assert!(retry.rebuilt);
+    let batches = factory.batches();
+    assert_eq!(batches.len(), 3);
+    assert_eq!(batches[1].len(), 1);
+    assert_eq!(batches[2].len(), 2);
+    let mut rebuilt_contents = batches[2]
+        .iter()
+        .map(|input| input.content.as_str())
+        .collect::<Vec<_>>();
+    rebuilt_contents.sort_unstable();
+    assert_eq!(rebuilt_contents, ["alpha standard", "bravo standard"]);
+    assert!(
+        std::fs::read_dir(&config.layout.staging)
+            .expect("staging directory")
+            .filter_map(Result::ok)
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("invalid-builder-"))
+    );
 }
 
 #[tokio::test]
@@ -508,6 +675,20 @@ async fn generation_validation_checks_inventory_catalog_and_model_fingerprint() 
     assert!(!doctor.publisher_locked);
 
     let mut mismatch = identity();
+    mismatch.cognee_rs_commit = "fedcba9876543210".to_owned();
+    assert!(matches!(
+        validate_published_generation(&config, Some(&mismatch)),
+        Err(ReferenceError::ModelMismatch)
+    ));
+
+    let mut mismatch = identity();
+    mismatch.adapter_version = "1.4.5".to_owned();
+    assert!(matches!(
+        validate_published_generation(&config, Some(&mismatch)),
+        Err(ReferenceError::ModelMismatch)
+    ));
+
+    let mut mismatch = identity();
     mismatch.embedding.model = "different-embedding".to_owned();
     assert!(matches!(
         validate_published_generation(&config, Some(&mismatch)),
@@ -541,6 +722,89 @@ async fn generation_validation_checks_inventory_catalog_and_model_fingerprint() 
 }
 
 #[tokio::test]
+async fn caught_up_fast_path_rebuilds_and_republishes_a_corrupt_generation() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let config = config(temporary.path().join("reference"));
+    seed(&config, "validated reference", "validated", "validated.md");
+    let factory = FakeFactory::new();
+    let initial = publisher(config.clone(), factory.clone())
+        .publish_once()
+        .await
+        .expect("initial publication");
+    let artifact = config
+        .layout
+        .generations
+        .join(&initial.generation_id)
+        .join("vector/vectors.lance");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&artifact, std::fs::Permissions::from_mode(0o644))
+            .expect("make artifact writable for corruption fixture");
+    }
+    std::fs::write(&artifact, b"corrupt-vector").expect("corrupt current generation");
+
+    let replacement = publisher(config.clone(), factory)
+        .publish_once()
+        .await
+        .expect("replacement publication");
+
+    assert!(replacement.published);
+    assert!(replacement.rebuilt);
+    assert_ne!(replacement.generation_id, initial.generation_id);
+    validate_published_generation(&config, Some(&identity()))
+        .expect("replacement generation validates");
+}
+
+#[tokio::test]
+async fn caught_up_fast_path_rebuilds_for_a_changed_model_fingerprint() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let config = config(temporary.path().join("reference"));
+    seed(&config, "model-bound reference", "model", "model.md");
+    let initial_factory = FakeFactory::new();
+    publisher(config.clone(), initial_factory)
+        .publish_once()
+        .await
+        .expect("initial publication");
+    let mut changed_identity = identity();
+    changed_identity.llm.model = "gpt-5.4".to_owned();
+    let changed_factory = FakeFactory::with_identity(changed_identity.clone());
+
+    let replacement = publisher(config.clone(), changed_factory.clone())
+        .publish_once()
+        .await
+        .expect("model-change publication");
+
+    assert!(replacement.published);
+    assert!(replacement.rebuilt);
+    assert_eq!(changed_factory.batches()[0].len(), 1);
+    validate_published_generation(&config, Some(&changed_identity))
+        .expect("replacement model fingerprint validates");
+}
+
+#[tokio::test]
+async fn caught_up_fast_path_preserves_generation_io_failures() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let config = config(temporary.path().join("reference"));
+    seed(&config, "missing generation", "missing", "missing.md");
+    let factory = FakeFactory::new();
+    publisher(config.clone(), factory.clone())
+        .publish_once()
+        .await
+        .expect("initial publication");
+    let mut current = read_current(&config);
+    current.generation_id = "missing-generation".to_owned();
+    replace_current(&config, &current);
+
+    let error = publisher(config, factory)
+        .publish_once()
+        .await
+        .expect_err("missing generation is an I/O failure");
+
+    assert!(matches!(error, ReferenceError::Io(_)));
+}
+
+#[tokio::test]
 async fn staged_read_only_probe_must_not_change_the_generation_tree() {
     let temporary = tempfile::tempdir().expect("temporary directory");
     let config = config(temporary.path().join("reference"));
@@ -561,6 +825,24 @@ async fn staged_read_only_probe_must_not_change_the_generation_tree() {
             .next()
             .is_none()
     );
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn staged_read_only_probe_must_not_change_file_access_times() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let config = config(temporary.path().join("reference"));
+    seed(&config, "access-time sentinel", "sentinel", "sentinel.md");
+    let factory = FakeFactory::new();
+    factory.mutate_access_time_during_probe();
+
+    let error = publisher(config.clone(), factory)
+        .publish_once()
+        .await
+        .expect_err("access-time mutation must block publication");
+
+    assert!(matches!(error, ReferenceError::ReadOnly));
+    assert!(!config.layout.current.exists());
 }
 
 #[tokio::test]
@@ -590,6 +872,21 @@ async fn publisher_rejects_symlinks_hard_links_and_sockets_from_the_builder() {
 #[derive(Debug)]
 struct FailAt {
     point: PublishFaultPoint,
+}
+
+#[derive(Debug)]
+struct FailOnceAt {
+    point: PublishFaultPoint,
+    fired: AtomicBool,
+}
+
+impl PublishHooks for FailOnceAt {
+    fn checkpoint(&self, point: PublishFaultPoint) -> Result<(), ReferenceError> {
+        if point == self.point && !self.fired.swap(true, Ordering::SeqCst) {
+            return Err(ReferenceError::Unavailable);
+        }
+        Ok(())
+    }
 }
 
 impl PublishHooks for FailAt {
@@ -753,6 +1050,29 @@ fn recovery_never_reclaims_a_live_or_cross_host_publish_lock() {
 
 fn read_current(config: &ReferenceConfig) -> CurrentPointer {
     read_json(&config.layout.current)
+}
+
+fn replace_current(config: &ReferenceConfig, current: &CurrentPointer) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            &config.layout.current,
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .expect("make current pointer writable");
+    }
+    std::fs::write(
+        &config.layout.current,
+        serde_json::to_vec(current).expect("serialize current pointer"),
+    )
+    .expect("replace current pointer fixture");
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        &config.layout.current,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o444),
+    )
+    .expect("restore current pointer mode");
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> T {
@@ -931,4 +1251,60 @@ fn concrete_reference_settings_route_both_provider_clients_with_apex_identity() 
     );
     assert!(settings.vector_db_url.ends_with("generation/vector"));
     assert!(settings.graph_file_path.ends_with("generation/graph"));
+}
+
+#[test]
+#[cfg(feature = "engine")]
+fn reference_factory_rejects_any_noncanonical_embedding_contract() {
+    use std::collections::HashMap;
+
+    use cognee_mcp::config::{AgentConfig, EnvSource};
+    use cognee_mcp::reference::CogneeReferenceEngineFactory;
+
+    struct FakeEnv(HashMap<String, String>);
+
+    impl EnvSource for FakeEnv {
+        fn get(&self, key: &str) -> Option<String> {
+            self.0.get(key).cloned()
+        }
+    }
+
+    for (model, dimensions) in [
+        ("text-embedding-3-small", "3072"),
+        ("text-embedding-3-large", "1536"),
+    ] {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let env = FakeEnv(HashMap::from([
+            ("HOME".to_owned(), temporary.path().display().to_string()),
+            ("APEX_COGNEE_PROXY_KEY".to_owned(), "fixture-key".to_owned()),
+            ("APEX_COGNEE_LLM_PROVIDER".to_owned(), "openai".to_owned()),
+            (
+                "APEX_COGNEE_LLM_ENDPOINT".to_owned(),
+                "https://proxy.example/v1".to_owned(),
+            ),
+            (
+                "APEX_COGNEE_LLM_MODEL".to_owned(),
+                "gpt-5.4-mini".to_owned(),
+            ),
+            (
+                "APEX_COGNEE_EMBEDDING_PROVIDER".to_owned(),
+                "openai".to_owned(),
+            ),
+            (
+                "APEX_COGNEE_EMBEDDING_ENDPOINT".to_owned(),
+                "https://proxy.example/v1".to_owned(),
+            ),
+            ("APEX_COGNEE_EMBEDDING_MODEL".to_owned(), model.to_owned()),
+            (
+                "APEX_COGNEE_EMBEDDING_DIMENSIONS".to_owned(),
+                dimensions.to_owned(),
+            ),
+        ]));
+        let agent = AgentConfig::from_env(&env).expect("syntactically valid agent config");
+
+        assert!(matches!(
+            CogneeReferenceEngineFactory::new(agent),
+            Err(ReferenceError::Unavailable)
+        ));
+    }
 }

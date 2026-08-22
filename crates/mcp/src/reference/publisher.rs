@@ -90,6 +90,12 @@ struct BuilderManifest {
     dataset: String,
     included_through: u64,
     sources: Vec<SourceManifestEntry>,
+    #[serde(default = "dirty_builder_manifest")]
+    dirty: bool,
+    #[serde(default)]
+    cognee_rs_commit: String,
+    #[serde(default)]
+    adapter_version: String,
     llm: ReferenceProviderFingerprint,
     embedding: ReferenceProviderFingerprint,
 }
@@ -235,29 +241,43 @@ impl ReferencePublisher {
                 published: false,
             });
         }
+        let identity = self.factory.identity();
+        if !has_known_build_fingerprint(&identity.cognee_rs_commit)
+            || !has_known_build_fingerprint(&identity.adapter_version)
+        {
+            return Err(ReferenceError::Unavailable);
+        }
+        let mut rebuild_for_invalid_current = false;
         if let Some(current) = read_optional_json::<CurrentPointer>(&self.config.layout.current)?
-            && current.schema_version == REFERENCE_SCHEMA_VERSION
             && current.included_through == snapshot.head.highest_committed_sequence
         {
-            return Ok(PublishReceipt {
-                generation_id: current.generation_id,
-                included_through: current.included_through,
-                source_count: latest.len(),
-                rebuilt: false,
-                published: false,
-            });
+            match validate_published_generation(&self.config, Some(&identity)) {
+                Ok(validated) => {
+                    return Ok(PublishReceipt {
+                        generation_id: validated.generation_id,
+                        included_through: validated.included_through,
+                        source_count: validated.source_count,
+                        rebuilt: false,
+                        published: false,
+                    });
+                }
+                Err(ReferenceError::CorruptRecord | ReferenceError::ModelMismatch) => {
+                    rebuild_for_invalid_current = true;
+                }
+                Err(error) => return Err(error),
+            }
         }
 
-        let identity = self.factory.identity();
         let existing_builder = read_optional_json::<BuilderManifest>(
             &self.config.layout.builder.join("manifest.json"),
         )?;
-        let rebuild = builder_requires_rebuild(
-            existing_builder.as_ref(),
-            &snapshot.records,
-            &identity,
-            &self.config,
-        );
+        let rebuild = rebuild_for_invalid_current
+            || builder_requires_rebuild(
+                existing_builder.as_ref(),
+                &snapshot.records,
+                &identity,
+                &self.config,
+            );
         let (inputs, previous_sources) = if rebuild {
             reset_builder(&self.config.layout, self.sync.as_ref())?;
             (latest.values().cloned().collect::<Vec<_>>(), Vec::new())
@@ -276,19 +296,28 @@ impl ReferencePublisher {
             )
         };
 
-        if !inputs.is_empty() {
-            self.ingest_builder(&identity, &inputs).await?;
-        }
-
         let sources = merge_source_manifest(previous_sources, &inputs, rebuild, &latest);
-        let builder_manifest = BuilderManifest {
+        let mut builder_manifest = BuilderManifest {
             schema_version: REFERENCE_SCHEMA_VERSION,
             dataset: self.config.dataset.to_owned(),
             included_through: snapshot.head.highest_committed_sequence,
             sources: sources.clone(),
+            dirty: !inputs.is_empty(),
+            cognee_rs_commit: identity.cognee_rs_commit.clone(),
+            adapter_version: identity.adapter_version.clone(),
             llm: identity.llm.clone(),
             embedding: identity.embedding.clone(),
         };
+        if !inputs.is_empty() {
+            write_private_json(
+                &self.config.layout.builder.join("manifest.json"),
+                &builder_manifest,
+                ReplaceMode::Replace,
+                self.sync.as_ref(),
+            )?;
+            self.ingest_builder(&identity, &inputs).await?;
+            builder_manifest.dirty = false;
+        }
         write_private_json(
             &self.config.layout.builder.join("manifest.json"),
             &builder_manifest,
@@ -565,14 +594,17 @@ pub fn validate_published_generation(
         || manifest.generation_id != current.generation_id
         || manifest.dataset != config.dataset
         || manifest.included_through != current.included_through
-        || manifest.cognee_rs_commit.is_empty()
-        || manifest.adapter_version.is_empty()
+        || !has_known_build_fingerprint(&manifest.cognee_rs_commit)
+        || !has_known_build_fingerprint(&manifest.adapter_version)
         || !manifest.probe.verified
     {
         return Err(ReferenceError::CorruptRecord);
     }
     if let Some(expected) = expected_identity
-        && (manifest.llm != expected.llm || manifest.embedding != expected.embedding)
+        && (manifest.cognee_rs_commit != expected.cognee_rs_commit
+            || manifest.adapter_version != expected.adapter_version
+            || manifest.llm != expected.llm
+            || manifest.embedding != expected.embedding)
     {
         return Err(ReferenceError::ModelMismatch);
     }
@@ -606,6 +638,10 @@ fn engine_input(record: &ReferenceRecord) -> ReferenceEngineInput {
         content: record.content.clone(),
         label: record.source_label.clone(),
         external_metadata: BTreeMap::from([
+            (
+                "externalEventId".to_owned(),
+                Value::String(record.event_id.clone()),
+            ),
             (
                 "cognee_external_event_id".to_owned(),
                 Value::String(record.event_id.clone()),
@@ -653,6 +689,9 @@ fn builder_requires_rebuild(
     };
     if manifest.schema_version != REFERENCE_SCHEMA_VERSION
         || manifest.dataset != config.dataset
+        || manifest.dirty
+        || manifest.cognee_rs_commit != identity.cognee_rs_commit
+        || manifest.adapter_version != identity.adapter_version
         || manifest.llm != identity.llm
         || manifest.embedding != identity.embedding
         || !config.layout.builder.join("data").is_dir()
@@ -687,6 +726,15 @@ fn builder_requires_rebuild(
             record.supersedes_event_id.is_some()
                 || known_sources.contains(record.source_id.as_str())
         })
+}
+
+fn has_known_build_fingerprint(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty() && !value.eq_ignore_ascii_case("unknown")
+}
+
+const fn dirty_builder_manifest() -> bool {
+    true
 }
 
 fn merge_source_manifest(
@@ -856,6 +904,7 @@ struct TreeEntry {
     directory: bool,
     bytes: u64,
     modified_nanos: u128,
+    accessed_nanos: u128,
     sha256: Option<String>,
 }
 
@@ -875,16 +924,12 @@ fn tree_fingerprint(root: &Path) -> Result<Vec<TreeEntry>, ReferenceError> {
             if !directory && !metadata.is_file() {
                 return Err(ReferenceError::CorruptRecord);
             }
-            let modified_nanos = metadata
-                .modified()
-                .ok()
-                .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-                .map_or(0, |duration| duration.as_nanos());
             result.push(TreeEntry {
                 path: safe_relative_string(root, &path)?,
                 directory,
                 bytes: metadata.len(),
-                modified_nanos,
+                modified_nanos: 0,
+                accessed_nanos: 0,
                 sha256: if directory {
                     None
                 } else {
@@ -895,6 +940,23 @@ fn tree_fingerprint(root: &Path) -> Result<Vec<TreeEntry>, ReferenceError> {
                 pending.push(path);
             }
         }
+    }
+    // Reading directories and hashing files can update their access times.
+    // Capture all metadata only after those fingerprint-internal reads finish,
+    // so the before/after comparison measures the probe rather than itself.
+    for entry in &mut result {
+        let metadata = fs::symlink_metadata(root.join(&entry.path))?;
+        entry.bytes = metadata.len();
+        entry.modified_nanos = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |duration| duration.as_nanos());
+        entry.accessed_nanos = metadata
+            .accessed()
+            .ok()
+            .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |duration| duration.as_nanos());
     }
     result.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(result)

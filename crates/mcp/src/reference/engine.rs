@@ -9,6 +9,11 @@ use serde_json::Value;
 use super::REFERENCE_DATASET;
 use super::ReferenceError;
 
+#[cfg(feature = "engine")]
+const REFERENCE_EMBEDDING_MODEL: &str = "text-embedding-3-large";
+#[cfg(feature = "engine")]
+const REFERENCE_EMBEDDING_DIMENSIONS: u32 = 3072;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReferenceProviderFingerprint {
     pub provider: String,
@@ -103,8 +108,8 @@ impl CogneeReferenceEngineFactory {
             || config.llm.model.trim().is_empty()
             || embedding.provider.trim().is_empty()
             || embedding.endpoint.trim().is_empty()
-            || embedding.model.trim().is_empty()
-            || embedding.dimensions == 0
+            || embedding.model != REFERENCE_EMBEDDING_MODEL
+            || embedding.dimensions != REFERENCE_EMBEDDING_DIMENSIONS
             || config.proxy_key().is_empty()
         {
             return Err(ReferenceError::Unavailable);
@@ -309,13 +314,37 @@ impl ReferenceReadEngine for CogneeReferenceReadEngine {
             cognee_bindings_common::ops::retrieval::recall(&self.state, &probe.query, &options)
                 .await
                 .map_err(|_| ReferenceError::Unavailable)?;
-        Ok(json_contains_string(&result, &probe.expected_event_id))
+        Ok(recall_result_contains_probe(&result, probe))
     }
 
     async fn close(self: Box<Self>) -> Result<(), ReferenceError> {
         self.state.close().await;
         Ok(())
     }
+}
+
+#[cfg(feature = "engine")]
+fn recall_result_contains_probe(value: &Value, probe: &ReferenceRecallProbe) -> bool {
+    if value.get("searchTypeUsed").and_then(Value::as_str) != Some("CHUNKS") {
+        return false;
+    }
+    let Some(items) = value.get("items").and_then(Value::as_array) else {
+        return false;
+    };
+    items.iter().any(|item| {
+        if item.get("source").and_then(Value::as_str) != Some("graph") {
+            return false;
+        }
+        let Some(content) = item.get("content") else {
+            return false;
+        };
+        json_contains_string(content, &probe.expected_event_id)
+            || (!probe.query.is_empty()
+                && content
+                    .pointer("/payload/text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.contains(&probe.query)))
+    })
 }
 
 #[cfg(feature = "engine")]
@@ -329,5 +358,59 @@ fn json_contains_string(value: &Value, expected: &str) -> bool {
             .values()
             .any(|value| json_contains_string(value, expected)),
         Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+
+#[cfg(all(test, feature = "engine"))]
+mod tests {
+    use serde_json::json;
+
+    use super::{ReferenceRecallProbe, recall_result_contains_probe};
+
+    #[test]
+    fn serialized_chunks_response_matches_relevant_content_without_provenance() {
+        let response = json!({
+            "items": [{
+                "source": "graph",
+                "content": {
+                    "id": "30d5ce68-63a4-42bb-a64d-07ca7d1a7c4a",
+                    "score": 0.98,
+                    "payload": {
+                        "type": "DocumentChunk",
+                        "text": "The APEX reference sentinel is cobalt-orchid-742.",
+                        "dataset_id": "bd91b9e2-0f28-43b8-8fe5-10a602b0fef3"
+                    }
+                },
+                "score": 1.0
+            }],
+            "searchTypeUsed": "CHUNKS",
+            "autoRouted": false,
+            "searchResponse": {
+                "search_type": "CHUNKS",
+                "result": {
+                    "kind": "Items",
+                    "data": [{
+                        "id": "30d5ce68-63a4-42bb-a64d-07ca7d1a7c4a",
+                        "score": 0.98,
+                        "payload": {
+                            "type": "DocumentChunk",
+                            "text": "The APEX reference sentinel is cobalt-orchid-742.",
+                            "dataset_id": "bd91b9e2-0f28-43b8-8fe5-10a602b0fef3"
+                        }
+                    }]
+                }
+            }
+        });
+        let relevant = ReferenceRecallProbe {
+            query: "APEX reference sentinel is cobalt-orchid-742".to_owned(),
+            expected_event_id: "event-id-not-present-in-chunks".to_owned(),
+        };
+        let unrelated = ReferenceRecallProbe {
+            query: "different source content".to_owned(),
+            expected_event_id: "event-id-not-present-in-chunks".to_owned(),
+        };
+
+        assert!(recall_result_contains_probe(&response, &relevant));
+        assert!(!recall_result_contains_probe(&response, &unrelated));
     }
 }
