@@ -20,9 +20,9 @@ use cognee_mcp::ledger::Ledger;
 use cognee_mcp::mcp::ToolRouter;
 use cognee_mcp::reference::{
     DeltaStore, PreparedDocument, ReferenceConfig, ReferenceEngineFactory, ReferenceEngineIdentity,
-    ReferenceEngineOpen, ReferenceError, ReferenceLayout, ReferenceLimits,
-    ReferenceProviderFingerprint, ReferenceReadEngine, ReferenceReader, ReferenceWriteEngine,
-    Source,
+    ReferenceEngineInput, ReferenceEngineOpen, ReferenceError, ReferenceLayout, ReferenceLimits,
+    ReferenceProviderFingerprint, ReferencePublisher, ReferenceReadEngine, ReferenceReader,
+    ReferenceRecallProbe, ReferenceWriteEngine, Source,
 };
 use cognee_mcp::spool::{Priority, Spool, SpoolRecord};
 use cognee_mcp::tools::{McpTools, tool_descriptors};
@@ -229,6 +229,89 @@ impl ReferenceEngineFactory for UnusedReferenceFactory {
     }
 }
 
+#[derive(Default)]
+struct RecordingReferenceState {
+    recalls: Mutex<Vec<RecallRequest>>,
+}
+
+#[derive(Clone)]
+struct RecordingReferenceFactory {
+    state: Arc<RecordingReferenceState>,
+}
+
+struct RecordingReferenceWriter {
+    root: std::path::PathBuf,
+}
+
+struct RecordingReferenceReader {
+    state: Arc<RecordingReferenceState>,
+}
+
+#[async_trait]
+impl ReferenceWriteEngine for RecordingReferenceWriter {
+    async fn add_and_cognify(
+        &mut self,
+        _dataset: &str,
+        _inputs: Vec<ReferenceEngineInput>,
+    ) -> Result<(), ReferenceError> {
+        for directory in ["data", "vector", "graph"] {
+            let directory = self.root.join(directory);
+            std::fs::create_dir_all(&directory)?;
+            std::fs::write(directory.join("store"), b"fixture")?;
+        }
+        Ok(())
+    }
+
+    async fn close(self: Box<Self>) -> Result<(), ReferenceError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ReferenceReadEngine for RecordingReferenceReader {
+    async fn recall_contains(
+        &mut self,
+        _dataset: &str,
+        _probe: &ReferenceRecallProbe,
+    ) -> Result<bool, ReferenceError> {
+        Ok(true)
+    }
+
+    async fn recall(&mut self, request: RecallRequest) -> Result<RecallResponse, ReferenceError> {
+        self.state.recalls.lock().expect("recalls").push(request);
+        Ok(RecallResponse::default())
+    }
+
+    async fn close(self: Box<Self>) -> Result<(), ReferenceError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ReferenceEngineFactory for RecordingReferenceFactory {
+    fn identity(&self) -> ReferenceEngineIdentity {
+        reference_identity()
+    }
+
+    async fn open_writer(
+        &self,
+        request: &ReferenceEngineOpen,
+    ) -> Result<Box<dyn ReferenceWriteEngine>, ReferenceError> {
+        Ok(Box::new(RecordingReferenceWriter {
+            root: request.root.clone(),
+        }))
+    }
+
+    async fn open_reader(
+        &self,
+        _request: &ReferenceEngineOpen,
+    ) -> Result<Box<dyn ReferenceReadEngine>, ReferenceError> {
+        Ok(Box::new(RecordingReferenceReader {
+            state: Arc::clone(&self.state),
+        }))
+    }
+}
+
 fn private_tools(temporary: &TempDir) -> McpTools {
     tools(temporary, false).3
 }
@@ -386,6 +469,95 @@ async fn reference_recall_defaults_to_chunks_and_returns_matching_structured_and
     assert_eq!(structured["items"][0]["source_label"], "standards.md");
     assert_eq!(structured["reference"]["status"], "ok");
     assert_eq!(structured["truncated"], false);
+}
+
+#[tokio::test]
+async fn reference_recall_forwards_every_valid_boundary_default_and_search_type() {
+    let temporary = tempfile::tempdir().expect("temporary root");
+    let config = reference_config(&temporary.path().join("reference"));
+    let document = PreparedDocument::from_bytes(
+        Source::Stdin,
+        b"Published fixture used to exercise graph request forwarding.",
+        Some("request-forwarding"),
+        Some("forwarding.md"),
+        &config.limits,
+    )
+    .expect("reference document");
+    DeltaStore::new(config.layout.clone(), config.limits)
+        .commit_batch(&[document])
+        .expect("commit reference delta");
+    let state = Arc::new(RecordingReferenceState::default());
+    let factory = Arc::new(RecordingReferenceFactory {
+        state: Arc::clone(&state),
+    });
+    ReferencePublisher::new(config.clone(), factory.clone())
+        .expect("reference publisher")
+        .publish_once()
+        .await
+        .expect("publish reference generation");
+    let tools =
+        private_tools(&temporary).with_reference_reader(ReferenceReader::new(config, factory));
+
+    let one_byte = tools
+        .call("cognee_reference_recall", json!({"query": "x"}))
+        .await;
+    assert_eq!(one_byte["isError"], false, "{one_byte}");
+    let max_query = "x".repeat(8_192);
+    let max_bytes = tools
+        .call(
+            "cognee_reference_recall",
+            json!({"query": max_query, "top_k": 1}),
+        )
+        .await;
+    assert_eq!(max_bytes["isError"], false, "{max_bytes}");
+    let upper_top_k = tools
+        .call(
+            "cognee_reference_recall",
+            json!({"query": "upper bound", "top_k": 10}),
+        )
+        .await;
+    assert_eq!(upper_top_k["isError"], false, "{upper_top_k}");
+
+    for search_type in ["CHUNKS", "SUMMARIES", "GRAPH_COMPLETION", "RAG_COMPLETION"] {
+        let result = tools
+            .call(
+                "cognee_reference_recall",
+                json!({"query": "search type", "search_type": search_type}),
+            )
+            .await;
+        assert_eq!(result["isError"], false, "{search_type}: {result}");
+    }
+
+    let without_wait = tools
+        .call("cognee_reference_recall", json!({"query": "wait hint"}))
+        .await;
+    let with_wait = tools
+        .call(
+            "cognee_reference_recall",
+            json!({"query": "wait hint", "wait_for_previous": true}),
+        )
+        .await;
+    assert_eq!(with_wait, without_wait);
+
+    let recalls = state.recalls.lock().expect("recalls");
+    assert_eq!(recalls.len(), 9);
+    assert_eq!(recalls[0].query, "x");
+    assert_eq!(recalls[0].top_k, 3);
+    assert_eq!(recalls[0].search_type.as_deref(), Some("CHUNKS"));
+    assert_eq!(recalls[1].query.len(), 8_192);
+    assert_eq!(recalls[1].top_k, 1);
+    assert_eq!(recalls[2].top_k, 10);
+    assert_eq!(
+        recalls[3..7]
+            .iter()
+            .map(|request| request.search_type.as_deref().expect("search type"))
+            .collect::<Vec<_>>(),
+        ["CHUNKS", "SUMMARIES", "GRAPH_COMPLETION", "RAG_COMPLETION"]
+    );
+    assert_eq!(recalls[7], recalls[8]);
+    assert!(recalls.iter().all(|request| {
+        request.dataset == "fleet_reference" && !request.auto_route && request.session_id.is_none()
+    }));
 }
 
 #[derive(Default)]
