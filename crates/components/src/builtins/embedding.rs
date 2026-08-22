@@ -199,6 +199,7 @@ mod tests {
             dimensions: 384,
             endpoint: None,
             api_key: None,
+            user_agent: None,
             batch_size: 36,
             mock,
             mock_deterministic: false,

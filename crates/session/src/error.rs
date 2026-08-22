@@ -1,5 +1,8 @@
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
+    #[error("session store is read-only")]
+    ReadOnly,
+
     #[error("session store error: {0}")]
     StoreError(String),
 

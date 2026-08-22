@@ -113,6 +113,12 @@ pub struct Settings {
     pub default_user_id: String,
     pub default_dataset_name: String,
 
+    /// Explicit process-local access mode for immutable database generations.
+    /// This is deliberately not populated from a generic environment variable:
+    /// only a trusted constructor (such as the reference reader) may enable it.
+    #[serde(skip)]
+    pub read_only: bool,
+
     pub system_root_directory: String,
     pub data_root_directory: String,
     pub cache_root_directory: String,
@@ -819,6 +825,7 @@ impl Settings {
             .unwrap_or(8191);
 
         cognee_components::BackendBuildContext {
+            read_only: self.read_only,
             data_root_directory: PathBuf::from(&self.data_root_directory),
             system_root_directory: PathBuf::from(&self.system_root_directory),
             relational_db_url: self.resolved_relational_db_url(),
@@ -1072,6 +1079,7 @@ impl Default for Settings {
         Self {
             default_user_id: "00000000-0000-0000-0000-000000000000".to_string(),
             default_dataset_name: "main_dataset".to_string(),
+            read_only: false,
             system_root_directory: "./.cognee_system".to_string(),
             data_root_directory: "./.data_storage".to_string(),
             cache_root_directory: "./.cognee_cache".to_string(),
@@ -3106,6 +3114,16 @@ mod tests {
                 "telemetry_snapshot leaked credential/URL substring: {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn read_only_mode_is_explicit_and_defaults_to_writable() {
+        let mut settings = Settings::default();
+        assert!(!settings.read_only);
+        assert!(!settings.backend_context().read_only);
+
+        settings.read_only = true;
+        assert!(settings.backend_context().read_only);
     }
 
     #[test]

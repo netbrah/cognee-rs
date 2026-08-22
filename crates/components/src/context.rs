@@ -15,6 +15,11 @@ use std::path::PathBuf;
 /// `build_storage` / `build_database` constructors.
 #[derive(Clone)]
 pub struct BackendBuildContext {
+    /// Open persistent backends for retrieval only. Factories must not create
+    /// directories, initialize schemas, or return adapters that can mutate
+    /// their backing stores when this is set.
+    pub read_only: bool,
+
     // ── storage / relational database ─────────────────────────────────────
     /// Root directory for ingested data files (LocalStorage).
     pub data_root_directory: PathBuf,
