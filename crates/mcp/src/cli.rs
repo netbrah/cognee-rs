@@ -6,7 +6,7 @@ pub use crate::error::AgentError;
 use crate::reference::ReferenceCommand;
 
 #[derive(Debug, Parser)]
-#[command(name = "cognee-agent", about = "Cognee MCP agent")]
+#[command(name = "cognee-agent", version, about = "Cognee MCP agent")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,

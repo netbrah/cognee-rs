@@ -3,6 +3,22 @@ use cognee_mcp::cli::{Cli, Command};
 use cognee_mcp::reference::ReferenceCommand;
 
 #[test]
+fn version_flag_reports_the_adapter_version() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cognee-agent"))
+        .arg("--version")
+        .output()
+        .expect("run cognee-agent --version");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"cognee-agent 0.2.0\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn parses_all_five_top_level_commands() {
     for command in ["mcp", "hook", "drain", "doctor", "recover"] {
         assert!(
