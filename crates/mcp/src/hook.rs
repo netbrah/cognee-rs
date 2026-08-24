@@ -153,14 +153,25 @@ pub fn run_hook_with<R: Read, W: Write, E: Write>(
         }
     };
 
-    let response = if matches!(event, HookEvent::SessionStart) {
-        let cache = ContextCache::new(services.config.layout.clone());
+    let cache = ContextCache::new(services.config.layout.clone());
+    let mut injected_context = None;
+    let response = if matches!(event, HookEvent::SessionStart | HookEvent::BeforeAgent) {
         let cached = cache.read(&session_id).and_then(|context| match context {
             Some(context) => Ok(Some(context)),
             None => cache.read_bootstrap(&services.config.dataset),
         });
         match cached {
-            Ok(Some(context)) => HookResponse::with_context(event, context),
+            Ok(Some(context)) => match cache.was_injected(&session_id, &context) {
+                Ok(false) => {
+                    injected_context = Some(context.clone());
+                    HookResponse::with_context(event, context)
+                }
+                Ok(true) => HookResponse::capture(),
+                Err(_) => {
+                    report_failure(services, &mut diagnostics, "context_injection_state");
+                    HookResponse::capture()
+                }
+            },
             Ok(None) => HookResponse::capture(),
             Err(_) => {
                 report_failure(services, &mut diagnostics, "context_cache");
@@ -171,6 +182,14 @@ pub fn run_hook_with<R: Read, W: Write, E: Write>(
         HookResponse::capture()
     };
     write_response(&mut output, &response)?;
+    if let Some(context) = injected_context.as_deref() {
+        if cache.mark_injected(&session_id, context).is_err() {
+            report_failure(services, &mut diagnostics, "context_injection_state");
+        }
+    }
+    if matches!(event, HookEvent::PreCompress) && cache.rearm_injection(&session_id).is_err() {
+        report_failure(services, &mut diagnostics, "context_injection_state");
+    }
 
     if durable
         && should_spawn(event, &spool, services.config.limits.max_events_per_drain)

@@ -170,7 +170,7 @@ fn contains_forbidden_key(value: &Value) -> bool {
 }
 
 #[test]
-fn six_official_events_emit_one_non_blocking_object_and_only_session_start_uses_cache() {
+fn six_official_events_emit_one_non_blocking_object_and_inject_cached_context_once() {
     let temporary = tempdir().expect("temporary root");
     let root = temporary.path().join("cognee");
     let spawner = Arc::new(RecordingDrainSpawner::default());
@@ -356,7 +356,7 @@ fn fresh_session_injection_falls_back_to_the_bounded_user_bootstrap_cache() {
 }
 
 #[test]
-fn before_agent_captures_the_prompt_without_injecting_cached_memory() {
+fn before_agent_injects_cached_memory_while_capturing_the_prompt() {
     let temporary = tempdir().expect("temporary root");
     let spawner = Arc::new(RecordingDrainSpawner::default());
     let services = services(temporary.path(), 50, spawner);
@@ -372,7 +372,18 @@ fn before_agent_captures_the_prompt_without_injecting_cached_memory() {
 
     result.expect("BeforeAgent remains fail-open");
     assert!(stderr.is_empty());
-    assert_eq!(one_json_object(&stdout), json!({"suppressOutput": true}));
+    let response = one_json_object(&stdout);
+    assert_eq!(response["suppressOutput"], true);
+    assert_eq!(
+        response["hookSpecificOutput"]["hookEventName"],
+        "BeforeAgent"
+    );
+    assert!(
+        response["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("BeforeAgent context")
+            .contains("Stable preference: give concise evidence-backed answers.")
+    );
     assert_eq!(
         cognee_mcp::spool::Spool::new(
             services.config().layout.clone(),
@@ -382,6 +393,125 @@ fn before_agent_captures_the_prompt_without_injecting_cached_memory() {
         .expect("spool depths")
         .pending,
         1
+    );
+}
+
+#[test]
+fn identical_cached_memory_is_injected_only_once_per_session() {
+    let temporary = tempdir().expect("temporary root");
+    let spawner = Arc::new(RecordingDrainSpawner::default());
+    let services = services(temporary.path(), 50, spawner);
+    ContextCache::new(services.config().layout.clone())
+        .write(
+            "session-17",
+            "Stable preference: give concise evidence-backed answers.",
+        )
+        .expect("write session cache");
+
+    let first = serde_json::to_vec(&fixture("BeforeAgent", "2026-08-19T20:00:00Z"))
+        .expect("first hook fixture");
+    let (stdout, stderr, result) = run(&services, first.as_slice());
+    result.expect("first BeforeAgent remains fail-open");
+    assert!(stderr.is_empty());
+    assert!(
+        one_json_object(&stdout)["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("first injection")
+            .contains("Stable preference")
+    );
+
+    let second = serde_json::to_vec(&fixture("BeforeAgent", "2026-08-19T20:00:01Z"))
+        .expect("second hook fixture");
+    let (stdout, stderr, result) = run(&services, second.as_slice());
+    result.expect("second BeforeAgent remains fail-open");
+    assert!(stderr.is_empty());
+    assert_eq!(one_json_object(&stdout), json!({"suppressOutput": true}));
+}
+
+#[test]
+fn refreshed_cached_memory_is_reinjected_in_the_same_session() {
+    let temporary = tempdir().expect("temporary root");
+    let spawner = Arc::new(RecordingDrainSpawner::default());
+    let services = services(temporary.path(), 50, spawner);
+    let cache = ContextCache::new(services.config().layout.clone());
+    cache
+        .write("session-17", "Initial preference: show concise evidence.")
+        .expect("write initial session cache");
+
+    let first = serde_json::to_vec(&fixture("BeforeAgent", "2026-08-19T20:00:00Z"))
+        .expect("first hook fixture");
+    let (stdout, stderr, result) = run(&services, first.as_slice());
+    result.expect("first BeforeAgent remains fail-open");
+    assert!(stderr.is_empty());
+    assert!(
+        one_json_object(&stdout)["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("initial injection")
+            .contains("Initial preference")
+    );
+
+    cache
+        .write(
+            "session-17",
+            "Updated preference: show concise evidence with timestamps.",
+        )
+        .expect("refresh session cache");
+    let second = serde_json::to_vec(&fixture("BeforeAgent", "2026-08-19T20:00:01Z"))
+        .expect("second hook fixture");
+    let (stdout, stderr, result) = run(&services, second.as_slice());
+    result.expect("second BeforeAgent remains fail-open");
+    assert!(stderr.is_empty());
+    let context = one_json_object(&stdout)["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .expect("refreshed injection")
+        .to_owned();
+    assert!(context.contains("Updated preference"));
+    assert!(!context.contains("Initial preference"));
+}
+
+#[test]
+fn precompress_rearms_the_last_injected_memory() {
+    let temporary = tempdir().expect("temporary root");
+    let spawner = Arc::new(RecordingDrainSpawner::default());
+    let services = services(temporary.path(), 50, spawner);
+    ContextCache::new(services.config().layout.clone())
+        .write(
+            "session-17",
+            "Stable preference: give concise evidence-backed answers.",
+        )
+        .expect("write session cache");
+
+    let before_agent = serde_json::to_vec(&fixture("BeforeAgent", "2026-08-19T20:00:00Z"))
+        .expect("initial hook fixture");
+    let (stdout, stderr, result) = run(&services, before_agent.as_slice());
+    result.expect("initial BeforeAgent remains fail-open");
+    assert!(stderr.is_empty());
+    assert!(one_json_object(&stdout)["hookSpecificOutput"]["additionalContext"].is_string());
+
+    let duplicate = serde_json::to_vec(&fixture("BeforeAgent", "2026-08-19T20:00:01Z"))
+        .expect("duplicate hook fixture");
+    let (stdout, stderr, result) = run(&services, duplicate.as_slice());
+    result.expect("duplicate BeforeAgent remains fail-open");
+    assert!(stderr.is_empty());
+    assert_eq!(one_json_object(&stdout), json!({"suppressOutput": true}));
+
+    let precompress = serde_json::to_vec(&fixture("PreCompress", "2026-08-19T20:00:02Z"))
+        .expect("PreCompress hook fixture");
+    let (stdout, stderr, result) = run(&services, precompress.as_slice());
+    result.expect("PreCompress remains fail-open");
+    assert!(stderr.is_empty());
+    assert_eq!(one_json_object(&stdout), json!({"suppressOutput": true}));
+
+    let after_compression = serde_json::to_vec(&fixture("BeforeAgent", "2026-08-19T20:00:03Z"))
+        .expect("post-compression hook fixture");
+    let (stdout, stderr, result) = run(&services, after_compression.as_slice());
+    result.expect("post-compression BeforeAgent remains fail-open");
+    assert!(stderr.is_empty());
+    assert!(
+        one_json_object(&stdout)["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("rearmed context")
+            .contains("Stable preference")
     );
 }
 
