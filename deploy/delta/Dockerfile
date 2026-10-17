@@ -19,10 +19,12 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Corporate TLS interception: cluster-egress to LLM/embedding endpoints may
-# chain through the NetApp SSFMCCA CA (same bundle the Python delta image
-# bakes). Harmless where egress is direct; load-bearing where it isn't.
-COPY deploy/delta/netapp-ssfmcca.pem /usr/local/share/ca-certificates/netapp-ssfmcca.crt
+# Corporate TLS trust: llm-proxy-api.ai.eng.netapp.com serves a chain anchored
+# at eng-RSP-APVX-MSCA0-CA (verified from in-pod curl 2026-10-17), and proxy
+# paths may re-sign with SSFMCCA. Bake the same bundle the Python stack mounts
+# from the netapp-ca-bundle configmap (it contains both). The server binary
+# reads this store via reqwest's rustls-tls-native-roots (delta fork patch).
+COPY deploy/delta/netapp-ca-bundle.pem /usr/local/share/ca-certificates/netapp-ca-bundle.crt
 RUN update-ca-certificates
 
 COPY dist/cognee-http-server /usr/local/bin/cognee-http-server

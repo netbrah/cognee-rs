@@ -104,7 +104,12 @@ predicates = "3.1"
 rand = "0.8"
 rayon = "1.10"
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "json", "stream", "multipart"] }
+# delta fork patch: rustls-tls-native-roots instead of rustls-tls (= webpki
+# roots only). Internal LLM/embedding endpoints chain to NetApp enterprise
+# CAs that Mozilla's bundle cannot contain; the deploy image ships those CAs
+# in the system store (deploy/delta/Dockerfile) and rustls-native-certs reads
+# it (plus SSL_CERT_FILE). Upstream defaults stay untouched elsewhere.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "gzip", "json", "stream", "multipart"] }
 scraper = "0.21"
 schemars = "0.8"
 serde = { version = "1", features = ["derive"] }
