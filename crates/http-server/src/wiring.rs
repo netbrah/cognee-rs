@@ -22,6 +22,7 @@ use cognee_ontology::{OntologyManager, OntologyResolver};
 use cognee_search::{
     SeaOrmSessionStore, SearchBuilder, SearchOrchestrator, SessionManager, SessionStore,
 };
+use cognee_session::RedisSessionStore;
 use cognee_vector::VectorDB;
 use secrecy::ExposeSecret;
 
@@ -222,6 +223,10 @@ async fn wire_session(
     cfg: &HttpServerConfig,
     database: Arc<DatabaseConnection>,
 ) -> (Option<Arc<dyn SessionStore>>, Option<Arc<SessionManager>>) {
+    if cfg.session_store_backend.eq_ignore_ascii_case("redis") {
+        return wire_redis_session(cfg).await;
+    }
+
     if !cfg.session_store_backend.eq_ignore_ascii_case("seaorm") {
         tracing::warn!(
             "session store backend '{}' unsupported in standalone wiring; session disabled",
@@ -241,6 +246,45 @@ async fn wire_session(
             (None, None)
         }
     }
+}
+
+/// `COGNEE_SESSION_STORE=redis`: connect the Python-compatible Redis session
+/// store (TTL rearmed on every write, `SESSION_TTL_SECONDS`, 7-day default).
+///
+/// The server boot races a same-Pod redis sidecar (containers start in
+/// parallel), so a connection refusal is retried a few times before the
+/// store is dropped to `None` with the standard visible warning — session
+/// memory must never fail the server, but it must also not go dark silently
+/// on a sidecar that merely needed a moment.
+async fn wire_redis_session(
+    cfg: &HttpServerConfig,
+) -> (Option<Arc<dyn SessionStore>>, Option<Arc<SessionManager>>) {
+    let ttl = u64::try_from(cfg.session_ttl_seconds.max(0)).unwrap_or(u64::MAX);
+    let mut attempt = 0_u32;
+    let store = loop {
+        attempt += 1;
+        match RedisSessionStore::connect(
+            &cfg.session_cache_host,
+            cfg.session_cache_port,
+            &cfg.session_cache_username,
+            cfg.session_cache_password.expose_secret(),
+        )
+        .await
+        {
+            Ok(store) => break store.with_session_ttl_seconds(ttl),
+            Err(err) if attempt < 3 => {
+                tracing::warn!("redis session connect attempt {attempt}/3 failed: {err}");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            Err(err) => {
+                tracing::warn!("redis session store unavailable, wiring as None: {err}");
+                return (None, None);
+            }
+        }
+    };
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    let manager = Arc::new(SessionManager::new(Arc::clone(&store)));
+    (Some(store), Some(manager))
 }
 
 fn wire_search_orchestrator(

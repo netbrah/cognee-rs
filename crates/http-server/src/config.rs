@@ -224,6 +224,28 @@ pub struct HttpServerConfig {
     /// Env: `COGNEE_SESSION_DIR`.
     pub session_root_directory: PathBuf,
 
+    /// Redis session-store host; only read when
+    /// `COGNEE_SESSION_STORE=redis`.
+    /// Env: `CACHE_HOST` (Python's cache-backend parity name).
+    pub session_cache_host: String,
+
+    /// Redis session-store port.
+    /// Env: `CACHE_PORT`.
+    pub session_cache_port: u16,
+
+    /// Redis ACL username; empty means "no username".
+    /// Env: `CACHE_USERNAME`.
+    pub session_cache_username: String,
+
+    /// Redis password; empty means "no auth".
+    /// Env: `CACHE_PASSWORD`.
+    pub session_cache_password: SecretString,
+
+    /// Seconds a session's keys live after their last write; non-positive
+    /// never expires them (Python's `session_ttl_seconds`, 7 days).
+    /// Env: `SESSION_TTL_SECONDS`.
+    pub session_ttl_seconds: i64,
+
     /// Whether notebook code execution backend is enabled.
     /// Env: `COGNEE_NOTEBOOK_RUNNER_ENABLED`.
     pub notebook_runner_enabled: bool,
@@ -365,6 +387,11 @@ impl Default for HttpServerConfig {
             llm_max_completion_tokens: cognee_llm::OpenAIAdapter::DEFAULT_MAX_COMPLETION_TOKENS,
             session_store_backend: "seaorm".to_string(),
             session_root_directory: default_session_root_directory(&system_root),
+            session_cache_host: "localhost".to_string(),
+            session_cache_port: 6379,
+            session_cache_username: String::new(),
+            session_cache_password: SecretString::new(String::new().into()),
+            session_ttl_seconds: 604_800,
             notebook_runner_enabled: false,
             responses_client_enabled: false,
             disable_default_backends: false,
@@ -573,6 +600,25 @@ impl HttpServerConfig {
         }
         if let Ok(v) = std::env::var("COGNEE_SESSION_DIR") {
             cfg.session_root_directory = PathBuf::from(v);
+        }
+        if let Ok(v) = std::env::var("CACHE_HOST") {
+            cfg.session_cache_host = v;
+        }
+        if let Ok(v) = std::env::var("CACHE_PORT") {
+            cfg.session_cache_port = v.parse::<u16>().map_err(|e| {
+                ServerError::Other(anyhow::anyhow!("CACHE_PORT: {e}"))
+            })?;
+        }
+        if let Ok(v) = std::env::var("CACHE_USERNAME") {
+            cfg.session_cache_username = v;
+        }
+        if let Ok(v) = std::env::var("CACHE_PASSWORD") {
+            cfg.session_cache_password = SecretString::new(v.into());
+        }
+        if let Ok(v) = std::env::var("SESSION_TTL_SECONDS") {
+            cfg.session_ttl_seconds = v.parse::<i64>().map_err(|e| {
+                ServerError::Other(anyhow::anyhow!("SESSION_TTL_SECONDS: {e}"))
+            })?;
         }
 
         if let Ok(v) = std::env::var("COGNEE_NOTEBOOK_RUNNER_ENABLED") {

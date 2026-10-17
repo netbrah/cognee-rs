@@ -39,6 +39,8 @@ struct RedisQAEntry {
 /// both SDKs can share a Redis instance.
 pub struct RedisSessionStore {
     conn: MultiplexedConnection,
+    /// Seconds a session's keys live after its last write; 0 never expires.
+    session_ttl_seconds: u64,
 }
 
 impl RedisSessionStore {
@@ -50,18 +52,81 @@ impl RedisSessionStore {
             .get_multiplexed_async_connection()
             .await
             .map_err(|e| SessionError::StoreError(format!("redis connection error: {e}")))?;
-        Ok(Self { conn })
+        Ok(Self::from_connection(conn))
+    }
+
+    /// Connect to Redis at `host:port` with optional credentials.
+    ///
+    /// Unlike [`Self::new`], nothing is spliced into a URL: the host and the
+    /// credentials travel as separate fields (as Python's `RedisAdapter`
+    /// passes them as separate kwargs), so a password with URL-reserved
+    /// characters (`@`, `/`, `#`, `%`, …) or a bare IPv6 host such as `::1`
+    /// reaches the server verbatim. An empty username or password means
+    /// "none".
+    pub async fn connect(
+        host: &str,
+        port: u16,
+        username: &str,
+        password: &str,
+    ) -> Result<Self, SessionError> {
+        let client = redis::Client::open(connection_info(host, port, username, password))
+            .map_err(|e| SessionError::StoreError(format!("redis client error: {e}")))?;
+        let conn = client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| SessionError::StoreError(format!("redis connection error: {e}")))?;
+        Ok(Self::from_connection(conn))
     }
 
     /// Build from an already-established connection.
     pub fn from_connection(conn: MultiplexedConnection) -> Self {
-        Self { conn }
+        Self {
+            conn,
+            session_ttl_seconds: 0,
+        }
+    }
+
+    /// Expire a session's keys (Q&A list, trace list, graph context) this
+    /// many seconds after their last write, as Python's `RedisAdapter` does
+    /// with `session_ttl_seconds` (default 604 800, 7 days). `0` never
+    /// expires them, the behaviour of a store built without this call.
+    #[must_use]
+    pub fn with_session_ttl_seconds(mut self, seconds: u64) -> Self {
+        self.session_ttl_seconds = seconds;
+        self
+    }
+
+    /// Python's `_apply_session_ttl`: (re)arm `key`'s expiry after a write.
+    async fn apply_session_ttl(
+        &self,
+        conn: &mut MultiplexedConnection,
+        key: &str,
+    ) -> Result<(), SessionError> {
+        if self.session_ttl_seconds == 0 {
+            return Ok(());
+        }
+        let seconds = i64::try_from(self.session_ttl_seconds).unwrap_or(i64::MAX);
+        conn.expire::<_, ()>(key, seconds).await.map_err(map_err)
     }
 }
 
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+/// The connection info for [`RedisSessionStore::connect`]: TCP `host:port`,
+/// database 0, and the credentials as-is (empty → `None`).
+fn connection_info(host: &str, port: u16, username: &str, password: &str) -> redis::ConnectionInfo {
+    let non_empty = |s: &str| (!s.is_empty()).then(|| s.to_string());
+    redis::ConnectionInfo {
+        addr: redis::ConnectionAddr::Tcp(host.to_string(), port),
+        redis: redis::RedisConnectionInfo {
+            username: non_empty(username),
+            password: non_empty(password),
+            ..Default::default()
+        },
+    }
+}
 
 fn session_key(user_id: Option<&str>, session_id: &str) -> String {
     let uid = user_id.unwrap_or("default");
@@ -177,6 +242,7 @@ impl SessionStore for RedisSessionStore {
         let key = session_key(user_id, session_id);
         let mut conn = self.conn.clone();
         conn.rpush::<_, _, ()>(&key, &json).await.map_err(map_err)?;
+        self.apply_session_ttl(&mut conn, &key).await?;
 
         Ok(qa_id)
     }
@@ -266,6 +332,9 @@ impl SessionStore for RedisSessionStore {
                 .await
                 .map_err(map_err)?;
         }
+        if !kept.is_empty() {
+            self.apply_session_ttl(&mut conn, &key).await?;
+        }
 
         Ok(true)
     }
@@ -342,6 +411,7 @@ impl SessionStore for RedisSessionStore {
                 .await
                 .map_err(map_err)?;
         }
+        self.apply_session_ttl(&mut conn, &key).await?;
 
         Ok(true)
     }
@@ -366,6 +436,7 @@ impl SessionStore for RedisSessionStore {
         let key = graph_context_key(user_id, session_id);
         let mut conn = self.conn.clone();
         conn.set::<_, _, ()>(&key, context).await.map_err(map_err)?;
+        self.apply_session_ttl(&mut conn, &key).await?;
         Ok(())
     }
 
@@ -383,6 +454,7 @@ impl SessionStore for RedisSessionStore {
         let key = trace_key(user_id, session_id);
         let mut conn = self.conn.clone();
         conn.rpush::<_, _, ()>(&key, &json).await.map_err(map_err)?;
+        self.apply_session_ttl(&mut conn, &key).await?;
 
         Ok(trace_id)
     }
@@ -402,5 +474,138 @@ impl SessionStore for RedisSessionStore {
                     .map_err(|e| SessionError::StoreError(format!("json parse error: {e}")))
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test code — panics are acceptable failures"
+)]
+mod tests {
+    use super::connection_info;
+
+    #[test]
+    fn credentials_with_url_reserved_characters_are_passed_verbatim() {
+        let info = connection_info("localhost", 6379, "us@er", "p@ss/w#rd%2F");
+        match &info.addr {
+            redis::ConnectionAddr::Tcp(host, port) => {
+                assert_eq!(host, "localhost");
+                assert_eq!(*port, 6379);
+            }
+            other => panic!("expected a TCP address, got {other:?}"),
+        }
+        assert_eq!(info.redis.username.as_deref(), Some("us@er"));
+        assert_eq!(info.redis.password.as_deref(), Some("p@ss/w#rd%2F"));
+        assert_eq!(info.redis.db, 0);
+    }
+
+    #[test]
+    fn an_ipv6_host_needs_no_brackets() {
+        let info = connection_info("::1", 6380, "", "");
+        match &info.addr {
+            redis::ConnectionAddr::Tcp(host, port) => {
+                assert_eq!(host, "::1");
+                assert_eq!(*port, 6380);
+            }
+            other => panic!("expected a TCP address, got {other:?}"),
+        }
+    }
+
+    /// `with_session_ttl_seconds` arms an expiry on every key a write
+    /// touches; without it nothing expires. Needs a Redis server:
+    /// `REDIS_TEST_URL=redis://127.0.0.1:6379`; skipped when unset. CI runs
+    /// it in the `redis-session` lane.
+    #[tokio::test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "tests drive configuration through the process env"
+    )]
+    async fn session_ttl_expires_every_written_key() {
+        use redis::AsyncCommands;
+
+        use super::{RedisSessionStore, graph_context_key, session_key, trace_key};
+        use crate::session_store::SessionStore;
+        use crate::types::SessionTraceStep;
+
+        let Some(url) = std::env::var("REDIS_TEST_URL")
+            .ok()
+            .filter(|u| !u.is_empty())
+        else {
+            // The `REDIS_TEST_URL not set … skipping` shape is what the CI
+            // lane's `assert_pg_suite_ran.sh` guard fails on.
+            eprintln!("REDIS_TEST_URL not set — skipping session_ttl_expires_every_written_key");
+            return;
+        };
+        let session = format!("ttl-{}", uuid::Uuid::new_v4());
+        let user = "ttl-user";
+
+        let store = RedisSessionStore::new(&url)
+            .await
+            .unwrap()
+            .with_session_ttl_seconds(120);
+        store
+            .create_qa_entry(&session, Some(user), "q", "a", None)
+            .await
+            .unwrap();
+        store
+            .set_graph_context(&session, Some(user), "ctx")
+            .await
+            .unwrap();
+        store
+            .save_trace_step(
+                user,
+                &session,
+                SessionTraceStep {
+                    trace_id: "t1".to_string(),
+                    origin_function: "f".to_string(),
+                    status: "success".to_string(),
+                    memory_query: String::new(),
+                    memory_context: String::new(),
+                    method_params: serde_json::json!({}),
+                    method_return_value: None,
+                    error_message: String::new(),
+                    session_feedback: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut conn = redis::Client::open(url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+        for key in [
+            session_key(Some(user), &session),
+            graph_context_key(Some(user), &session),
+            trace_key(user, &session),
+        ] {
+            let ttl: i64 = conn.ttl(&key).await.unwrap();
+            assert!((1..=120).contains(&ttl), "{key}: ttl {ttl}");
+            let _: () = conn.del(&key).await.unwrap();
+        }
+
+        // Without a TTL the key never expires (`TTL` is -1).
+        let plain = RedisSessionStore::new(&url).await.unwrap();
+        plain
+            .create_qa_entry(&session, Some(user), "q", "a", None)
+            .await
+            .unwrap();
+        let key = session_key(Some(user), &session);
+        let ttl: i64 = conn.ttl(&key).await.unwrap();
+        assert_eq!(ttl, -1);
+        let _: () = conn.del(&key).await.unwrap();
+    }
+
+    #[test]
+    fn empty_credentials_mean_none() {
+        let info = connection_info("h", 1, "", "");
+        assert_eq!(info.redis.username, None);
+        assert_eq!(info.redis.password, None);
+        let info = connection_info("h", 1, "", "secret");
+        assert_eq!(info.redis.username, None);
+        assert_eq!(info.redis.password.as_deref(), Some("secret"));
     }
 }
