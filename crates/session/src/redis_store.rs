@@ -13,7 +13,9 @@ use uuid::Uuid;
 
 use crate::error::SessionError;
 use crate::session_store::{SessionQAUpdate, SessionStore};
-use crate::types::{SessionQAEntry, SessionTraceStep, UsedGraphElementIds};
+use crate::types::{
+    SessionQAEntry, SessionTraceStep, UsedGraphElementIds, norm_user_id, norm_user_id_opt,
+};
 
 /// A single Q&A entry as serialised to/from Redis (Python-compatible JSON).
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -128,8 +130,13 @@ fn connection_info(host: &str, port: u16, username: &str, password: &str) -> red
     }
 }
 
+/// The `user_id` segment is normalized (see [`norm_user_id`]): the remember
+/// write path passes hyphenated ids while the session routers pass hex, so
+/// both must derive the same key or entries written by one caller are
+/// invisible to the other.
 fn session_key(user_id: Option<&str>, session_id: &str) -> String {
-    let uid = user_id.unwrap_or("default");
+    let uid = norm_user_id_opt(user_id);
+    let uid = uid.as_deref().unwrap_or("default");
     format!("agent_sessions:{uid}:{session_id}")
 }
 
@@ -179,12 +186,13 @@ fn redis_entry_to_domain(e: &RedisQAEntry, session_id: &str) -> SessionQAEntry {
 }
 
 fn graph_context_key(user_id: Option<&str>, session_id: &str) -> String {
-    let uid = user_id.unwrap_or("default");
+    let uid = norm_user_id_opt(user_id);
+    let uid = uid.as_deref().unwrap_or("default");
     format!("graph_knowledge:{uid}:{session_id}")
 }
 
 fn trace_key(user_id: &str, session_id: &str) -> String {
-    format!("cognee:trace:{user_id}:{session_id}")
+    format!("cognee:trace:{}:{session_id}", norm_user_id(user_id))
 }
 
 /// Apply a `SessionQAUpdate` to a `RedisQAEntry` in place.
@@ -607,5 +615,26 @@ mod tests {
         let info = connection_info("h", 1, "", "secret");
         assert_eq!(info.redis.username, None);
         assert_eq!(info.redis.password.as_deref(), Some("secret"));
+    }
+
+    /// The remember write path passes hyphenated ids and the session routers
+    /// pass hex; if a key builder did not normalize, the two callers would
+    /// derive different keys and entries would be invisible across them.
+    #[test]
+    fn key_builders_converge_hyphenated_and_hex_user_ids() {
+        use super::{graph_context_key, session_key, trace_key};
+
+        let hex = "7d8f1beccc275d17ab84fe1f058cf3fa";
+        let hyphenated = "7d8f1bec-cc27-5d17-ab84-fe1f058cf3fa";
+
+        assert_eq!(
+            session_key(Some(hyphenated), "s1"),
+            session_key(Some(hex), "s1")
+        );
+        assert_eq!(
+            graph_context_key(Some(hyphenated), "s1"),
+            graph_context_key(Some(hex), "s1")
+        );
+        assert_eq!(trace_key(hyphenated, "s1"), trace_key(hex, "s1"));
     }
 }

@@ -8,7 +8,7 @@ use uuid::Uuid;
 use super::entity;
 use crate::error::SessionError;
 use crate::session_store::SessionQAUpdate;
-use crate::types::SessionTraceStep;
+use crate::types::{norm_user_id, norm_user_id_opt, SessionTraceStep};
 
 fn map_db_err(e: sea_orm::DbErr) -> SessionError {
     SessionError::StoreError(e.to_string())
@@ -26,7 +26,7 @@ pub async fn create_qa_entry(
     let model = entity::ActiveModel {
         id: Set(id.simple().to_string()),
         session_id: Set(session_id.to_string()),
-        user_id: Set(user_id.map(|s| s.to_string())),
+        user_id: Set(norm_user_id_opt(user_id)),
         question: Set(question.to_string()),
         answer: Set(answer.to_string()),
         context: Set(context.map(|s| s.to_string())),
@@ -46,6 +46,9 @@ pub async fn get_latest_entries(
     user_id: Option<&str>,
     limit: usize,
 ) -> Result<Vec<entity::Model>, SessionError> {
+    let user_id = norm_user_id_opt(user_id);
+    let user_id = user_id.as_deref();
+
     // To get the last N entries ordered oldest-first, we query DESC with limit,
     // then reverse in memory.
     let mut query = entity::Entity::find().filter(entity::Column::SessionId.eq(session_id));
@@ -75,6 +78,9 @@ pub async fn get_all_entries(
     session_id: &str,
     user_id: Option<&str>,
 ) -> Result<Vec<entity::Model>, SessionError> {
+    let user_id = norm_user_id_opt(user_id);
+    let user_id = user_id.as_deref();
+
     let mut query = entity::Entity::find().filter(entity::Column::SessionId.eq(session_id));
 
     if let Some(uid) = user_id {
@@ -93,6 +99,9 @@ pub async fn delete_session(
     session_id: &str,
     user_id: Option<&str>,
 ) -> Result<u64, SessionError> {
+    let user_id = norm_user_id_opt(user_id);
+    let user_id = user_id.as_deref();
+
     let mut delete = entity::Entity::delete_many().filter(entity::Column::SessionId.eq(session_id));
 
     if let Some(uid) = user_id {
@@ -118,6 +127,9 @@ pub async fn delete_qa_entry(
     user_id: Option<&str>,
     qa_id: &str,
 ) -> Result<bool, SessionError> {
+    let user_id = norm_user_id_opt(user_id);
+    let user_id = user_id.as_deref();
+
     let mut delete = entity::Entity::delete_many()
         .filter(entity::Column::Id.eq(qa_id))
         .filter(entity::Column::SessionId.eq(session_id));
@@ -151,6 +163,9 @@ pub async fn update_qa_entry(
     qa_id: &str,
     updates: SessionQAUpdate,
 ) -> Result<bool, SessionError> {
+    let user_id = norm_user_id_opt(user_id);
+    let user_id = user_id.as_deref();
+
     // First find the existing entry
     let mut query = entity::Entity::find()
         .filter(entity::Column::Id.eq(qa_id))
@@ -201,7 +216,8 @@ pub async fn update_qa_entry(
 }
 
 fn graph_context_id(user_id: Option<&str>, session_id: &str) -> String {
-    let uid = user_id.unwrap_or("default");
+    let uid = norm_user_id_opt(user_id);
+    let uid = uid.as_deref().unwrap_or("default");
     format!("{uid}:{session_id}")
 }
 
@@ -226,6 +242,8 @@ pub async fn save_trace_step(
     session_id: &str,
     step: SessionTraceStep,
 ) -> Result<String, SessionError> {
+    let user_id = norm_user_id(user_id);
+
     let method_params_json = serde_json::to_string(&step.method_params)
         .map_err(|e| SessionError::StoreError(format!("json error: {e}")))?;
     let method_return_value_json = match &step.method_return_value {
@@ -239,7 +257,7 @@ pub async fn save_trace_step(
     // Assign next `seq` for this `(user_id, session_id)` so reads return
     // entries in stable insertion order (independent of timestamp resolution).
     let max_seq: Option<i64> = entity::trace_step::Entity::find()
-        .filter(entity::trace_step::Column::UserId.eq(user_id))
+        .filter(entity::trace_step::Column::UserId.eq(user_id.as_str()))
         .filter(entity::trace_step::Column::SessionId.eq(session_id))
         .order_by_desc(entity::trace_step::Column::Seq)
         .limit(1)
@@ -252,7 +270,7 @@ pub async fn save_trace_step(
     let trace_id = step.trace_id.clone();
     let model = entity::trace_step::ActiveModel {
         trace_id: Set(trace_id.clone()),
-        user_id: Set(user_id.to_string()),
+        user_id: Set(user_id),
         session_id: Set(session_id.to_string()),
         seq: Set(next_seq),
         created_at: Set(Utc::now()),
@@ -275,8 +293,10 @@ pub async fn read_trace_steps(
     user_id: &str,
     session_id: &str,
 ) -> Result<Vec<SessionTraceStep>, SessionError> {
+    let user_id = norm_user_id(user_id);
+
     let models = entity::trace_step::Entity::find()
-        .filter(entity::trace_step::Column::UserId.eq(user_id))
+        .filter(entity::trace_step::Column::UserId.eq(user_id.as_str()))
         .filter(entity::trace_step::Column::SessionId.eq(session_id))
         .order_by_asc(entity::trace_step::Column::Seq)
         .all(db)
@@ -333,7 +353,7 @@ pub async fn set_graph_context(
         let model = entity::graph_context::ActiveModel {
             id: Set(id),
             session_id: Set(session_id.to_string()),
-            user_id: Set(user_id.map(|s| s.to_string())),
+            user_id: Set(norm_user_id_opt(user_id)),
             context: Set(context.to_string()),
             updated_at: Set(Utc::now()),
         };
@@ -341,4 +361,127 @@ pub async fn set_graph_context(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm::{ConnectOptions, ConnectionTrait, Database};
+
+    /// In-memory sqlite with the production table shapes. `:memory:` is
+    /// per-connection, so the pool is pinned to one connection for the
+    /// schema to be visible to every query.
+    async fn setup() -> DatabaseConnection {
+        let mut opt = ConnectOptions::new("sqlite::memory:".to_string());
+        opt.max_connections(1);
+        let db = Database::connect(opt).await.unwrap();
+        db.execute_unprepared(
+            "CREATE TABLE session_qa_entries (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                user_id TEXT,
+                question TEXT NOT NULL,
+                answer TEXT NOT NULL,
+                context TEXT,
+                created_at TEXT NOT NULL,
+                feedback_text TEXT,
+                feedback_score INTEGER,
+                used_graph_element_ids TEXT,
+                memify_metadata TEXT
+            )",
+        )
+        .await
+        .unwrap();
+        db.execute_unprepared(
+            "CREATE TABLE session_graph_context (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                user_id TEXT,
+                context TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
+        )
+        .await
+        .unwrap();
+        db.execute_unprepared(
+            "CREATE TABLE session_trace_steps (
+                trace_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                origin_function TEXT NOT NULL,
+                status TEXT NOT NULL,
+                memory_query TEXT NOT NULL,
+                memory_context TEXT NOT NULL,
+                method_params TEXT NOT NULL,
+                method_return_value TEXT,
+                error_message TEXT NOT NULL,
+                session_feedback TEXT NOT NULL
+            )",
+        )
+        .await
+        .unwrap();
+        db
+    }
+
+    // The remember write path stores `Uuid::to_string()` (hyphenated) while
+    // the session routers read with the hex form; the store boundary
+    // normalizes both sides, so a row written in either format is visible to
+    // a read in the other. Regression for the `qas: []`-despite-rows bug on
+    // /sessions/{id}.
+    #[tokio::test]
+    async fn qa_entries_round_trip_across_user_id_formats() {
+        let db = setup().await;
+        let hex = "7d8f1beccc275d17ab84fe1f058cf3fa";
+        let hyphenated = "7d8f1bec-cc27-5d17-ab84-fe1f058cf3fa";
+
+        create_qa_entry(&db, Uuid::new_v4(), "s1", Some(hyphenated), "q", "a", None)
+            .await
+            .unwrap();
+        let rows = get_latest_entries(&db, "s1", Some(hex), 10).await.unwrap();
+        assert_eq!(rows.len(), 1, "hex read must see the hyphenated write");
+        assert_eq!(rows[0].user_id.as_deref(), Some(hex), "storage keeps hex");
+
+        create_qa_entry(&db, Uuid::new_v4(), "s2", Some(hex), "q", "a", None)
+            .await
+            .unwrap();
+        let rows = get_all_entries(&db, "s2", Some(hyphenated)).await.unwrap();
+        assert_eq!(rows.len(), 1, "hyphenated read must see the hex write");
+    }
+
+    #[tokio::test]
+    async fn trace_steps_round_trip_across_user_id_formats() {
+        let db = setup().await;
+        let hex = "7d8f1beccc275d17ab84fe1f058cf3fa";
+        let hyphenated = "7d8f1bec-cc27-5d17-ab84-fe1f058cf3fa";
+
+        let step = SessionTraceStep {
+            trace_id: "t1".into(),
+            origin_function: "f".into(),
+            status: "success".into(),
+            memory_query: String::new(),
+            memory_context: String::new(),
+            method_params: serde_json::json!({}),
+            method_return_value: None,
+            error_message: String::new(),
+            session_feedback: String::new(),
+        };
+        save_trace_step(&db, hyphenated, "s1", step).await.unwrap();
+        let steps = read_trace_steps(&db, hex, "s1").await.unwrap();
+        assert_eq!(steps.len(), 1, "hex read must see the hyphenated trace write");
+    }
+
+    #[tokio::test]
+    async fn graph_context_round_trips_across_user_id_formats() {
+        let db = setup().await;
+        let hex = "7d8f1beccc275d17ab84fe1f058cf3fa";
+        let hyphenated = "7d8f1bec-cc27-5d17-ab84-fe1f058cf3fa";
+
+        set_graph_context(&db, "s1", Some(hyphenated), "ctx").await.unwrap();
+        assert_eq!(
+            get_graph_context(&db, "s1", Some(hex)).await.unwrap().as_deref(),
+            Some("ctx")
+        );
+    }
 }

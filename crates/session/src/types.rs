@@ -89,3 +89,22 @@ pub struct SessionTraceStep {
 fn empty_object() -> serde_json::Value {
     serde_json::Value::Object(serde_json::Map::new())
 }
+
+/// Storage-boundary format for `user_id`, shared by every session backend.
+///
+/// Callers disagree on UUID formatting for the same identity: the remember
+/// write path passes `Uuid::to_string()` (hyphenated) while the session
+/// routers pass the hex id produced by `uuid_hex::to_hex`. Every `user_id`
+/// crossing into storage — in writes, read filters, and Redis keys — is
+/// reduced to lower-case hex here, so both formats address the same rows
+/// regardless of which caller wrote them. UUID hyphens are position-only
+/// separators, so stripping them is lossless; non-UUID ids (e.g. "default")
+/// pass through unchanged apart from case.
+pub(crate) fn norm_user_id(user_id: &str) -> String {
+    user_id.replace('-', "").to_lowercase()
+}
+
+/// Convenience over [`norm_user_id`] for the `Option<&str>` caller shape.
+pub(crate) fn norm_user_id_opt(user_id: Option<&str>) -> Option<String> {
+    user_id.map(norm_user_id)
+}
