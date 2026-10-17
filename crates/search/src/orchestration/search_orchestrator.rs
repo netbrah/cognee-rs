@@ -133,6 +133,17 @@ fn build_used_graph_element_ids(
     }
 }
 
+/// Whether a search request's session QA should be persisted.
+///
+/// `POST /remember/entry` rejects a blank `session_id` with a 400; the search
+/// persist path must not silently write rows that endpoint can never serve.
+/// A blank (or whitespace-only) session id would land in `session_qa_entries`
+/// unreachable by `/sessions/{id}`, invisible to `improve`, and inflate session
+/// stats — so treat it as "no session" and skip the write.
+fn persists_session_qa(session_id: Option<&str>) -> bool {
+    session_id.is_some_and(|sid| !sid.trim().is_empty())
+}
+
 pub struct SearchOrchestrator {
     registry: SearchTypeRegistry,
     database: Option<Arc<dyn SearchHistoryDb>>,
@@ -560,7 +571,7 @@ impl SearchOrchestrator {
         // actually be saved. Access tracking stays gated on `include_context`
         // above and is intentionally not re-run here.
         let context = if context.is_none()
-            && request.session_id.is_some()
+            && persists_session_qa(request.session_id.as_deref())
             && self.session_manager.is_some()
             && retriever.search_type() == crate::types::SearchType::HybridCompletion
         {
@@ -579,6 +590,7 @@ impl SearchOrchestrator {
             .await?;
 
         if let (Some(session_id), Some(sm)) = (&request.session_id, &self.session_manager)
+            && persists_session_qa(Some(session_id))
             && let SearchOutput::Text(ref answer) = output
         {
             // Python parity: only persist the full context payload when the caller
@@ -658,6 +670,7 @@ impl SearchOrchestrator {
     reason = "test code — panics are acceptable failures"
 )]
 mod tests {
+    use super::persists_session_qa;
     use crate::orchestration::SearchTypeRegistry;
     use crate::orchestration::{CONTEXT_LABEL_COMBINED, CONTEXT_LABEL_DEFAULT};
     use crate::retrievers::SearchRetriever;
@@ -673,6 +686,18 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
     use uuid::Uuid;
+
+    #[test]
+    fn blank_session_ids_never_persist_search_qa() {
+        // Regression: lanes that resolve session_id to "" poisoned
+        // session_qa_entries with rows /sessions/{id} cannot serve and
+        // improve never distills. /remember/entry 400s on the same input;
+        // the search persist path must agree.
+        assert!(!persists_session_qa(None));
+        assert!(!persists_session_qa(Some("")));
+        assert!(!persists_session_qa(Some("   ")));
+        assert!(persists_session_qa(Some("claude_39cbd047")));
+    }
 
     struct FakeChunksRetriever;
 
