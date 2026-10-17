@@ -36,8 +36,15 @@ pub use crate::error::RecallErrorBody;
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RecallPayloadDTO {
-    #[serde(default = "default_search_type", alias = "search_type")]
-    pub search_type: WireSearchType,
+    /// Search type. Omitted (or absent) keeps the Python-parity default
+    /// (`GRAPH_COMPLETION`) exactly as before. An explicit `null` opts into
+    /// auto-routing and is the only way to enable the session-first
+    /// short-circuit in `auto` scope with `sessionId` set: the router
+    /// resolves `(session, no datasets, no query_type)` to
+    /// `auto_fallthrough = true`, letting a session hit skip the graph
+    /// runner entirely.
+    #[serde(default = "default_search_type_opt", alias = "search_type")]
+    pub search_type: Option<WireSearchType>,
 
     #[serde(default)]
     pub datasets: Option<Vec<String>>,
@@ -124,10 +131,16 @@ where
     }
 }
 
+/// Serde default for an absent `searchType`: the parity default wrapped in
+/// `Some`. An explicit `null` deserializes to `None` (see field docs).
+fn default_search_type_opt() -> Option<WireSearchType> {
+    Some(default_search_type())
+}
+
 impl Default for RecallPayloadDTO {
     fn default() -> Self {
         Self {
-            search_type: default_search_type(),
+            search_type: default_search_type_opt(),
             datasets: None,
             dataset_ids: None,
             query: default_query(),
@@ -155,7 +168,7 @@ mod tests {
     #[test]
     fn test_empty_post_body_round_trips_with_defaults() {
         let payload: RecallPayloadDTO = serde_json::from_str("{}").expect("empty body");
-        assert_eq!(payload.search_type, WireSearchType::GraphCompletion);
+        assert_eq!(payload.search_type, Some(WireSearchType::GraphCompletion));
         assert_eq!(payload.query, "What is in the document?");
         assert_eq!(payload.top_k, Some(10));
         assert!(!payload.only_context);
@@ -238,7 +251,7 @@ mod tests {
             "query": "hi"
         }"#;
         let payload: RecallPayloadDTO = serde_json::from_str(json).expect("parse camelCase");
-        assert_eq!(payload.search_type, WireSearchType::GraphCompletion);
+        assert_eq!(payload.search_type, Some(WireSearchType::GraphCompletion));
         assert_eq!(payload.dataset_ids.as_ref().map(|v| v.len()), Some(1));
         assert_eq!(payload.system_prompt.as_deref(), Some("sys"));
         assert_eq!(payload.node_name.as_ref().map(|v| v.len()), Some(1));
@@ -259,7 +272,7 @@ mod tests {
             "query": "hi"
         }"#;
         let payload: RecallPayloadDTO = serde_json::from_str(json).expect("parse snake_case");
-        assert_eq!(payload.search_type, WireSearchType::GraphCompletion);
+        assert_eq!(payload.search_type, Some(WireSearchType::GraphCompletion));
         assert_eq!(payload.dataset_ids.as_ref().map(|v| v.len()), Some(1));
         assert_eq!(payload.system_prompt.as_deref(), Some("sys"));
         assert_eq!(payload.node_name.as_ref().map(|v| v.len()), Some(1));
@@ -270,7 +283,7 @@ mod tests {
     #[test]
     fn recall_dto_serializes_camelcase_only() {
         let dto = RecallPayloadDTO {
-            search_type: WireSearchType::GraphCompletion,
+            search_type: Some(WireSearchType::GraphCompletion),
             datasets: None,
             dataset_ids: Some(vec![uuid::Uuid::nil()]),
             query: "q".into(),
@@ -306,6 +319,16 @@ mod tests {
                 "snake_case key {forbidden} leaked: {s}"
             );
         }
+    }
+
+    #[test]
+    fn recall_dto_null_search_type_enables_auto_routing() {
+        // Explicit `null` is the opt-in for the session-first short-circuit;
+        // absent keeps the parity default (test_empty_post_body...).
+        let json = r#"{"query": "x", "sessionId": "s1", "searchType": null}"#;
+        let payload: RecallPayloadDTO = serde_json::from_str(json).expect("parse null searchType");
+        assert_eq!(payload.search_type, None);
+        assert_eq!(payload.session_id.as_deref(), Some("s1"));
     }
 
     #[test]

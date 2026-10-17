@@ -54,12 +54,17 @@ pub async fn get_latest_entries(
         query = query.filter(entity::Column::UserId.eq(uid));
     }
 
-    let mut entries = query
-        .order_by_desc(entity::Column::CreatedAt)
-        .limit(limit as u64)
-        .all(db)
-        .await
-        .map_err(map_db_err)?;
+    // `usize::MAX` is the callers' "no limit" sentinel (e.g. the sessions
+    // detail router reads the whole history for parity with Python). Passing
+    // it through `.limit()` panics in the Postgres driver binding u64::MAX
+    // as i64; omit the LIMIT for the sentinel instead.
+    let query = if limit < usize::MAX {
+        query.order_by_desc(entity::Column::CreatedAt).limit(limit as u64)
+    } else {
+        query.order_by_desc(entity::Column::CreatedAt)
+    };
+
+    let mut entries = query.all(db).await.map_err(map_db_err)?;
 
     entries.reverse();
     Ok(entries)

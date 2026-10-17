@@ -103,6 +103,27 @@ pub struct RankedGraphEdge {
     pub target_description: Option<String>,
 }
 
+/// Existence gate + one wide similarity search for a single collection.
+/// `Ok(None)` means the collection is absent (mirrors the skip in the
+/// sequential loop this replaced).
+async fn search_one_collection(
+    vector_db: &dyn VectorDB,
+    query_vector: &[f32],
+    collection: (&str, &str),
+    wide_search_top_k: usize,
+) -> Result<Option<Vec<cognee_vector::SearchResult>>, SearchError> {
+    let (data_type, field_name) = collection;
+    if !vector_db.has_collection(data_type, field_name).await? {
+        debug!("vector collection {data_type}/{field_name} does not exist — skipping");
+        return Ok(None);
+    }
+    Ok(Some(
+        vector_db
+            .search_similar(data_type, field_name, query_vector, wide_search_top_k)
+            .await?,
+    ))
+}
+
 #[tracing::instrument(
     name = "cognee.retrieval.graph_search",
     skip(graph_db, vector_db, embedding_engine, config),
@@ -147,20 +168,27 @@ pub async fn brute_force_triplet_search(
     // their metadata (confirmed in cognify tasks.rs).
     let mut edge_type_distances = HashMap::<String, f32>::new();
 
-    for (data_type, field_name) in SEARCH_COLLECTIONS {
-        if !vector_db.has_collection(data_type, field_name).await? {
-            debug!("vector collection {data_type}/{field_name} does not exist — skipping");
-            continue;
-        }
+    // Issue all six collection searches concurrently. Sequential was six
+    // pgvector round-trips of summed wall time and six separate pool-occupancy
+    // windows against a small shared connection pool. The fold below stays in
+    // SEARCH_COLLECTIONS order, so the `node_dataset_ids` first-wins tie-break
+    // (and every min-merge, which is order-free) is unchanged; the only
+    // semantic difference is that a failing collection surfaces its error
+    // after the fan-out completes rather than cancelling the rest.
+    let [c0, c1, c2, c3, c4, c5] = SEARCH_COLLECTIONS;
+    let (r0, r1, r2, r3, r4, r5) = tokio::join!(
+        search_one_collection(vector_db, &query_vector, c0, config.wide_search_top_k),
+        search_one_collection(vector_db, &query_vector, c1, config.wide_search_top_k),
+        search_one_collection(vector_db, &query_vector, c2, config.wide_search_top_k),
+        search_one_collection(vector_db, &query_vector, c3, config.wide_search_top_k),
+        search_one_collection(vector_db, &query_vector, c4, config.wide_search_top_k),
+        search_one_collection(vector_db, &query_vector, c5, config.wide_search_top_k),
+    );
 
-        let results = vector_db
-            .search_similar(
-                data_type,
-                field_name,
-                &query_vector,
-                config.wide_search_top_k,
-            )
-            .await?;
+    for ((data_type, field_name), outcome) in
+        SEARCH_COLLECTIONS.into_iter().zip([r0, r1, r2, r3, r4, r5])
+    {
+        let Some(results) = outcome? else { continue };
 
         for result in results {
             // Convert Qdrant cosine similarity to cosine distance: distance = 1 - similarity

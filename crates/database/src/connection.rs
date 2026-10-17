@@ -26,6 +26,15 @@ const POOL_MIN_CONNECTIONS: u32 = 0;
 const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// Read a positive pool override from the environment. Unset, blank,
+/// non-numeric, or zero values fall back to the compiled default.
+fn pool_override(key: &str) -> Option<u32> {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|v| *v > 0)
+}
+
 /// Ceilings on the work [`close`] does to empty the pool after sqlx's own
 /// `Pool::close` has returned. See [`drain_sqlite_pool`], which explains why
 /// there are two of them and why the hard one is enforced off the runtime clock.
@@ -116,9 +125,18 @@ pub async fn connect(url: &str) -> Result<DatabaseConnection, DatabaseError> {
     }
 
     let mut opt = ConnectOptions::new(url.to_owned());
-    opt.max_connections(POOL_MAX_CONNECTIONS)
+    // `DATABASE_POOL_SIZE` / `DATABASE_POOL_ACQUIRE_TIMEOUT_SECS` let a
+    // server-backend deployment raise the ceiling: one pool serves sessions,
+    // pipeline state, and cognify writes concurrently, so 10 connections plus
+    // a 30 s acquire timeout is a serialization cliff under load, not a
+    // tuned value. The SQLite path ignores both (single writer regardless).
+    opt.max_connections(pool_override("DATABASE_POOL_SIZE").unwrap_or(POOL_MAX_CONNECTIONS))
         .min_connections(POOL_MIN_CONNECTIONS)
-        .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
+        .acquire_timeout(
+            pool_override("DATABASE_POOL_ACQUIRE_TIMEOUT_SECS")
+                .map(|secs| Duration::from_secs(u64::from(secs)))
+                .unwrap_or(POOL_ACQUIRE_TIMEOUT),
+        )
         .idle_timeout(POOL_IDLE_TIMEOUT);
 
     Database::connect(opt)

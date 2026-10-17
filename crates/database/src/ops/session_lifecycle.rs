@@ -75,19 +75,35 @@ fn abandon_threshold_ts() -> DateTime<Utc> {
     Utc::now() - Duration::seconds(abandon_after_seconds())
 }
 
+/// Render a positional placeholder for parameter index `i` (1-based).
+///
+/// The `$n` form is accepted by *both* supported backends: Postgres
+/// requires it, and SQLite treats `$n` as a named parameter that sqlx
+/// binds positionally — which is why the write path in this module
+/// (`ensure_and_touch_session`, `accumulate_usage`) has always used it on
+/// SQLite too. Bare `?` binds fine on SQLite but Postgres parses it as
+/// the JSONB operator, failing with `syntax error at or near "AND"`, so
+/// every hand-rolled statement here must number its placeholders.
+fn ph(i: usize) -> String {
+    format!("${i}")
+}
+
 /// Render the `effective_status` SQL fragment used inside SELECT lists.
-/// Returns the literal SQL plus the bound parameter (the cutoff
-/// timestamp) so callers can splice it into larger statements.
+/// Returns the literal SQL (bound at placeholder index `ph_idx`) plus the
+/// bound parameter (the cutoff timestamp) so callers can splice it into
+/// larger statements.
 ///
 /// Matches Python's `get_effective_status_sql` at
 /// `cognee/modules/session_lifecycle/metrics.py:271-292`.
-fn effective_status_sql_fragment(threshold: DateTime<Utc>) -> (String, Value) {
+fn effective_status_sql_fragment(threshold: DateTime<Utc>, ph_idx: usize) -> (String, Value) {
     // Both SQLite (sqlx-sqlite) and Postgres (sqlx-postgres) support
     // CASE WHEN ... THEN ... ELSE ... END; the bound timestamp is
     // dialect-portable via the `Value` enum.
-    let sql =
-        "CASE WHEN status = 'running' AND last_activity_at < ? THEN 'abandoned' ELSE status END"
-            .to_string();
+    let sql = format!(
+        "CASE WHEN status = 'running' AND last_activity_at < {} \
+         THEN 'abandoned' ELSE status END",
+        ph(ph_idx),
+    );
     (sql, threshold.into())
 }
 
@@ -473,62 +489,67 @@ pub async fn list_session_rows(
     Span::current().record(COGNEE_DB_SYSTEM, database_system_label(db));
     let backend = db.get_database_backend();
     let threshold = abandon_threshold_ts();
-    let (eff_sql, eff_param) = effective_status_sql_fragment(threshold);
     let user_hex = uuid_hex::to_hex(filters.user_id);
 
-    // ---- Build WHERE clause ----------------------------------------------
-    // We track parameter index so we can splice the effective-status
-    // fragment plus user-supplied filter values in order.
-    //
-    // The `eff_param` is bound *only* when `status_filter` is set; the
-    // SELECT list always references it though, so when listing without
-    // a status filter we still need the bound value at SELECT time.
-    let mut where_parts: Vec<String> = Vec::new();
-    let mut where_params: Vec<Value> = Vec::new();
+    // ---- WHERE-clause builder ---------------------------------------------
+    // Placeholders are `$n`-numbered in binding order (see `ph`), so the
+    // clause must be rebuilt per statement with the right index base: the
+    // count statement binds only the WHERE params (base 1), while the page
+    // statement additionally binds the effective-status threshold first,
+    // for its SELECT list ($1 claimed there, so base 2).
+    let build_where = |base: usize| -> (String, Vec<Value>) {
+        let mut parts: Vec<String> = Vec::new();
+        let mut params: Vec<Value> = Vec::new();
+        let next_ph = |params: &[Value]| ph(base + params.len());
 
-    // visibility predicate
-    if filters.permitted_dataset_ids.is_empty() {
-        where_parts.push("user_id = ?".to_string());
-        where_params.push(Value::from(user_hex.clone()));
-    } else {
-        let mut placeholders = Vec::with_capacity(filters.permitted_dataset_ids.len());
-        let mut perm_params: Vec<Value> = Vec::with_capacity(filters.permitted_dataset_ids.len());
-        for ds in &filters.permitted_dataset_ids {
-            placeholders.push("?");
-            perm_params.push(Value::from(uuid_hex::to_hex(*ds)));
+        // visibility predicate
+        if filters.permitted_dataset_ids.is_empty() {
+            parts.push(format!("user_id = {}", next_ph(&params)));
+            params.push(Value::from(user_hex.clone()));
+        } else {
+            let user_ph = next_ph(&params);
+            params.push(Value::from(user_hex.clone()));
+            let mut placeholders = Vec::with_capacity(filters.permitted_dataset_ids.len());
+            for ds in &filters.permitted_dataset_ids {
+                placeholders.push(next_ph(&params));
+                params.push(Value::from(uuid_hex::to_hex(*ds)));
+            }
+            parts.push(format!(
+                "(user_id = {user_ph} OR dataset_id IN ({}))",
+                placeholders.join(", ")
+            ));
         }
-        where_parts.push(format!(
-            "(user_id = ? OR dataset_id IN ({}))",
-            placeholders.join(", ")
-        ));
-        where_params.push(Value::from(user_hex.clone()));
-        where_params.extend(perm_params);
-    }
 
-    if let Some(since) = filters.since {
-        where_parts.push("last_activity_at >= ?".to_string());
-        where_params.push(Value::from(since));
-    }
+        if let Some(since) = filters.since {
+            parts.push(format!("last_activity_at >= {}", next_ph(&params)));
+            params.push(Value::from(since));
+        }
 
-    if let Some(ref status_filter) = filters.status_filter {
-        // The effective-status SQL fragment binds the threshold timestamp.
-        where_parts.push(format!("({eff_sql}) = ?"));
-        where_params.push(eff_param.clone());
-        where_params.push(Value::from(status_filter.clone()));
-    }
+        if let Some(ref status_filter) = filters.status_filter {
+            // The effective-status fragment binds the threshold timestamp,
+            // then the requested status value.
+            let (frag, val) = effective_status_sql_fragment(threshold, base + params.len());
+            let status_ph = ph(base + params.len() + 1);
+            parts.push(format!("({frag}) = {status_ph}"));
+            params.push(val);
+            params.push(Value::from(status_filter.clone()));
+        }
 
-    let where_clause = if where_parts.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", where_parts.join(" AND "))
+        let where_clause = if parts.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", parts.join(" AND "))
+        };
+        (where_clause, params)
     };
 
     // ---- Count query -----------------------------------------------------
-    let count_sql = format!("SELECT COUNT(*) AS n FROM session_records {where_clause}");
+    let (count_where, count_params) = build_where(1);
+    let count_sql = format!("SELECT COUNT(*) AS n FROM session_records {count_where}");
     let count_row = CountRow::find_by_statement(Statement::from_sql_and_values(
         backend,
         &count_sql,
-        where_params.clone(),
+        count_params,
     ))
     .one(db)
     .await
@@ -539,22 +560,27 @@ pub async fn list_session_rows(
     let sort_col = sortable_column(&filters.order_by);
     let direction = if filters.descending { "DESC" } else { "ASC" };
 
-    // SELECT must always bind the effective-status threshold. Build
-    // params in the order: SELECT params, WHERE params, LIMIT/OFFSET.
-    let mut page_params: Vec<Value> = Vec::with_capacity(where_params.len() + 3);
-    page_params.push(eff_param.clone()); // for the SELECT list expression
-    page_params.extend(where_params);
+    // The SELECT-list effective-status fragment claims $1 (it always binds
+    // the threshold, even with no status filter), so the WHERE builder
+    // starts at 2. Param order: SELECT params, WHERE params, LIMIT/OFFSET.
+    let (eff_sql, eff_param) = effective_status_sql_fragment(threshold, 1);
+    let (page_where, page_where_params) = build_where(2);
+    let mut page_params: Vec<Value> = Vec::with_capacity(page_where_params.len() + 3);
+    page_params.push(eff_param); // for the SELECT list expression
+    page_params.extend(page_where_params);
+    let limit_ph = ph(page_params.len() + 1);
+    let offset_ph = ph(page_params.len() + 2);
+    page_params.push(Value::from(i64::from(filters.limit)));
+    page_params.push(Value::from(i64::from(filters.offset)));
 
     let page_sql = format!(
         "SELECT session_id, user_id, dataset_id, status, started_at, \
                 last_activity_at, ended_at, tokens_in, tokens_out, cost_usd, \
                 error_count, last_model, ({eff_sql}) AS effective_status \
-         FROM session_records {where_clause} \
+         FROM session_records {page_where} \
          ORDER BY {sort_col} {direction} \
-         LIMIT ? OFFSET ?"
+         LIMIT {limit_ph} OFFSET {offset_ph}"
     );
-    page_params.push(Value::from(i64::from(filters.limit)));
-    page_params.push(Value::from(i64::from(filters.offset)));
 
     let raw_rows = ListRow::find_by_statement(Statement::from_sql_and_values(
         backend,
@@ -640,35 +666,43 @@ pub async fn aggregate_stats(
     // Shared visibility / since predicate. The same WHERE clause is
     // reused across totals / duration / status-bucket queries — Python
     // builds it once at `get_sessions_router.py:124-131` and reuses.
-    let mut where_parts: Vec<String> = Vec::new();
-    let mut base_params: Vec<Value> = Vec::new();
+    // (See `list_session_rows` for why the builder takes an index base:
+    // the status-bucket statement additionally binds the effective-status
+    // threshold in its SELECT list, shifting the WHERE params by one.)
+    let build_where = |base: usize| -> (String, Vec<Value>) {
+        let mut parts: Vec<String> = Vec::new();
+        let mut params: Vec<Value> = Vec::new();
+        let next_ph = |params: &[Value]| ph(base + params.len());
 
-    if permitted_dataset_ids.is_empty() {
-        where_parts.push("user_id = ?".to_string());
-        base_params.push(Value::from(user_hex.clone()));
-    } else {
-        let mut placeholders = Vec::with_capacity(permitted_dataset_ids.len());
-        let mut perm_params: Vec<Value> = Vec::with_capacity(permitted_dataset_ids.len());
-        for ds in permitted_dataset_ids {
-            placeholders.push("?");
-            perm_params.push(Value::from(uuid_hex::to_hex(*ds)));
+        if permitted_dataset_ids.is_empty() {
+            parts.push(format!("user_id = {}", next_ph(&params)));
+            params.push(Value::from(user_hex.clone()));
+        } else {
+            let user_ph = next_ph(&params);
+            params.push(Value::from(user_hex.clone()));
+            let mut placeholders = Vec::with_capacity(permitted_dataset_ids.len());
+            for ds in permitted_dataset_ids {
+                placeholders.push(next_ph(&params));
+                params.push(Value::from(uuid_hex::to_hex(*ds)));
+            }
+            parts.push(format!(
+                "(user_id = {user_ph} OR dataset_id IN ({}))",
+                placeholders.join(", ")
+            ));
         }
-        where_parts.push(format!(
-            "(user_id = ? OR dataset_id IN ({}))",
-            placeholders.join(", ")
-        ));
-        base_params.push(Value::from(user_hex.clone()));
-        base_params.extend(perm_params);
-    }
-    if let Some(s) = since {
-        where_parts.push("last_activity_at >= ?".to_string());
-        base_params.push(Value::from(s));
-    }
-    let where_clause = if where_parts.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", where_parts.join(" AND "))
+        if let Some(s) = since {
+            parts.push(format!("last_activity_at >= {}", next_ph(&params)));
+            params.push(Value::from(s));
+        }
+        let where_clause = if parts.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", parts.join(" AND "))
+        };
+        (where_clause, params)
     };
+    // totals / duration bind only the WHERE params (base 1).
+    let (where_clause, base_params) = build_where(1);
 
     // ---- (a) Totals ------------------------------------------------------
     let totals_sql = format!(
@@ -730,16 +764,18 @@ pub async fn aggregate_stats(
     };
 
     // ---- (c) Status buckets ---------------------------------------------
+    // The SELECT-list effective-status fragment claims $1 here, so this
+    // statement's WHERE clause is rebuilt with base 2.
     let threshold = abandon_threshold_ts();
-    let (eff_sql, eff_param) = effective_status_sql_fragment(threshold);
-    // SELECT params: eff_param first, then base_params (where).
-    let mut bucket_params: Vec<Value> = Vec::with_capacity(base_params.len() + 1);
+    let (eff_sql, eff_param) = effective_status_sql_fragment(threshold, 1);
+    let (bucket_where, bucket_where_params) = build_where(2);
+    let mut bucket_params: Vec<Value> = Vec::with_capacity(bucket_where_params.len() + 1);
     bucket_params.push(eff_param);
-    bucket_params.extend(base_params.clone());
+    bucket_params.extend(bucket_where_params);
 
     let bucket_sql = format!(
         "SELECT ({eff_sql}) AS s, COUNT(*) AS c \
-         FROM session_records {where_clause} \
+         FROM session_records {bucket_where} \
          GROUP BY s"
     );
     let buckets = StatusBucketRow::find_by_statement(Statement::from_sql_and_values(
@@ -828,28 +864,28 @@ pub async fn cost_by_model(
     let backend = db.get_database_backend();
     let user_hex = uuid_hex::to_hex(user_id);
 
+    // Single statement, WHERE-only params: plain `$n` numbering from 1.
     let mut where_parts: Vec<String> = Vec::new();
     let mut params: Vec<Value> = Vec::new();
 
     if permitted_dataset_ids.is_empty() {
-        where_parts.push("sr.user_id = ?".to_string());
+        where_parts.push(format!("sr.user_id = {}", ph(params.len() + 1)));
         params.push(Value::from(user_hex.clone()));
     } else {
+        let user_ph = ph(params.len() + 1);
+        params.push(Value::from(user_hex.clone()));
         let mut placeholders = Vec::with_capacity(permitted_dataset_ids.len());
-        let mut perm_params: Vec<Value> = Vec::with_capacity(permitted_dataset_ids.len());
         for ds in permitted_dataset_ids {
-            placeholders.push("?");
-            perm_params.push(Value::from(uuid_hex::to_hex(*ds)));
+            placeholders.push(ph(params.len() + 1));
+            params.push(Value::from(uuid_hex::to_hex(*ds)));
         }
         where_parts.push(format!(
-            "(sr.user_id = ? OR sr.dataset_id IN ({}))",
+            "(sr.user_id = {user_ph} OR sr.dataset_id IN ({}))",
             placeholders.join(", ")
         ));
-        params.push(Value::from(user_hex.clone()));
-        params.extend(perm_params);
     }
     if let Some(s) = since {
-        where_parts.push("sr.last_activity_at >= ?".to_string());
+        where_parts.push(format!("sr.last_activity_at >= {}", ph(params.len() + 1)));
         params.push(Value::from(s));
     }
     let where_clause = if where_parts.is_empty() {

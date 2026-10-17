@@ -121,7 +121,21 @@ impl PgVectorAdapter {
     ///   `postgres://user:pass@localhost:5432/mydb`
     /// * `dimension` — default vector dimension (e.g. 384 for BGE-Small)
     pub async fn new(database_url: &str, dimension: usize) -> VectorDBResult<Self> {
-        let db = Database::connect(database_url)
+        // This adapter opens its own pool, separate from the relational one,
+        // so it gets the same env override treatment (`VECTOR_DB_POOL_SIZE`)
+        // with an explicit ceiling instead of a driver default. The acquire
+        // timeout matches the relational pool's so pool exhaustion surfaces
+        // as a prompt error rather than a silent hang.
+        let mut opt = sea_orm::ConnectOptions::new(database_url.to_owned());
+        opt.max_connections(
+            std::env::var("VECTOR_DB_POOL_SIZE")
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(10),
+        )
+        .acquire_timeout(std::time::Duration::from_secs(30));
+        let db = Database::connect(opt)
             .await
             .map_err(|e| VectorDBError::StorageError(format!("PGVector connect failed: {e}")))?;
 

@@ -181,7 +181,7 @@ pub async fn post_recall(
         .and_then(|n| if n > 0 { Some(n as usize) } else { None })
         .unwrap_or(10);
     let datasets: Option<Vec<String>> = payload.datasets.clone();
-    let query_type: Option<cognee_search::SearchType> = Some(payload.search_type.into());
+    let query_type: Option<cognee_search::SearchType> = payload.search_type.map(Into::into);
 
     let auto_mode = normalized.as_slice() == [RecallScope::Auto];
     let (sources, auto_fallthrough): (Vec<RecallScope>, bool) = if auto_mode {
