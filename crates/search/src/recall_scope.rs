@@ -14,6 +14,7 @@ use std::collections::HashSet;
 use cognee_session::{SessionManager, SessionStore};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
+use uuid::Uuid;
 
 use crate::observability::COGNEE_SEARCH_TYPE;
 use crate::types::SearchError;
@@ -427,6 +428,13 @@ pub async fn run_graph(
     search_orchestrator: &SearchOrchestrator,
     span: &tracing::Span,
     options: Option<&RecallOptions>,
+    // Owner identity for the orchestrator's owner-scoped dataset NAME
+    // resolution. `None` here used to make any datasets-bearing recall
+    // impossible: the orchestrator raises InvalidInput whenever a name
+    // filter is present without a user_id, so the HTTP recall route
+    // answered 422 for every dataset-scoped request (e.g. the integrations
+    // plugin, which always scopes recall to its dataset).
+    user_id: Option<Uuid>,
 ) -> Result<(Vec<RecallItem>, SearchType, bool, SearchResponse), SearchError> {
     // Python recall.py:458-472: still run the router on explicit query_type
     // + auto_route=true so the override gets recorded.
@@ -467,7 +475,7 @@ pub async fn run_graph(
         wide_search_top_k: options.and_then(|o| o.wide_search_top_k),
         triplet_distance_penalty: options.and_then(|o| o.triplet_distance_penalty),
         save_interaction: None,
-        user_id: None,
+        user_id,
         verbose: None,
         feedback_influence: options.and_then(|o| o.feedback_influence),
         retriever_specific_config: None,

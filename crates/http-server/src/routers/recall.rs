@@ -240,6 +240,7 @@ pub async fn post_recall(
                     orchestrator.as_ref(),
                     &span,
                     None,
+                    Some(user.id),
                 )
                 .await
                 .map_err(map_recall_error)?;

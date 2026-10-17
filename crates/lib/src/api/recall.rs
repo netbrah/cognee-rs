@@ -182,6 +182,10 @@ pub async fn recall(
                     search_orchestrator,
                     &span,
                     options.as_ref(),
+                    // SDK user ids are strings; only UUID-shaped ones can
+                    // address owner-scoped datasets (matches
+                    // SearchRequest.user_id's Option<Uuid> typing).
+                    user_id.and_then(|u| uuid::Uuid::parse_str(u).ok()),
                 )
                 .await
                 .map_err(|e| ApiError::Search(e.to_string()))?;
