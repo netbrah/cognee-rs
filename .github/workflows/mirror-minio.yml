@@ -1,11 +1,14 @@
 name: Mirror minio images
 
-# One-shot registry mirror: MinIO removed its images from Docker Hub (pulls
-# deny from every network we control AND from GitHub runners — the tags
-# simply no longer exist there), so the source is quay.io, MinIO's primary
-# registry since 2021. Relay the two images needed by apex-beads-origin (S3
-# origin for dolt replication) through this runner into ghcr, from where the
-# Mac relays them into docker.repo.eng.netapp.com/user/palanisd/ (two-stage
+# One-shot image build for apex-beads-origin (S3 origin for dolt
+# replication). No registry source works: MinIO removed minio/minio from
+# Docker Hub (pulls deny even from GitHub runners), quay.io now gates
+# anonymous pulls (401 from runners and our networks), ghcr has no minio,
+# and dl.min.io returns 410. The GitHub release binaries for the exact
+# targeted tags DO exist and ship sha256sums, so: fetch binaries from
+# github.com/minio/{minio,mc} releases, verify against the release's
+# .sha256sum, build minimal alpine-based images, push to ghcr. The Mac then
+# relays ghcr -> docker.repo.eng.netapp.com/user/palanisd/ (two-stage
 # pattern proven for cognee-rs-delta). Dispatch-only.
 
 on:
@@ -20,7 +23,7 @@ env:
   MC_TAG: RELEASE.2025-08-13T08-35-41Z
 
 jobs:
-  mirror:
+  build:
     runs-on: ubuntu-24.04
     steps:
       - name: Log in to ghcr
@@ -30,16 +33,57 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Relay minio server
+      - name: Fetch and verify minio server binary
         run: |
-          docker pull --platform linux/amd64 quay.io/minio/minio:${MINIO_TAG}
-          docker tag quay.io/minio/minio:${MINIO_TAG} \
-            ghcr.io/${{ github.repository_owner }}/mirror-minio:${MINIO_TAG}
-          docker push ghcr.io/${{ github.repository_owner }}/mirror-minio:${MINIO_TAG}
+          base="https://github.com/minio/minio/releases/download/${MINIO_TAG}/minio.linux-amd64.${MINIO_TAG}"
+          curl -sfL "${base}.sha256sum" -o minio.sha256sum
+          curl -sfL "${base}" -o "minio.linux-amd64.${MINIO_TAG}"
+          sha256sum -c minio.sha256sum
+          mv "minio.linux-amd64.${MINIO_TAG}" server/minio
+        shell: bash
 
-      - name: Relay minio client
+      - name: Fetch and verify mc client binary
         run: |
-          docker pull --platform linux/amd64 quay.io/minio/mc:${MC_TAG}
-          docker tag quay.io/minio/mc:${MC_TAG} \
-            ghcr.io/${{ github.repository_owner }}/mirror-mc:${MC_TAG}
-          docker push ghcr.io/${{ github.repository_owner }}/mirror-mc:${MC_TAG}
+          mkdir -p client
+          base="https://github.com/minio/mc/releases/download/${MC_TAG}/mc.linux-amd64.${MC_TAG}"
+          curl -sfL "${base}.sha256sum" -o client/mc.sha256sum
+          curl -sfL "${base}" -o "client/mc.linux-amd64.${MC_TAG}"
+          (cd client && sha256sum -c mc.sha256sum)
+          mv "client/mc.linux-amd64.${MC_TAG}" client/mc
+        shell: bash
+
+      - name: Build and push minio server image
+        run: |
+          mkdir -p server
+          cat > server/Dockerfile <<'EOF'
+          FROM alpine:3.20
+          RUN apk add --no-cache ca-certificates && adduser -D -u 1000 minio
+          COPY minio /usr/bin/minio
+          RUN chmod 0755 /usr/bin/minio
+          USER 1000
+          EXPOSE 9000
+          ENTRYPOINT ["/usr/bin/minio"]
+          EOF
+          docker buildx build --platform linux/amd64 --push \
+            -t "ghcr.io/${{ github.repository_owner }}/mirror-minio:${MINIO_TAG}" \
+            server
+
+      - name: Build and push mc image
+        run: |
+          cat > client/Dockerfile <<'EOF'
+          FROM alpine:3.20
+          RUN apk add --no-cache ca-certificates
+          COPY mc /usr/bin/mc
+          RUN chmod 0755 /usr/bin/mc
+          ENTRYPOINT ["/usr/bin/mc"]
+          EOF
+          docker buildx build --platform linux/amd64 --push \
+            -t "ghcr.io/${{ github.repository_owner }}/mirror-mc:${MC_TAG}" \
+            client
+
+      - name: Report digests
+        run: |
+          docker buildx imagetools inspect --format '{{.Descriptor.Digest}}' \
+            "ghcr.io/${{ github.repository_owner }}/mirror-minio:${MINIO_TAG}"
+          docker buildx imagetools inspect --format '{{.Descriptor.Digest}}' \
+            "ghcr.io/${{ github.repository_owner }}/mirror-mc:${MC_TAG}"
