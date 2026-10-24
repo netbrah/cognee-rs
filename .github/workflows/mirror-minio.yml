@@ -51,7 +51,7 @@ jobs:
           base="https://github.com/minio/mc/releases/download/${MC_TAG}/mc.linux-amd64.${MC_TAG}"
           curl -sfL "${base}.sha256sum" -o client/mc.sha256sum
           curl -sfL "${base}" -o "client/mc.linux-amd64.${MC_TAG}"
-          (cd client && sha256sum -c mc.sha256sum)
+          (cd client && echo "$(awk '{print $1}' mc.sha256sum)  mc.linux-amd64.${MC_TAG}" | sha256sum -c)
           mv "client/mc.linux-amd64.${MC_TAG}" client/mc
         shell: bash
 
