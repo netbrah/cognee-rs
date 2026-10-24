@@ -1,9 +1,11 @@
 name: Mirror minio images
 
-# One-shot registry mirror: docker.io is unreachable from both the Mac and
-# SCS, so relay the two MinIO images needed by apex-beads-origin (S3 origin
-# for dolt replication) through this runner into ghcr, from where the Mac
-# relays them into docker.repo.eng.netapp.com/user/palanisd/ (two-stage
+# One-shot registry mirror: MinIO removed its images from Docker Hub (pulls
+# deny from every network we control AND from GitHub runners — the tags
+# simply no longer exist there), so the source is quay.io, MinIO's primary
+# registry since 2021. Relay the two images needed by apex-beads-origin (S3
+# origin for dolt replication) through this runner into ghcr, from where the
+# Mac relays them into docker.repo.eng.netapp.com/user/palanisd/ (two-stage
 # pattern proven for cognee-rs-delta). Dispatch-only.
 
 on:
@@ -30,14 +32,14 @@ jobs:
 
       - name: Relay minio server
         run: |
-          docker pull --platform linux/amd64 docker.io/minio/minio:${MINIO_TAG}
-          docker tag docker.io/minio/minio:${MINIO_TAG} \
+          docker pull --platform linux/amd64 quay.io/minio/minio:${MINIO_TAG}
+          docker tag quay.io/minio/minio:${MINIO_TAG} \
             ghcr.io/${{ github.repository_owner }}/mirror-minio:${MINIO_TAG}
           docker push ghcr.io/${{ github.repository_owner }}/mirror-minio:${MINIO_TAG}
 
       - name: Relay minio client
         run: |
-          docker pull --platform linux/amd64 docker.io/minio/mc:${MC_TAG}
-          docker tag docker.io/minio/mc:${MC_TAG} \
+          docker pull --platform linux/amd64 quay.io/minio/mc:${MC_TAG}
+          docker tag quay.io/minio/mc:${MC_TAG} \
             ghcr.io/${{ github.repository_owner }}/mirror-mc:${MC_TAG}
           docker push ghcr.io/${{ github.repository_owner }}/mirror-mc:${MC_TAG}
